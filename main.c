@@ -59,6 +59,8 @@ struct file_entry {
     struct symbol *syms;
     int n_syms;
     int cap_syms;
+    char **includes;
+    int n_includes;
 };
 
 static struct file_entry *g_files;
@@ -69,18 +71,20 @@ static tag_set g_tags;
 
 static int opt_follow_deps;
 static int opt_show_calls;
-static int opt_sys_includes;
 static char *opt_inc_paths[64];
 static int opt_n_inc_paths;
 static char *opt_defines[64];
 static int opt_n_defines;
+static char *opt_strip_macros[64];
+static int opt_n_strip_macros;
+static size_t opt_strip_macro_lens[64];
 
 static struct option long_options[] = {
     {"deps",         no_argument,       NULL, 'd'},
     {"define",       required_argument, NULL, 'D'},
     {"include-dir",  required_argument, NULL, 'I'},
     {"calls",        no_argument,       NULL, 'c'},
-    {"sys-includes", no_argument,       NULL, 's'},
+    {"strip",        required_argument, NULL, 'S'},
     {"help",         no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0}
 };
@@ -96,12 +100,40 @@ static void print_usage(const char *prog) {
         "  -D, --define MACRO      Define macro for preprocessor branch selection\n"
         "  -I, --include-dir DIR   Add include search path\n"
         "  -c, --calls             Show call graph edges under functions\n"
-        "  -s, --sys-includes      Show system #include lines\n"
+        "  -S, --strip MACRO       Strip project-specific qualifier macro from output\n"
         "  -h, --help              Print this help and exit\n",
         name);
 }
 
 /* ── Helpers ───────────────────────────────────────────────────── */
+
+static char *read_file_source(const char *path, long *out_length) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    if (length < 0) { fclose(f); return NULL; }
+    fseek(f, 0, SEEK_SET);
+    char *source = malloc((size_t)length + 1);
+    if (!source) { fclose(f); return NULL; }
+    size_t nread = fread(source, 1, (size_t)length, f);
+    fclose(f);
+    if ((long)nread != length) { free(source); return NULL; }
+    source[length] = '\0';
+    *out_length = length;
+    return source;
+}
+
+static int should_skip_fts_entry(FTSENT *ent) {
+    if (ent->fts_name[0] == '.') return 1;
+    if (ent->fts_info == FTS_D && ent->fts_level > FTS_ROOTLEVEL &&
+       (strcmp(ent->fts_name, "build") == 0 ||
+        strcmp(ent->fts_name, "vendor") == 0 ||
+        strcmp(ent->fts_name, "node_modules") == 0 ||
+        strcmp(ent->fts_name, "third_party") == 0))
+        return 1;
+    return 0;
+}
 
 static int is_source_file(const char *filename) {
     const char *dot = strrchr(filename, '.');
@@ -167,10 +199,185 @@ static void strip_qualifiers(char *text) {
             src = p;
             continue;
         }
+        /* User-specified -S macros */
+        int matched = 0;
+        for (int i = 0; i < opt_n_strip_macros; i++) {
+            if (strncmp(src, opt_strip_macros[i], opt_strip_macro_lens[i]) == 0 &&
+                (src[opt_strip_macro_lens[i]] == ' ' ||
+                 src[opt_strip_macro_lens[i]] == '\n' ||
+                 src[opt_strip_macro_lens[i]] == '\t')) {
+                src += opt_strip_macro_lens[i];
+                while (*src == ' ' || *src == '\n' || *src == '\t') src++;
+                matched = 1;
+                break;
+            }
+        }
+        if (matched) continue;
         break;
     }
     if (src != text)
         memmove(text, src, strlen(src) + 1);
+}
+
+static void strip_trailing_attribute(char *text) {
+    char *last = NULL;
+    char *p = text;
+    while ((p = strstr(p, "__attribute__((")) != NULL) {
+        last = p;
+        p++;
+    }
+    if (!last) return;
+    /* Verify it's after a closing brace/paren (trailing position) */
+    char *before = last - 1;
+    while (before >= text && (*before == ' ' || *before == '\n')) before--;
+    if (before < text || (*before != ')' && *before != '}')) return;
+    /* Find matching )) */
+    int depth = 2;
+    char *end = last + 15;
+    while (*end && depth > 0) {
+        if (*end == '(') depth++;
+        else if (*end == ')') depth--;
+        end++;
+    }
+    /* Remove: shift everything after the attribute back */
+    while (*end == ' ') end++;
+    memmove(last, end, strlen(end) + 1);
+}
+
+static void strip_comments(char *text) {
+    char *r = text, *w = text;
+    while (*r) {
+        /* Skip string literals verbatim */
+        if (*r == '"' || *r == '\'') {
+            char q = *r;
+            *w++ = *r++;
+            while (*r && *r != q) {
+                if (*r == '\\' && r[1]) *w++ = *r++;
+                *w++ = *r++;
+            }
+            if (*r) *w++ = *r++;
+            continue;
+        }
+        /* Line comment — skip to newline, keep the newline */
+        if (r[0] == '/' && r[1] == '/') {
+            while (*r && *r != '\n') r++;
+            continue;
+        }
+        /* Block comment — skip entirely */
+        if (r[0] == '/' && r[1] == '*') {
+            r += 2;
+            while (*r && !(r[0] == '*' && r[1] == '/')) r++;
+            if (*r) r += 2;
+            continue;
+        }
+        *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+static void normalize_whitespace(char *text) {
+    char *r = text, *w = text;
+    while (*r) {
+        char *line_start = w;
+        /* Copy leading whitespace (indentation) as-is */
+        while (*r == ' ' || *r == '\t') *w++ = *r++;
+        /* Process content: collapse interior space runs */
+        while (*r && *r != '\n') {
+            if (*r == '"' || *r == '\'') {
+                char q = *r;
+                *w++ = *r++;
+                while (*r && *r != q) {
+                    if (*r == '\\' && r[1]) *w++ = *r++;
+                    *w++ = *r++;
+                }
+                if (*r) *w++ = *r++;
+                continue;
+            }
+            if (*r == ' ' || *r == '\t') {
+                *w++ = ' ';
+                while (*r == ' ' || *r == '\t') r++;
+                continue;
+            }
+            *w++ = *r++;
+        }
+        /* Trim trailing spaces before newline */
+        while (w > line_start && (w[-1] == ' ' || w[-1] == '\t')) w--;
+        /* Copy newline */
+        if (*r == '\n') *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+static void join_continuation_lines(char *text) {
+    char *r = text, *w = text;
+    while (*r) {
+        char *line_start = w;
+        int is_preproc = 0;
+
+        /* Copy first segment of line */
+        while (*r && *r != '\n') *w++ = *r++;
+
+        /* Check if original line starts with # */
+        for (char *p = line_start; p < w; p++) {
+            if (*p == ' ' || *p == '\t') continue;
+            if (*p == '#') is_preproc = 1;
+            break;
+        }
+
+        /* Inner loop: keep joining until line is complete */
+        while (*r == '\n' && !is_preproc) {
+            /* Find last non-whitespace char of current line */
+            char *ce = w;
+            while (ce > line_start && (ce[-1] == ' ' || ce[-1] == '\t')) ce--;
+            char last = (ce > line_start) ? ce[-1] : '\0';
+
+            /* Rule 1: dangling semicolon on next line */
+            char *nc = r + 1;
+            while (*nc == ' ' || *nc == '\t') nc++;
+            if (*nc == ';' && (nc[1] == '\n' || nc[1] == '\0')) {
+                *w++ = ';';
+                r = nc + 1;
+                break;
+            }
+
+            /* Rule 2: line complete? */
+            if (last == ';' || last == ',' || last == '{' ||
+                last == '}' || last == '\\' || last == ')' ||
+                last == '\0')
+                break;
+
+            /* Incomplete — join next line */
+            r++;                                      /* skip \n */
+            while (*r == ' ' || *r == '\t') r++;      /* skip indent */
+            *w++ = ' ';                               /* single space */
+            while (*r && *r != '\n') *w++ = *r++;     /* copy next line */
+        }
+
+        if (*r == '\n') *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+static void collapse_blank_lines(char *text) {
+    char *r = text, *w = text;
+    while (*r) {
+        *w++ = *r++;
+        if (r[-1] == '\n') {
+            while (*r == '\n') r++;
+        }
+    }
+    *w = '\0';
+}
+
+static void postprocess_skeleton(char *buf, int do_strip) {
+    if (do_strip) {
+        strip_qualifiers(buf);
+        strip_trailing_attribute(buf);
+    }
+    strip_comments(buf);
+    normalize_whitespace(buf);
+    join_continuation_lines(buf);
+    collapse_blank_lines(buf);
 }
 
 static void fprint_node_text(FILE *out, const char *source,
@@ -181,6 +388,52 @@ static void fprint_node_text(FILE *out, const char *source,
         fprintf(out, "%.*s;%s", len, source + start, has_nl ? "" : "\n");
     else
         fprintf(out, "%.*s%s", len, source + start, has_nl ? "" : "\n");
+}
+
+static int is_simple_sequential_enum(TSNode enum_node, int threshold) {
+    TSNode body = ts_node_child_by_field_name(enum_node, "body", 4);
+    if (ts_node_is_null(body)) return 0;
+    int n = 0, n_valued = 0, first_valued = 0;
+    uint32_t cc = ts_node_child_count(body);
+    for (uint32_t i = 0; i < cc; i++) {
+        TSNode child = ts_node_child(body, i);
+        if (strcmp(ts_node_type(child), "enumerator") != 0) continue;
+        n++;
+        TSNode val = ts_node_child_by_field_name(child, "value", 5);
+        if (!ts_node_is_null(val)) {
+            n_valued++;
+            if (n == 1) first_valued = 1;
+        }
+    }
+    if (n <= threshold) return 0;
+    return (n_valued == 0 || (n_valued == 1 && first_valued));
+}
+
+static void fprint_compact_enum(FILE *out, TSNode full_node,
+                                TSNode enum_node, const char *source) {
+    /* Print everything from full_node start to enum body '{' */
+    uint32_t node_start = ts_node_start_byte(full_node);
+    TSNode body = ts_node_child_by_field_name(enum_node, "body", 4);
+    uint32_t body_start = ts_node_start_byte(body);
+    fprintf(out, "%.*s{ ", (int)(body_start - node_start), source + node_start);
+
+    /* Print enumerators comma-separated */
+    uint32_t cc = ts_node_child_count(body);
+    int first = 1;
+    for (uint32_t i = 0; i < cc; i++) {
+        TSNode child = ts_node_child(body, i);
+        if (strcmp(ts_node_type(child), "enumerator") != 0) continue;
+        if (!first) fprintf(out, ", ");
+        first = 0;
+        uint32_t cs = ts_node_start_byte(child);
+        uint32_t ce = ts_node_end_byte(child);
+        fprintf(out, "%.*s", (int)(ce - cs), source + cs);
+    }
+
+    /* Print everything from enum body '}' to full_node end */
+    uint32_t body_end = ts_node_end_byte(body);
+    uint32_t node_end = ts_node_end_byte(full_node);
+    fprintf(out, " }%.*s\n", (int)(node_end - body_end), source + body_end);
 }
 
 static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
@@ -206,27 +459,46 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
                     trim_end--;
                 fprint_node_text(mem, source, start, trim_end, 1);
                 fclose(mem);
-                strip_qualifiers(buf);
+                postprocess_skeleton(buf, 1);
                 return buf;
             }
         }
     }
 
     if (cap_idx == CAP_GLOBAL_VAR) {
-        /* Truncate large initializer lists: emit "= { ... };" instead */
+        /* Truncate large initializer lists and string literals */
         uint32_t cc = ts_node_child_count(node);
         for (uint32_t c = 0; c < cc; c++) {
             TSNode child = ts_node_child(node, c);
             if (strcmp(ts_node_type(child), "init_declarator") == 0) {
                 TSNode val = ts_node_child_by_field_name(child, "value", 5);
-                if (!ts_node_is_null(val) &&
-                    strcmp(ts_node_type(val), "initializer_list") == 0) {
-                    uint32_t val_start = ts_node_start_byte(val);
-                    fprint_node_text(mem, source, start, val_start, 0);
-                    fprintf(mem, "{ ... };\n");
-                    fclose(mem);
-                    strip_qualifiers(buf);
-                    return buf;
+                if (!ts_node_is_null(val)) {
+                    const char *vtype = ts_node_type(val);
+                    const char *placeholder = NULL;
+                    if (strcmp(vtype, "initializer_list") == 0)
+                        placeholder = "{ ... };\n";
+                    else if (strcmp(vtype, "string_literal") == 0 ||
+                             strcmp(vtype, "concatenated_string") == 0)
+                        placeholder = "\"...\";\n";
+                    if (placeholder) {
+                        uint32_t val_start = ts_node_start_byte(val);
+                        fprint_node_text(mem, source, start, val_start, 0);
+                        /* Trim trailing whitespace so "=\n  " becomes "= " */
+                        long pos = ftell(mem);
+                        while (pos > 0) {
+                            fseek(mem, pos - 1, SEEK_SET);
+                            int ch = fgetc(mem);
+                            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
+                                pos--;
+                            else
+                                break;
+                        }
+                        fseek(mem, pos, SEEK_SET);
+                        fprintf(mem, " %s", placeholder);
+                        fclose(mem);
+                        postprocess_skeleton(buf, 1);
+                        return buf;
+                    }
                 }
             }
         }
@@ -234,20 +506,46 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
     }
 
     if (cap_idx == CAP_STRUCT_DEF || cap_idx == CAP_ENUM_DEF) {
+        if (cap_idx == CAP_ENUM_DEF &&
+            is_simple_sequential_enum(node, 6)) {
+            fprint_compact_enum(mem, node, node, source);
+            fclose(mem);
+            /* Compact output ends with "}\n"; insert semicolon */
+            size_t len = strlen(buf);
+            if (len > 0 && buf[len-1] == '\n') {
+                buf = realloc(buf, len + 2);
+                buf[len-1] = ';';
+                buf[len] = '\n';
+                buf[len+1] = '\0';
+            }
+            strip_qualifiers(buf);
+            return buf;
+        }
         fprint_node_text(mem, source, start, end, 1);
         fclose(mem);
-        strip_qualifiers(buf);
+        postprocess_skeleton(buf, 1);
         return buf;
     }
 
-    /* Strip qualifiers from declarations (variables, typedefs) but not
-       from preprocessor directives or includes */
-    int strip = (cap_idx == CAP_GLOBAL_VAR || cap_idx == CAP_TYPEDEF);
+    /* Compact typedef-wrapped sequential enums */
+    if (cap_idx == CAP_TYPEDEF) {
+        uint32_t cc = ts_node_child_count(node);
+        for (uint32_t c = 0; c < cc; c++) {
+            TSNode child = ts_node_child(node, c);
+            if (strcmp(ts_node_type(child), "enum_specifier") == 0 &&
+                is_simple_sequential_enum(child, 6)) {
+                fprint_compact_enum(mem, node, child, source);
+                fclose(mem);
+                strip_qualifiers(buf);
+                return buf;
+            }
+        }
+    }
 
+    int strip = (cap_idx == CAP_GLOBAL_VAR || cap_idx == CAP_TYPEDEF);
     fprint_node_text(mem, source, start, end, 0);
     fclose(mem);
-    if (strip)
-        strip_qualifiers(buf);
+    postprocess_skeleton(buf, strip);
     return buf;
 }
 
@@ -263,8 +561,8 @@ static int is_macro_defined(const char *name, char **defines, int n_defines) {
 static int eval_ifdef(TSNode node, const char *source,
                       char **defines, int n_defines) {
     uint32_t start = ts_node_start_byte(node);
-    int is_ifndef = (strstr(source + start, "ifndef") != NULL &&
-                     (size_t)(strstr(source + start, "ifndef") - (source + start)) < 20);
+    const char *p = strstr(source + start, "ifndef");
+    int is_ifndef = (p != NULL && (size_t)(p - (source + start)) < 20);
 
     TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
     if (ts_node_is_null(name_node)) return -1;
@@ -433,92 +731,6 @@ static char *resolve_include(const char *inc_path, int is_system,
     return NULL;
 }
 
-static char **extract_includes(const char *path, TSParser *parser, TSQuery *query,
-                               char **search_paths, int n_search,
-                               char **defines, int n_defines, int *out_count) {
-    *out_count = 0;
-
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-
-    fseek(f, 0, SEEK_END);
-    long length = ftell(f);
-    if (length < 0) { fclose(f); return NULL; }
-    fseek(f, 0, SEEK_SET);
-
-    char *source = malloc((size_t)length + 1);
-    if (!source) { fclose(f); return NULL; }
-
-    size_t nread = fread(source, 1, (size_t)length, f);
-    fclose(f);
-    if ((long)nread != length) { free(source); return NULL; }
-    source[length] = '\0';
-
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
-    if (!tree) { free(source); return NULL; }
-    TSNode root = ts_tree_root_node(tree);
-
-    TSQueryCursor *cursor = ts_query_cursor_new();
-    ts_query_cursor_exec(cursor, query, root);
-
-    char *path_copy = strdup(path);
-    char *file_dir = dirname(path_copy);
-
-    int cap = 16, count = 0;
-    char **results = malloc((size_t)cap * sizeof(char *));
-
-    TSQueryMatch match;
-    while (ts_query_cursor_next_match(cursor, &match)) {
-        if (match.capture_count < 1) continue;
-        uint32_t cap_idx = match.captures[0].index;
-        if (cap_idx != CAP_INCLUDE) continue;
-
-        TSNode node = match.captures[0].node;
-
-        if (should_skip_preproc(node, source, defines, n_defines))
-            continue;
-
-        uint32_t child_count = ts_node_child_count(node);
-        for (uint32_t c = 0; c < child_count; c++) {
-            TSNode child = ts_node_child(node, c);
-            const char *type = ts_node_type(child);
-            int is_system = 0;
-            if (strcmp(type, "system_lib_string") == 0)
-                is_system = 1;
-            else if (strcmp(type, "string_literal") == 0)
-                is_system = 0;
-            else
-                continue;
-
-            uint32_t s = ts_node_start_byte(child);
-            uint32_t e = ts_node_end_byte(child);
-            if (e - s < 3) continue;
-            uint32_t inc_len = e - s - 2;
-            char *inc_path = malloc(inc_len + 1);
-            memcpy(inc_path, source + s + 1, inc_len);
-            inc_path[inc_len] = '\0';
-
-            char *resolved = resolve_include(inc_path, is_system, file_dir,
-                                             search_paths, n_search);
-            free(inc_path);
-            if (!resolved) continue;
-
-            if (count >= cap) {
-                cap *= 2;
-                results = realloc(results, (size_t)cap * sizeof(char *));
-            }
-            results[count++] = resolved;
-        }
-    }
-
-    free(path_copy);
-    ts_query_cursor_delete(cursor);
-    ts_tree_delete(tree);
-    free(source);
-
-    *out_count = count;
-    return results;
-}
 
 /* ── Tag name extraction ───────────────────────────────────────── */
 
@@ -635,22 +847,11 @@ static void collect_callees(TSNode node, const char *source,
 /* ── collect_file: parse, query, filter, buffer symbols ────────── */
 
 static void collect_file(const char *path, TSParser *parser, TSQuery *query,
-                         char **defines, int n_defines) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return;
-
-    fseek(f, 0, SEEK_END);
-    long length = ftell(f);
-    if (length < 0) { fclose(f); return; }
-    fseek(f, 0, SEEK_SET);
-
-    char *source = malloc((size_t)length + 1);
-    if (!source) { fclose(f); return; }
-
-    size_t nread = fread(source, 1, (size_t)length, f);
-    fclose(f);
-    if ((long)nread != length) { free(source); return; }
-    source[length] = '\0';
+                         char **defines, int n_defines,
+                         char **search_paths, int n_search) {
+    long length;
+    char *source = read_file_source(path, &length);
+    if (!source) return;
 
     TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
     if (!tree) { free(source); return; }
@@ -685,8 +886,41 @@ static void collect_file(const char *path, TSParser *parser, TSQuery *query,
         if (should_skip_preproc(node, source, defines, n_defines))
             continue;
 
-        /* Skip #include lines — files are sorted by dependency order instead */
-        if (cap_idx == CAP_INCLUDE) continue;
+        /* Resolve #include paths and cache on file_entry */
+        if (cap_idx == CAP_INCLUDE) {
+            char *path_copy = strdup(path);
+            char *file_dir = dirname(path_copy);
+            uint32_t child_count = ts_node_child_count(node);
+            for (uint32_t c = 0; c < child_count; c++) {
+                TSNode child = ts_node_child(node, c);
+                const char *type = ts_node_type(child);
+                int is_system = 0;
+                if (strcmp(type, "system_lib_string") == 0)
+                    is_system = 1;
+                else if (strcmp(type, "string_literal") == 0)
+                    is_system = 0;
+                else
+                    continue;
+                uint32_t s = ts_node_start_byte(child);
+                uint32_t e = ts_node_end_byte(child);
+                if (e - s < 3) continue;
+                uint32_t inc_len = e - s - 2;
+                char *inc_path = malloc(inc_len + 1);
+                memcpy(inc_path, source + s + 1, inc_len);
+                inc_path[inc_len] = '\0';
+                char *resolved = resolve_include(inc_path, is_system, file_dir,
+                                                 search_paths, n_search);
+                free(inc_path);
+                if (!resolved) continue;
+                if (fe->n_includes % 16 == 0) {
+                    fe->includes = realloc(fe->includes,
+                        (size_t)(fe->n_includes + 16) * sizeof(char *));
+                }
+                fe->includes[fe->n_includes++] = resolved;
+            }
+            free(path_copy);
+            continue;
+        }
 
         /* Skip bare #define with no value (include guards) */
         if (cap_idx == CAP_PREPROC_DEF) {
@@ -768,9 +1002,7 @@ static void compute_common_prefix(char *out, size_t out_sz) {
 
 /* ── Topological sort by include order ──────────────────────────── */
 
-static void topo_sort_files(TSParser *parser, TSQuery *query,
-                            char **search_paths, int n_search,
-                            char **defines, int n_defines) {
+static void topo_sort_files(void) {
     int n = g_n_files;
     if (n <= 1) return;
 
@@ -780,14 +1012,10 @@ static void topo_sort_files(TSParser *parser, TSQuery *query,
     int *adj = calloc((size_t)n * (size_t)n, sizeof(int));  /* adj[i*n + j] = 1 */
 
     for (int i = 0; i < n; i++) {
-        int inc_count = 0;
-        char **includes = extract_includes(g_files[i].abs_path, parser, query,
-                                           search_paths, n_search,
-                                           defines, n_defines, &inc_count);
-        for (int k = 0; k < inc_count; k++) {
+        for (int k = 0; k < g_files[i].n_includes; k++) {
             /* Find which file index this resolves to */
             for (int j = 0; j < n; j++) {
-                if (j != i && strcmp(g_files[j].abs_path, includes[k]) == 0) {
+                if (j != i && strcmp(g_files[j].abs_path, g_files[i].includes[k]) == 0) {
                     /* i includes j → j must come before i */
                     if (!adj[j * n + i]) {
                         adj[j * n + i] = 1;
@@ -796,9 +1024,7 @@ static void topo_sort_files(TSParser *parser, TSQuery *query,
                     break;
                 }
             }
-            free(includes[k]);
         }
-        free(includes);
     }
 
     /* Kahn's algorithm */
@@ -856,11 +1082,9 @@ static void print_indented(const char *text, int indent) {
     }
 }
 
-static void print_tree(TSParser *parser, TSQuery *query,
-                       char **search_paths, int n_search,
-                       char **defines, int n_defines) {
+static void print_tree(void) {
     /* Topological sort by include dependencies */
-    topo_sort_files(parser, query, search_paths, n_search, defines, n_defines);
+    topo_sort_files();
 
     /* Compute common prefix and relative paths */
     char prefix[PATH_MAX];
@@ -943,6 +1167,9 @@ static void cleanup(void) {
             free(fe->syms[j].callees);
         }
         free(fe->syms);
+        for (int j = 0; j < fe->n_includes; j++)
+            free(fe->includes[j]);
+        free(fe->includes);
     }
     free(g_files);
 
@@ -959,7 +1186,7 @@ static void cleanup(void) {
 
 int main(int argc, char *argv[]) {
     int opt;
-    while ((opt = getopt_long(argc, argv, "dD:I:csh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dD:I:cS:h", long_options, NULL)) != -1) {
         switch (opt) {
         case 'd': opt_follow_deps = 1; break;
         case 'D':
@@ -969,7 +1196,13 @@ int main(int argc, char *argv[]) {
             if (opt_n_inc_paths < 64) opt_inc_paths[opt_n_inc_paths++] = optarg;
             break;
         case 'c': opt_show_calls = 1; break;
-        case 's': opt_sys_includes = 1; break;
+        case 'S':
+            if (opt_n_strip_macros < 64) {
+                opt_strip_macros[opt_n_strip_macros] = optarg;
+                opt_strip_macro_lens[opt_n_strip_macros] = strlen(optarg);
+                opt_n_strip_macros++;
+            }
+            break;
         case 'h':
             print_usage(argv[0]);
             return 0;
@@ -1014,15 +1247,7 @@ int main(int argc, char *argv[]) {
         }
         FTSENT *ent;
         while ((ent = fts_read(ftsp))) {
-            if (ent->fts_name[0] == '.') {
-                fts_set(ftsp, ent, FTS_SKIP);
-                continue;
-            }
-            if (ent->fts_info == FTS_D && ent->fts_level > FTS_ROOTLEVEL &&
-               (strcmp(ent->fts_name, "build") == 0 ||
-                strcmp(ent->fts_name, "vendor") == 0 ||
-                strcmp(ent->fts_name, "node_modules") == 0 ||
-                strcmp(ent->fts_name, "third_party") == 0)) {
+            if (should_skip_fts_entry(ent)) {
                 fts_set(ftsp, ent, FTS_SKIP);
                 continue;
             }
@@ -1039,17 +1264,13 @@ int main(int argc, char *argv[]) {
         /* BFS: collect files and discover new includes */
         while (queue_head < vis_count) {
             const char *file = visited[queue_head++];
-            collect_file(file, parser, query, opt_defines, opt_n_defines);
+            collect_file(file, parser, query, opt_defines, opt_n_defines,
+                         opt_inc_paths, opt_n_inc_paths);
 
-            int inc_count = 0;
-            char **includes = extract_includes(file, parser, query,
-                                               opt_inc_paths, opt_n_inc_paths,
-                                               opt_defines, opt_n_defines, &inc_count);
-            for (int i = 0; i < inc_count; i++) {
-                visited_add(&visited, &vis_count, &vis_cap, includes[i]);
-                free(includes[i]);
-            }
-            free(includes);
+            /* Read cached includes from the just-collected file_entry */
+            struct file_entry *fe = &g_files[g_n_files - 1];
+            for (int i = 0; i < fe->n_includes; i++)
+                visited_add(&visited, &vis_count, &vis_cap, fe->includes[i]);
         }
 
         for (int i = 0; i < vis_count; i++) free(visited[i]);
@@ -1066,22 +1287,15 @@ int main(int argc, char *argv[]) {
 
         FTSENT *ent;
         while ((ent = fts_read(ftsp))) {
-            if (ent->fts_name[0] == '.') {
-                fts_set(ftsp, ent, FTS_SKIP);
-                continue;
-            }
-            if (ent->fts_info == FTS_D && ent->fts_level > FTS_ROOTLEVEL &&
-               (strcmp(ent->fts_name, "build") == 0 ||
-                strcmp(ent->fts_name, "vendor") == 0 ||
-                strcmp(ent->fts_name, "node_modules") == 0 ||
-                strcmp(ent->fts_name, "third_party") == 0)) {
+            if (should_skip_fts_entry(ent)) {
                 fts_set(ftsp, ent, FTS_SKIP);
                 continue;
             }
 
             if (ent->fts_info == FTS_F && is_source_file(ent->fts_name)) {
                 collect_file(ent->fts_path, parser, query,
-                             opt_defines, opt_n_defines);
+                             opt_defines, opt_n_defines,
+                             opt_inc_paths, opt_n_inc_paths);
             }
         }
 
@@ -1089,8 +1303,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Print the collected tree */
-    print_tree(parser, query, opt_inc_paths, opt_n_inc_paths,
-               opt_defines, opt_n_defines);
+    print_tree();
     cleanup();
 
     ts_query_delete(query);
