@@ -1,0 +1,72 @@
+Whole-Program Build Scheme for archmap
+=======================================
+
+Overview
+--------
+All three compilation units (main.c, tree-sitter runtime, tree-sitter-c
+grammar) are compiled in a single gcc invocation with -fwhole-program.
+This gives the compiler complete visibility across every function and
+data structure, enabling cross-module inlining that separate compilation
+(even with LTO and static archives) cannot fully achieve.
+
+Vendored Sources
+----------------
+  vendor/tree-sitter/       tree-sitter v0.26.5  (runtime library)
+  vendor/tree-sitter-c/     tree-sitter-c v0.24.1 (C grammar)
+
+Fetched on first build via curl from GitHub release tarballs.
+No system-installed shared libraries are used.
+
+Source Files (single invocation)
+--------------------------------
+  main.c                                  archmap itself
+  vendor/tree-sitter/lib/src/lib.c        tree-sitter runtime (unity build)
+  vendor/tree-sitter-c/src/parser.c       C grammar tables
+
+Include Paths
+-------------
+  -I vendor/tree-sitter/lib/include       public tree-sitter API (tree_sitter/api.h)
+  -I vendor/tree-sitter/lib/src           internal headers needed by lib.c
+  -I vendor/tree-sitter-c/src             grammar parser.h, used by parser.c
+
+Compiler Flags
+--------------
+  -O3                               Full optimization suite
+  -march=native                     Target the build machine's ISA extensions
+  -flto                             Link-time optimization across all TUs
+  -fwhole-program                   Assume main() is the only entry point;
+                                    every other symbol becomes internal,
+                                    enabling aggressive inlining and DCE
+  -fomit-frame-pointer              Free %rbp as a general-purpose register
+  -fno-asynchronous-unwind-tables   Strip .eh_frame emission
+  -fno-unwind-tables                Strip .ARM.exidx / unwind data
+  -fno-stack-protector              Remove stack canary checks
+  -fipa-pta                         Interprocedural pointer analysis for
+                                    better alias resolution
+  -fmerge-all-constants             Deduplicate identical constants across TUs
+  -DNDEBUG                          Disable assert()
+  -Wall -Wextra                     Warnings
+  -std=gnu11                        C11 + POSIX/GNU extensions (tree-sitter
+                                    uses fdopen, le16toh, be16toh)
+
+Why -fwhole-program Matters
+---------------------------
+With separate .a archives, LTO sees each object file's symbols but must
+still respect external linkage: it cannot assume that tree_sitter_c() or
+ts_parser_parse_string() won't be called from a shared library or dlopen'd
+plugin, limiting how far it will inline or eliminate code.
+
+-fwhole-program tells gcc that the entire program is visible.  Every
+function except main() is effectively made static.  The compiler can then:
+
+  - Inline hot tree-sitter functions (ts_lexer_advance, ts_subtree_*)
+    directly into archmap's parsing loops
+  - Propagate constants across library boundaries
+  - Eliminate dead tree-sitter code paths never reached by archmap
+  - Perform interprocedural alias analysis across all three TUs at once
+
+Make Targets
+------------
+  make                Build archmap (fetches vendor sources on first run)
+  make clean          Remove the binary
+  make vendor-clean   Remove vendor/ entirely (re-fetched on next build)

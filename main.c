@@ -11,7 +11,8 @@
 #include <libgen.h>
 #include <limits.h>
 #include <tree_sitter/api.h>
-#include <tree_sitter/tree-sitter-c.h>
+
+extern const TSLanguage *tree_sitter_c(void);
 
 /* Verstable string set for struct/enum/union tag deduplication */
 #define NAME tag_set
@@ -42,8 +43,6 @@ const char *QUERY_SOURCE =
     "(preproc_function_def) @preproc_func "
     "(preproc_include) @include ";
 
-/* ── Data structures for buffered output ───────────────────────── */
-
 struct symbol {
     char *text;
     char **callees;
@@ -66,8 +65,6 @@ struct file_entry {
 static struct file_entry *g_files;
 static int g_n_files, g_cap_files;
 static tag_set g_tags;
-
-/* ── CLI options ───────────────────────────────────────────────── */
 
 static int opt_follow_deps;
 static int opt_show_calls;
@@ -104,8 +101,6 @@ static void print_usage(const char *prog) {
         "  -h, --help              Print this help and exit\n",
         name);
 }
-
-/* ── Helpers ───────────────────────────────────────────────────── */
 
 static char *read_file_source(const char *path, long *out_length) {
     FILE *f = fopen(path, "rb");
@@ -165,7 +160,6 @@ static struct symbol *add_symbol(struct file_entry *fe) {
 }
 
 static void add_callee(struct symbol *s, const char *name) {
-    /* deduplicate */
     for (int i = 0; i < s->n_callees; i++)
         if (strcmp(s->callees[i], name) == 0) return;
     if (s->n_callees >= s->cap_callees) {
@@ -174,8 +168,6 @@ static void add_callee(struct symbol *s, const char *name) {
     }
     s->callees[s->n_callees++] = strdup(name);
 }
-
-/* ── Skeleton text generation (to malloc'd string via open_memstream) ── */
 
 /* Strip storage-class specifiers and inline — everything in the skeleton
    is file-scope by definition, so these waste tokens. */
@@ -451,7 +443,6 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
             TSNode child = ts_node_child(node, c);
             if (strcmp(ts_node_type(child), "compound_statement") == 0) {
                 uint32_t body_start = ts_node_start_byte(child);
-                /* Trim trailing whitespace before the body */
                 uint32_t trim_end = body_start;
                 while (trim_end > start &&
                        (source[trim_end-1] == ' ' || source[trim_end-1] == '\n' ||
@@ -502,7 +493,6 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
                 }
             }
         }
-        /* Fall through to default handling */
     }
 
     if (cap_idx == CAP_STRUCT_DEF || cap_idx == CAP_ENUM_DEF) {
@@ -548,8 +538,6 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
     postprocess_skeleton(buf, strip);
     return buf;
 }
-
-/* ── Preprocessor evaluation (unchanged logic) ─────────────────── */
 
 static int is_macro_defined(const char *name, char **defines, int n_defines) {
     for (int i = 0; i < n_defines; i++) {
@@ -712,8 +700,6 @@ static int is_file_scope(TSNode node) {
     return 0;
 }
 
-/* ── Include resolution ────────────────────────────────────────── */
-
 static char *resolve_include(const char *inc_path, int is_system,
                              const char *file_dir,
                              char **search_paths, int n_search) {
@@ -732,9 +718,6 @@ static char *resolve_include(const char *inc_path, int is_system,
 }
 
 
-/* ── Tag name extraction ───────────────────────────────────────── */
-
-/* Extract tag name given access to source text */
 static char *extract_tag_name_src(TSNode node, const char *source) {
     TSNode name = ts_node_child_by_field_name(node, "name", 4);
     if (ts_node_is_null(name)) return NULL;
@@ -749,15 +732,11 @@ static char *extract_tag_name_src(TSNode node, const char *source) {
     return tag;
 }
 
-/* Check if a node has a body (field_declaration_list for struct/union,
-   enumerator_list for enum) */
 static int has_body(TSNode node) {
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
     return !ts_node_is_null(body);
 }
 
-/* Search inside a node for struct/union/enum specifiers and extract their tags
-   into g_tags if they have bodies. Also look inside type_definition children. */
 static void register_full_tags(TSNode node, const char *source) {
     const char *type = ts_node_type(node);
     if (strcmp(type, "struct_specifier") == 0 ||
@@ -818,8 +797,6 @@ static int is_bare_forward_decl(TSNode node, const char *source,
     return 0;
 }
 
-/* ── Call graph extraction ─────────────────────────────────────── */
-
 static void collect_callees(TSNode node, const char *source,
                             struct symbol *sym) {
     uint32_t count = ts_node_child_count(node);
@@ -843,8 +820,6 @@ static void collect_callees(TSNode node, const char *source,
         collect_callees(child, source, sym);
     }
 }
-
-/* ── collect_file: parse, query, filter, buffer symbols ────────── */
 
 static void collect_file(const char *path, TSParser *parser, TSQuery *query,
                          char **defines, int n_defines,
@@ -880,7 +855,6 @@ static void collect_file(const char *path, TSParser *parser, TSQuery *query,
             }
         }
 
-        /* Only file-scope nodes */
         if (!is_file_scope(node)) continue;
 
         if (should_skip_preproc(node, source, defines, n_defines))
@@ -937,14 +911,12 @@ static void collect_file(const char *path, TSParser *parser, TSQuery *query,
         struct symbol *sym = add_symbol(fe);
         sym->text = skeleton_text(source, node, cap_idx);
 
-        /* Detect forward declarations */
         char *fwd_tag = NULL;
         if (is_bare_forward_decl(node, source, cap_idx, &fwd_tag)) {
             sym->is_fwd_decl = 1;
             sym->tag_name = fwd_tag;
         }
 
-        /* Collect call graph edges */
         if (opt_show_calls && cap_idx == CAP_FUNC_DEF) {
             uint32_t child_count = ts_node_child_count(node);
             for (uint32_t c = 0; c < child_count; c++) {
@@ -962,8 +934,6 @@ static void collect_file(const char *path, TSParser *parser, TSQuery *query,
     free(source);
 }
 
-/* ── Visited set ───────────────────────────────────────────────── */
-
 static int visited_add(char ***visited, int *count, int *cap, const char *path) {
     for (int i = 0; i < *count; i++) {
         if (strcmp((*visited)[i], path) == 0) return 0;
@@ -975,8 +945,6 @@ static int visited_add(char ***visited, int *count, int *cap, const char *path) 
     (*visited)[(*count)++] = strdup(path);
     return 1;
 }
-
-/* ── Common prefix computation ─────────────────────────────────── */
 
 static void compute_common_prefix(char *out, size_t out_sz) {
     if (g_n_files == 0) { out[0] = '\0'; return; }
@@ -999,8 +967,6 @@ static void compute_common_prefix(char *out, size_t out_sz) {
         out[pfx_len] = '\0';
     }
 }
-
-/* ── Topological sort by include order ──────────────────────────── */
 
 static void topo_sort_files(void) {
     int n = g_n_files;
@@ -1054,7 +1020,6 @@ static void topo_sort_files(void) {
             order[count++] = i;
     }
 
-    /* Reorder g_files in-place via a temp copy */
     struct file_entry *tmp = malloc((size_t)n * sizeof(*tmp));
     for (int i = 0; i < n; i++)
         tmp[i] = g_files[order[i]];
@@ -1066,8 +1031,6 @@ static void topo_sort_files(void) {
     free(adj);
     free(in_degree);
 }
-
-/* ── Tree printer ──────────────────────────────────────────────── */
 
 static void print_indented(const char *text, int indent) {
     if (!text) return;
@@ -1152,8 +1115,6 @@ static void print_tree(void) {
     }
 }
 
-/* ── Cleanup ───────────────────────────────────────────────────── */
-
 static void cleanup(void) {
     for (int i = 0; i < g_n_files; i++) {
         struct file_entry *fe = &g_files[i];
@@ -1173,7 +1134,6 @@ static void cleanup(void) {
     }
     free(g_files);
 
-    /* Clean up tag set — free the stored keys */
     for (tag_set_itr itr = tag_set_first(&g_tags);
          !tag_set_is_end(itr);
          itr = tag_set_next(itr)) {
@@ -1181,8 +1141,6 @@ static void cleanup(void) {
     }
     tag_set_cleanup(&g_tags);
 }
-
-/* ── Main ──────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
     int opt;
@@ -1302,7 +1260,6 @@ int main(int argc, char *argv[]) {
         fts_close(ftsp);
     }
 
-    /* Print the collected tree */
     print_tree();
     cleanup();
 
