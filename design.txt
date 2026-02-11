@@ -1,0 +1,149 @@
+archmap — extracts a structural skeleton from C/C++ source trees using tree-sitter.
+
+Usage
+    archmap [options] <path> [path ...]
+
+    -d, --deps           Follow #include dependencies (BFS) beyond the given paths
+    -D, --define MACRO   Define macro for preprocessor branch selection
+    -I, --include-dir DIR  Add dir to the include search path
+    -c, --calls          Show call graph edges under functions
+    -s, --sys-includes   Show system #include <...> lines (hidden by default)
+    -h, --help           Print usage and exit
+
+Output format
+    Tree structure with 2-space indent per nesting level:
+
+        src/
+          core.h
+            #include "nolibc.h"
+            #define LOG_FATAL(fmt, ...) _fmt_write(2, "[FATAL] " fmt "\n", ##__VA_ARGS__)
+          event.c
+            #include "core.h"
+            void event_loop(struct server_ctx *ctx) ;
+              → queue_accept, uring_submit_and_wait, handle_accept, handle_recv
+
+    Rules:
+      - Directories end with /
+      - Paths are relative to the common prefix of all processed files
+      - Files are sorted alphabetically within each directory
+      - System #include <...> lines are omitted by default (use -s to show)
+      - Bare forward declarations (struct X;) are suppressed when a full
+        definition exists anywhere in the processed files
+      - Call edges (opt-in with -c) shown as → callee1, callee2, ... under
+        each function at 6-space indent
+
+How it works
+    A single tree-sitter query matches eight top-level node types:
+        function_definition  struct_specifier  enum_specifier  type_definition
+        declaration          preproc_def       preproc_function_def  preproc_include
+
+    Each file is parsed once. The match loop applies three filters:
+      1. Dedup: skip struct_specifier/enum_specifier whose parent is
+         type_definition or declaration (already captured by that parent).
+      2. Scope: keep only file-scope nodes (ancestor walk hits
+         translation_unit before any function_definition/compound_statement).
+      3. Preproc: if -D is set, skip nodes inside dead #ifdef/#if branches.
+
+    For function_definition, the compound_statement child is replaced with
+    a semicolon to produce a forward-declaration skeleton.
+
+    Buffered output: instead of printing as each file is parsed, symbols
+    are collected into in-memory arrays (struct file_entry / struct symbol).
+    After all files are processed, the tree printer sorts by relative path,
+    deduplicates forward declarations, and emits the tree format.
+
+Forward declaration deduplication
+    A verstable hash set (tag_set) tracks struct/enum/union tag names that
+    have full definitions (i.e., a body/field_declaration_list). When printing,
+    any bare forward declaration (struct X; with no body and no declarator)
+    whose tag is in the set is suppressed.
+
+    Detection: register_full_tags recursively walks each captured node for
+    struct_specifier/union_specifier/enum_specifier with a body field, and
+    inserts the tag name. is_bare_forward_decl checks if a node is a bare
+    forward declaration by looking for the absence of a body and declarator.
+
+Call graph extraction
+    When -c is active, each function_definition's compound_statement is
+    walked recursively to find call_expression nodes. The function child's
+    identifier text is extracted and deduplicated into a callees array on
+    the symbol. Macro invocations that tree-sitter parses as call_expression
+    (function-like macros) are also captured.
+
+Functions (source order)
+    is_source_file        Check extension (.c .h .cpp .hpp .cc)
+    fprint_node_text      Write source range to FILE*, optionally append semicolon
+    skeleton_text         Generate skeleton text into malloc'd string via open_memstream
+    is_macro_defined      Linear search of -D defines list
+    eval_ifdef            Evaluate preproc_ifdef node (#ifdef/#ifndef) → 1/0/-1
+    eval_preproc_if       Evaluate preproc_if node (#if defined/!defined/0/1) → 1/0/-1
+    should_skip_preproc   Ancestor walk to detect dead preprocessor branches
+    is_file_scope         Ancestor walk; true when translation_unit reached first
+    resolve_include       Try file_dir then -I paths; return realpath or NULL
+    extract_includes      Parse one file, collect resolved include paths
+    extract_tag_name_src  Extract struct/enum/union tag name from node with source text
+    has_body              Check if a node has a body (field_declaration_list or enumerator_list)
+    register_full_tags    Recursively find and register full struct/enum/union definitions
+    is_bare_forward_decl  Detect bare forward declarations (struct X;)
+    collect_callees       Recursively walk function body for call_expression nodes
+    collect_file          Parse, query, filter, buffer symbols for one file
+    add_file              Append a new file_entry to the global array
+    add_symbol            Append a new symbol to a file_entry
+    add_callee            Append a callee to a symbol (with dedup)
+    visited_add           Deduplicated insert into visited path set
+    compute_common_prefix Compute longest common directory prefix of all file paths
+    print_indented        Print multi-line text with given indent
+    print_tree            Sort files, suppress forward decls, emit tree format
+    cleanup               Free all allocated memory
+    main                  Argument parsing, parser/query setup, walk or BFS, print
+
+Preprocessor branch selection
+    Always active. should_skip_preproc walks from the matched node upward
+    through its ancestors:
+      - preproc_else: marks the node as being in an alternative branch.
+      - preproc_elif: evaluates the condition via eval_preproc_if (both
+        preproc_if and preproc_elif have a "condition" field). If the node
+        is below this elif (in a later elif or #else) and the condition is
+        true, an earlier branch wins so the node is skipped. If the node
+        is in this elif's own body and the condition is false/unknown, the
+        branch is dead and the node is skipped.
+      - preproc_elifdef: same logic as preproc_elif but uses eval_ifdef
+        (both preproc_ifdef and preproc_elifdef have a "name" field, and
+        the "ifndef" substring check works for "#elifndef" too).
+      - preproc_ifdef: eval_ifdef checks the "name" field against the
+        defines list, distinguishing #ifdef from #ifndef by scanning the
+        source text for "ifndef".
+      - preproc_if: eval_preproc_if inspects the "condition" child.
+        Handles preproc_defined, unary_expression (! operator), and
+        number_literal (0/1). Returns -1 (unknown) for anything else.
+      - A node is skipped when: condition is true but node is in the
+        alternative branch, or condition is not provably true (false or
+        unknown) and node is in the primary branch. This "unknown = false"
+        rule ensures exactly one branch is emitted per conditional.
+    Without -D flags, all macros are treated as undefined: #ifdef X skips
+    the primary block and emits the #else; #ifndef X emits the primary
+    (correct for include guards).
+
+Directory walking
+    Uses fts(3) with FTS_PHYSICAL | FTS_NOCHDIR.
+    Skip rules: dotfiles/dotdirs, and below root level: build, vendor,
+    node_modules, third_party.
+
+    Default mode: walk all given paths, collect each source file once,
+    then print the tree.
+
+    BFS dependency mode (-d): seed a visited set from the fts walk, then
+    iterate: collect_file buffers the skeleton, extract_includes resolves
+    the file's #include directives (quoted via file_dir, then -I paths)
+    and appends newly-seen realpath entries to the queue. Continues until
+    the queue is drained. Tree is printed after all files are collected.
+
+Dependencies
+    libtree-sitter, libtree-sitter-c — tree-sitter runtime and C grammar
+    verstable.h — single-header hash table library (header-only, in-tree)
+      Source: https://github.com/JacksonAllan/Verstable
+
+Build
+    make            # requires libtree-sitter, libtree-sitter-c
+    Compiles as: gcc -O2 -Wall -Wextra -pedantic -std=c11 main.c \
+                 -ltree-sitter -ltree-sitter-c -o archmap
