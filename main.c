@@ -33,6 +33,44 @@ enum {
     CAP_INCLUDE,
 };
 
+enum { SEC_TYPE = 0, SEC_DEF, SEC_DATA, SEC_FUNCTIONS, SEC_COUNT };
+
+static const char *section_headers[SEC_COUNT] = {
+    "[type]", "[def]", "[data]", "[functions]"
+};
+
+static int has_function_declarator(TSNode node) {
+    const char *type = ts_node_type(node);
+    if (strcmp(type, "function_declarator") == 0) return 1;
+    if (strcmp(type, "pointer_declarator") == 0 ||
+        strcmp(type, "parenthesized_declarator") == 0) {
+        TSNode inner = ts_node_child_by_field_name(node, "declarator", 10);
+        if (!ts_node_is_null(inner)) return has_function_declarator(inner);
+    }
+    return 0;
+}
+
+static int section_for_capture(uint32_t cap_idx, TSNode node) {
+    switch (cap_idx) {
+    case CAP_STRUCT_DEF: return SEC_TYPE;
+    case CAP_TYPEDEF:    return SEC_TYPE;
+    case CAP_ENUM_DEF: {
+        TSNode name = ts_node_child_by_field_name(node, "name", 4);
+        return ts_node_is_null(name) ? SEC_DEF : SEC_TYPE;
+    }
+    case CAP_PREPROC_DEF:  return SEC_DEF;
+    case CAP_PREPROC_FUNC: return SEC_DEF;
+    case CAP_GLOBAL_VAR: {
+        TSNode decl = ts_node_child_by_field_name(node, "declarator", 10);
+        if (!ts_node_is_null(decl) && has_function_declarator(decl))
+            return SEC_FUNCTIONS;
+        return SEC_DATA;
+    }
+    case CAP_FUNC_DEF:     return SEC_FUNCTIONS;
+    default: return SEC_DEF;
+    }
+}
+
 const char *QUERY_SOURCE =
     "(function_definition) @func_def "
     "(struct_specifier) @struct_def "
@@ -50,6 +88,10 @@ struct symbol {
     int cap_callees;
     int is_fwd_decl;
     char *tag_name;
+    uint32_t cap_idx;
+    uint32_t start_line;
+    uint32_t end_line;
+    int section;
 };
 
 struct file_entry {
@@ -177,6 +219,8 @@ static void strip_qualifiers(char *text) {
         if (strncmp(src, "static ", 7) == 0) { src += 7; continue; }
         if (strncmp(src, "inline ", 7) == 0) { src += 7; continue; }
         if (strncmp(src, "extern ", 7) == 0) { src += 7; continue; }
+        if (strncmp(src, "const ", 6) == 0) { src += 6; continue; }
+        if (strncmp(src, "volatile ", 9) == 0) { src += 9; continue; }
         if (strncmp(src, "_Noreturn ", 10) == 0) { src += 10; continue; }
         /* __attribute__((...)) — find matching )) */
         if (strncmp(src, "__attribute__((", 15) == 0) {
@@ -209,6 +253,27 @@ static void strip_qualifiers(char *text) {
     }
     if (src != text)
         memmove(text, src, strlen(src) + 1);
+}
+
+static void strip_struct_refs(char *text) {
+    char *r = text, *w = text;
+    while (*r) {
+        /* Preserve string literal contents */
+        if (*r == '"' || *r == '\'') {
+            char q = *r;
+            *w++ = *r++;
+            while (*r && *r != q) {
+                if (*r == '\\' && r[1]) *w++ = *r++;
+                *w++ = *r++;
+            }
+            if (*r) *w++ = *r++;
+            continue;
+        }
+        if (strncmp(r, "struct ", 7) == 0) { r += 7; continue; }
+        if (strncmp(r, "union ", 6) == 0) { r += 6; continue; }
+        *w++ = *r++;
+    }
+    *w = '\0';
 }
 
 static void strip_trailing_attribute(char *text) {
@@ -361,6 +426,35 @@ static void collapse_blank_lines(char *text) {
     *w = '\0';
 }
 
+static void collapse_to_single_line(char *text) {
+    char *r = text, *w = text;
+    while (*r) {
+        /* Preserve string literal contents */
+        if (*r == '"' || *r == '\'') {
+            char q = *r;
+            *w++ = *r++;
+            while (*r && *r != q) {
+                if (*r == '\\' && r[1]) *w++ = *r++;
+                *w++ = *r++;
+            }
+            if (*r) *w++ = *r++;
+            continue;
+        }
+        if (*r == '\n' || *r == '\r') {
+            /* Replace newline + surrounding whitespace with single space */
+            while (w > text && (w[-1] == ' ' || w[-1] == '\t')) w--;
+            r++;
+            while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
+            if (*r) *w++ = ' ';
+            continue;
+        }
+        *w++ = *r++;
+    }
+    /* Trim trailing whitespace */
+    while (w > text && (w[-1] == ' ' || w[-1] == '\t')) w--;
+    *w = '\0';
+}
+
 static void postprocess_skeleton(char *buf, int do_strip) {
     if (do_strip) {
         strip_qualifiers(buf);
@@ -370,6 +464,7 @@ static void postprocess_skeleton(char *buf, int do_strip) {
     normalize_whitespace(buf);
     join_continuation_lines(buf);
     collapse_blank_lines(buf);
+    collapse_to_single_line(buf);
 }
 
 static void fprint_node_text(FILE *out, const char *source,
@@ -497,7 +592,7 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
 
     if (cap_idx == CAP_STRUCT_DEF || cap_idx == CAP_ENUM_DEF) {
         if (cap_idx == CAP_ENUM_DEF &&
-            is_simple_sequential_enum(node, 6)) {
+            is_simple_sequential_enum(node, 0)) {
             fprint_compact_enum(mem, node, node, source);
             fclose(mem);
             /* Compact output ends with "}\n"; insert semicolon */
@@ -509,6 +604,7 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
                 buf[len+1] = '\0';
             }
             strip_qualifiers(buf);
+            collapse_to_single_line(buf);
             return buf;
         }
         fprint_node_text(mem, source, start, end, 1);
@@ -523,12 +619,24 @@ static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
         for (uint32_t c = 0; c < cc; c++) {
             TSNode child = ts_node_child(node, c);
             if (strcmp(ts_node_type(child), "enum_specifier") == 0 &&
-                is_simple_sequential_enum(child, 6)) {
+                is_simple_sequential_enum(child, 0)) {
                 fprint_compact_enum(mem, node, child, source);
                 fclose(mem);
                 strip_qualifiers(buf);
+                collapse_to_single_line(buf);
                 return buf;
             }
+        }
+    }
+
+    if (cap_idx == CAP_PREPROC_FUNC) {
+        TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
+        if (!ts_node_is_null(params)) {
+            uint32_t params_end = ts_node_end_byte(params);
+            fprint_node_text(mem, source, start, params_end, 0);
+            fclose(mem);
+            postprocess_skeleton(buf, 0);
+            return buf;
         }
     }
 
@@ -910,6 +1018,26 @@ static void collect_file(const char *path, TSParser *parser, TSQuery *query,
 
         struct symbol *sym = add_symbol(fe);
         sym->text = skeleton_text(source, node, cap_idx);
+        sym->cap_idx = cap_idx;
+        sym->start_line = ts_node_start_point(node).row + 1;
+        sym->end_line = ts_node_end_point(node).row + 1;
+
+        /* Skip incomplete declarations (e.g. CACHE_ALIGN on its own line) */
+        if (cap_idx == CAP_GLOBAL_VAR) {
+            uint32_t end_byte = ts_node_end_byte(node);
+            uint32_t p = end_byte;
+            while (p > ts_node_start_byte(node) &&
+                   (source[p-1] == ' ' || source[p-1] == '\n' ||
+                    source[p-1] == '\r' || source[p-1] == '\t'))
+                p--;
+            if (p == ts_node_start_byte(node) || source[p-1] != ';') {
+                free(sym->text);
+                fe->n_syms--;
+                continue;
+            }
+        }
+
+        sym->section = section_for_capture(cap_idx, node);
 
         char *fwd_tag = NULL;
         if (is_bare_forward_decl(node, source, cap_idx, &fwd_tag)) {
@@ -1032,17 +1160,13 @@ static void topo_sort_files(void) {
     free(in_degree);
 }
 
-static void print_indented(const char *text, int indent) {
-    if (!text) return;
-    const char *p = text;
-    while (*p) {
-        const char *nl = strchr(p, '\n');
-        if (!nl) nl = p + strlen(p);
-        printf("%*s%.*s\n", indent, "", (int)(nl - p), p);
-        if (*nl == '\n') nl++;
-        p = nl;
-        if (*p == '\0') break;
+static int is_suppressed_fwd(struct symbol *s) {
+    if (s->is_fwd_decl && s->tag_name) {
+        tag_set_itr itr = tag_set_get(&g_tags, s->tag_name);
+        if (!tag_set_is_end(itr))
+            return 1;
     }
+    return 0;
 }
 
 static void print_tree(void) {
@@ -1062,53 +1186,77 @@ static void print_tree(void) {
             g_files[i].rel_path = strdup(ap);
     }
 
-    char prev_dir[PATH_MAX] = "";
-
     for (int i = 0; i < g_n_files; i++) {
         struct file_entry *fe = &g_files[i];
-        if (fe->n_syms == 0) continue;
 
-        /* Extract directory portion */
-        char dir[PATH_MAX] = "";
-        const char *base = fe->rel_path;
-        const char *last_slash = strrchr(fe->rel_path, '/');
-        if (last_slash) {
-            size_t dlen = (size_t)(last_slash - fe->rel_path);
-            if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
-            memcpy(dir, fe->rel_path, dlen);
-            dir[dlen] = '\0';
-            base = last_slash + 1;
-        }
-
-        /* Print directory header if changed */
-        if (strcmp(dir, prev_dir) != 0) {
-            if (dir[0] != '\0')
-                printf("%s/\n", dir);
-            snprintf(prev_dir, sizeof(prev_dir), "%s", dir);
-        }
-
-        /* File name, indented 2 spaces */
-        printf("  %s\n", base);
-
-        /* Symbols, indented 4 spaces */
+        /* Check if file has any visible symbols */
+        int has_visible = 0;
         for (int j = 0; j < fe->n_syms; j++) {
-            struct symbol *s = &fe->syms[j];
-
-            /* Suppress forward declarations whose tag has a full definition */
-            if (s->is_fwd_decl && s->tag_name) {
-                tag_set_itr itr = tag_set_get(&g_tags, s->tag_name);
-                if (!tag_set_is_end(itr))
-                    continue;
+            if (!is_suppressed_fwd(&fe->syms[j])) {
+                has_visible = 1;
+                break;
             }
+        }
+        if (!has_visible) continue;
 
-            print_indented(s->text, 4);
+        printf("--- %s\n", fe->rel_path);
 
-            /* Call edges, indented 6 spaces */
-            if (opt_show_calls && s->n_callees > 0) {
-                printf("      \xe2\x86\x92 ");
-                for (int k = 0; k < s->n_callees; k++) {
-                    printf("%s%s", s->callees[k],
-                           k < s->n_callees - 1 ? ", " : "\n");
+        for (int sec = 0; sec < SEC_COUNT; sec++) {
+            /* Check if this section has any visible symbols */
+            int has_sec = 0;
+            for (int j = 0; j < fe->n_syms; j++) {
+                struct symbol *s = &fe->syms[j];
+                if (s->section == sec && !is_suppressed_fwd(s)) {
+                    has_sec = 1;
+                    break;
+                }
+            }
+            if (!has_sec) continue;
+
+            printf("%s\n", section_headers[sec]);
+
+            for (int j = 0; j < fe->n_syms; j++) {
+                struct symbol *s = &fe->syms[j];
+                if (s->section != sec) continue;
+                if (is_suppressed_fwd(s)) continue;
+                if (!s->text) continue;
+
+                char *text = s->text;
+                int text_len = (int)strlen(text);
+
+                /* [def] section: strip leading #define for preproc captures */
+                if (sec == SEC_DEF &&
+                    (s->cap_idx == CAP_PREPROC_DEF || s->cap_idx == CAP_PREPROC_FUNC)) {
+                    if (strncmp(text, "#define ", 8) == 0) {
+                        text += 8;
+                        text_len -= 8;
+                    }
+                }
+
+                /* [functions] and [data]: strip struct/union keywords from refs */
+                if (sec == SEC_FUNCTIONS || sec == SEC_DATA)
+                    strip_struct_refs(text);
+
+                /* Trim trailing whitespace/newline */
+                while (text_len > 0 &&
+                       (text[text_len-1] == '\n' || text[text_len-1] == '\r' ||
+                        text[text_len-1] == ' ' || text[text_len-1] == '\t'))
+                    text_len--;
+
+                /* Print with line suffix */
+                if (s->start_line == s->end_line)
+                    printf("%.*s  //:%u\n", text_len, text, (unsigned)s->start_line);
+                else
+                    printf("%.*s  //:%u-%u\n", text_len, text,
+                           (unsigned)s->start_line, (unsigned)s->end_line);
+
+                /* Call edges */
+                if (opt_show_calls && s->n_callees > 0) {
+                    printf("  \xe2\x86\x92 ");
+                    for (int k = 0; k < s->n_callees; k++) {
+                        printf("%s%s", s->callees[k],
+                               k < s->n_callees - 1 ? ", " : "\n");
+                    }
                 }
             }
         }
