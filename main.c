@@ -33,10 +33,10 @@ enum {
     CAP_INCLUDE,
 };
 
-enum { SEC_TYPE = 0, SEC_DEF, SEC_DATA, SEC_FUNCTIONS, SEC_COUNT };
+enum { SEC_STRUCT = 0, SEC_TYPE, SEC_DEF, SEC_DATA, SEC_FUNCTIONS, SEC_COUNT };
 
 static const char *section_headers[SEC_COUNT] = {
-    "[type]", "[def]", "[data]", "[functions]"
+    "[struct]", "[type]", "[def]", "[data]", "[functions]"
 };
 
 static int has_function_declarator(TSNode node) {
@@ -52,7 +52,7 @@ static int has_function_declarator(TSNode node) {
 
 static int section_for_capture(uint32_t cap_idx, TSNode node) {
     switch (cap_idx) {
-    case CAP_STRUCT_DEF: return SEC_TYPE;
+    case CAP_STRUCT_DEF: return SEC_STRUCT;
     case CAP_TYPEDEF:    return SEC_TYPE;
     case CAP_ENUM_DEF: {
         TSNode name = ts_node_child_by_field_name(node, "name", 4);
@@ -1233,8 +1233,8 @@ static void print_tree(void) {
                     }
                 }
 
-                /* [functions] and [data]: strip struct/union keywords from refs */
-                if (sec == SEC_FUNCTIONS || sec == SEC_DATA)
+                /* Strip struct/union keywords from all non-def sections */
+                if (sec != SEC_DEF)
                     strip_struct_refs(text);
 
                 /* Trim trailing whitespace/newline */
