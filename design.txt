@@ -11,28 +11,53 @@ Usage
     -h, --help           Print usage and exit
 
 Output format
-    Tree structure with 2-space indent per nesting level:
+    Flat sections per file, one declaration per line:
 
-        src/
-          core.h
-            #include "nolibc.h"
-            #define LOG_FATAL(fmt, ...) _fmt_write(2, "[FATAL] " fmt "\n", ##__VA_ARGS__)
-          event.c
-            #include "core.h"
-            void event_loop(struct server_ctx *ctx) ;
-              → queue_accept, uring_submit_and_wait, handle_accept, handle_recv
+        --- event.c
+        [struct]
+        conn_state { u8 closing : 1; u8 recv_active : 1; u8 reserved : 6; };  //:135-139
+        server_ctx { buf_ring br; sig_atomic_t running; int listen_fd; ... };  //:251-265
+        [type]
+        enum op_type { OP_ACCEPT = 0, OP_RECV = 1, OP_SEND = 2, ... };  //:56-63
+        [def]
+        CACHE_ALIGN __attribute__((aligned(64)))  //:74-75
+        decode_fd(ud)  //:152-153
+        [data]
+        io_uring_sqe SQE_TEMPLATE_ACCEPT = { ... };  //:77-83
+        conn_state g_conns[MAX_CONNECTIONS];  //:141
+        [functions]
+        void event_loop(server_ctx *ctx);  //:496-600
+        int server_run(u16 port, int cpu);  //:602-718
+
+    Sections (in order, omitted if empty):
+      [struct]     struct and union definitions (struct/union keyword stripped)
+      [type]       typedefs, named enums (enum foo { ... })
+      [def]        anonymous enums, #define (value macros keep value,
+                   function-like macros show name+params only, body dropped)
+      [data]       global/static variables
+      [functions]  function definitions (signature only) and function prototypes
 
     Rules:
-      - Directories end with /
+      - File delimiter: --- path/file.c
+      - Line numbers: //:N or //:N-M appended to every line
+      - Every declaration is collapsed to exactly one line
       - Paths are relative to the common prefix of all processed files
-      - Files are sorted alphabetically within each directory
+      - Files are topologically sorted by include dependencies
       - System #include <...> lines are omitted
-      - Bare forward declarations (struct X;) are suppressed when a full
+      - struct/union keywords stripped from all non-def sections
+      - Storage-class specifiers (static, extern, inline), const, volatile,
+        _Noreturn, and __attribute__((...)) stripped from declarations
+      - Bare forward declarations (struct X;) suppressed when a full
         definition exists anywhere in the processed files
-      - Call edges (opt-in with -c) shown as → callee1, callee2, ... under
-        each function at 6-space indent
-      - Global string literal initializers (string_literal, concatenated_string)
-        are truncated to = "..."; to save tokens
+      - Incomplete declarations (no trailing semicolon in source) are
+        skipped — handles macro-split fragments like CACHE_ALIGN on its
+        own line before a declaration
+      - Function prototypes (declarations with function_declarator) are
+        routed to [functions], not [data]
+      - Call edges (opt-in with -c) shown as -> callee1, callee2, ...
+        under each function
+      - Large initializers truncated to { ... }
+      - String literal initializers truncated to "..."
 
 How it works
     A single tree-sitter query matches eight top-level node types:
@@ -47,13 +72,31 @@ How it works
          translation_unit before any function_definition/compound_statement).
       3. Preproc: if -D is set, skip nodes inside dead #ifdef/#if branches.
 
-    For function_definition, the compound_statement child is replaced with
-    a semicolon to produce a forward-declaration skeleton.
+    After filtering, each captured node is classified into a section:
+      - section_for_capture() routes by capture index and node structure
+      - has_function_declarator() recursively checks through pointer_declarator
+        and parenthesized_declarator wrappers to detect function prototypes
+      - CAP_GLOBAL_VAR nodes with function_declarator go to SEC_FUNCTIONS
+      - Anonymous enums go to SEC_DEF; named enums go to SEC_TYPE
 
-    Buffered output: instead of printing as each file is parsed, symbols
-    are collected into in-memory arrays (struct file_entry / struct symbol).
-    After all files are processed, the tree printer sorts by relative path,
-    deduplicates forward declarations, and emits the tree format.
+    Skeleton text generation (skeleton_text):
+      - Function definitions: body (compound_statement) replaced with semicolon
+      - Global variables: large initializer_list replaced with { ... },
+        string_literal/concatenated_string replaced with "..."
+      - Struct/union/enum: bodies preserved but collapsed to single line
+      - Sequential enums (no explicit values, or only first has value):
+        compact comma-separated format
+      - Preproc function macros: name and parameters only, body dropped
+
+    Postprocessing pipeline (postprocess_skeleton):
+      strip_qualifiers -> strip_trailing_attribute -> strip_comments ->
+      normalize_whitespace -> join_continuation_lines ->
+      collapse_blank_lines -> collapse_to_single_line
+
+    Printing (print_tree):
+      - strip_struct_refs removes struct/union keywords from all non-def sections
+      - [def] section: leading #define stripped from preproc captures
+      - Forward declarations suppressed via tag_set lookup
 
 Forward declaration deduplication
     A verstable hash set (tag_set) tracks struct/enum/union tag names that
@@ -77,40 +120,49 @@ Functions (source order)
     read_file_source          Read file into malloc'd buffer
     should_skip_fts_entry     Check fts entry against skip rules (dotfiles, build dirs)
     is_source_file            Check extension (.c .h .cpp .hpp .cc)
-    strip_qualifiers          Remove leading storage-class/inline/attribute/custom macros
+    has_function_declarator   Recursively check if a declarator node contains a
+                              function_declarator (through pointer/parenthesized wrappers)
+    section_for_capture       Map capture index + node structure to output section
+    strip_qualifiers          Remove leading storage-class/inline/const/volatile/
+                              attribute/custom macros
+    strip_struct_refs         Remove struct/union keywords from type references
     strip_trailing_attribute  Remove trailing __attribute__((...)) after } or )
-    strip_comments            In-place removal of // and /* */ comments, preserving string literals
-    normalize_whitespace      Trim trailing whitespace per line; collapse interior space runs
-    collapse_blank_lines      Collapse runs of 2+ consecutive newlines to a single newline
-    join_continuation_lines   Join incomplete declaration lines split by qualifier stripping
-    postprocess_skeleton      Chain strip_qualifiers/strip_trailing_attribute/strip_comments/
-                              normalize_whitespace/collapse_blank_lines on skeleton text
+    strip_comments            In-place removal of // and /* */ comments, preserving
+                              string literals
+    normalize_whitespace      Trim trailing whitespace per line; collapse interior
+                              space runs
+    join_continuation_lines   Join incomplete declaration lines split by qualifier
+                              stripping
+    collapse_blank_lines      Collapse runs of 2+ consecutive newlines to single newline
+    collapse_to_single_line   Flatten multi-line text to single line, collapsing
+                              whitespace around newlines
+    postprocess_skeleton      Chain all text transforms on skeleton text
     fprint_node_text          Write source range to FILE*, optionally append semicolon
-    is_simple_sequential_enum Return true if enum has >threshold members and at most the first
-                              has an explicit = value (sequential enum)
-    fprint_compact_enum       Print enum as one-line comma-separated list; works for both
-                              standalone enum_specifier and typedef-wrapped enums
+    is_simple_sequential_enum Return true if enum members are sequential (at most
+                              first has explicit = value)
+    fprint_compact_enum       Print enum as one-line comma-separated list; works for
+                              both standalone and typedef-wrapped enums
     skeleton_text             Generate skeleton text into malloc'd string via open_memstream
     is_macro_defined          Linear search of -D defines list
-    eval_ifdef                Evaluate preproc_ifdef node (#ifdef/#ifndef) → 1/0/-1
-    eval_preproc_if           Evaluate preproc_if node (#if defined/!defined/0/1) → 1/0/-1
+    eval_ifdef                Evaluate preproc_ifdef node (#ifdef/#ifndef) -> 1/0/-1
+    eval_preproc_if           Evaluate preproc_if node (#if defined/!defined/0/1) -> 1/0/-1
     should_skip_preproc       Ancestor walk to detect dead preprocessor branches
     is_file_scope             Ancestor walk; true when translation_unit reached first
     resolve_include           Try file_dir then -I paths; return realpath or NULL
     extract_tag_name_src      Extract struct/enum/union tag name from node with source text
-    has_body                  Check if a node has a body (field_declaration_list or enumerator_list)
+    has_body                  Check if a node has a body field
     register_full_tags        Recursively find and register full struct/enum/union definitions
     is_bare_forward_decl      Detect bare forward declarations (struct X;)
     collect_callees           Recursively walk function body for call_expression nodes
-    collect_file              Parse, query, filter, buffer symbols + cache includes for one file
+    collect_file              Parse, query, filter, buffer symbols + cache includes
     add_file                  Append a new file_entry to the global array
     add_symbol                Append a new symbol to a file_entry
     add_callee                Append a callee to a symbol (with dedup)
     visited_add               Deduplicated insert into visited path set
     compute_common_prefix     Compute longest common directory prefix of all file paths
     topo_sort_files           Topological sort by cached include dependencies
-    print_indented            Print multi-line text with given indent
-    print_tree                Sort files, suppress forward decls, emit tree format
+    is_suppressed_fwd         Check if a forward decl should be suppressed (tag has full def)
+    print_tree                Sort files, suppress forward decls, emit sectioned format
     cleanup                   Free all allocated memory
     main                      Argument parsing, parser/query setup, walk or BFS, print
 
@@ -157,17 +209,22 @@ Directory walking
 
 Macro stripping (-S)
     strip_qualifiers removes leading storage-class specifiers (static, inline,
-    extern, _Noreturn), __attribute__((...)) blocks, and any macros specified
-    via -S from the start of declarations and function signatures.
-    strip_trailing_attribute removes __attribute__((...)) blocks that appear
-    after a closing } or ), e.g. } __attribute__((aligned(64)));  →  };
+    extern, const, volatile, _Noreturn), __attribute__((...)) blocks, and any
+    macros specified via -S from the start of declarations and function
+    signatures. strip_trailing_attribute removes __attribute__((...)) blocks
+    that appear after a closing } or ), e.g. } __attribute__((aligned(64)));
 
 Dependencies
     libtree-sitter, libtree-sitter-c — tree-sitter runtime and C grammar
+      Vendored in vendor/ as whole-program compilation (see build_scheme.txt)
     verstable.h — single-header hash table library (header-only, in-tree)
       Source: https://github.com/JacksonAllan/Verstable
 
 Build
-    make            # requires libtree-sitter, libtree-sitter-c
-    Compiles as: gcc -O2 -Wall -Wextra -pedantic -std=c11 main.c \
-                 -ltree-sitter -ltree-sitter-c -o archmap
+    make            # fetches vendor sources on first run, whole-program build
+    make clean      # remove binary
+    make vendor-clean  # remove vendor/ (re-fetched on next build)
+
+    Single-invocation build: main.c + tree-sitter lib.c + tree-sitter-c
+    parser.c compiled together with -fwhole-program for cross-module
+    inlining. See build_scheme.txt for full flag rationale.

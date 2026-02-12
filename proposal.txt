@@ -1,0 +1,206 @@
+Format Specification
+====================
+
+File delimiter:   --- path/file.c
+Section headers:  [struct] [type] [def] [data] [functions]  (in that order, omitted if empty)
+Line numbers:     //:N or //:N-M  appended to every line
+Indentation:      none — flat lines under each section
+Line count:       every declaration is exactly one line, no exceptions
+
+Sections:
+  [struct]     struct and union definitions (struct/union keyword stripped)
+  [type]       typedefs, named enums (enum foo { ... })
+  [def]        anonymous enums, #define (value macros keep value, function-like drop body)
+  [data]       global/static variables
+  [functions]  function definitions (signature only, body stripped) and function prototypes
+
+Rules:
+  - struct/union bodies collapsed to single line: { field; field; ... }
+  - struct/union keyword stripped everywhere except [def]
+  - enum members comma-separated on one line: { A=0, B=1, C=2 }
+  - strip storage-class (static/extern/inline), const, volatile, _Noreturn, __attribute__
+  - function-like macros: name and params only, body dropped
+  - value macros: keep the value (#define X 42), strip leading #define in output
+  - large initializers: { ... }  /  string literals: "..."
+  - function signatures always single-line, body replaced with ;
+  - function prototypes (declarations with function_declarator) go to [functions]
+  - incomplete declarations (no trailing ;) are silently skipped
+  - //:N or //:N-M is the line range in the original source
+  - directory changes encoded in the --- line via relative path
+  - files topologically sorted by include dependencies
+
+
+Example: uring_events project
+==============================
+
+--- nolibc.h
+[struct]
+k_sigaction { __sighandler_t sa_handler; unsigned long sa_flags; __sigrestore_t sa_restorer; k_sigset_t sa_mask; };  //:40-45
+sockaddr { unsigned short sa_family; char sa_data[14]; };  //:53-56
+[type]
+typedef uint8_t u8;  //:13
+typedef uint16_t u16;  //:14
+typedef uint32_t u32;  //:15
+typedef uint64_t u64;  //:16
+typedef int32_t i32;  //:17
+typedef int64_t i64;  //:18
+typedef unsigned long k_sigset_t;  //:36
+typedef void (*__sighandler_t)(int);  //:37
+typedef void (*__sigrestore_t)(void);  //:38
+typedef volatile int sig_atomic_t;  //:65
+typedef { unsigned long __bits[CPU_SETSIZE / _NCPUBITS]; } cpu_set_t;  //:72-74
+[def]
+SIGINT 2  //:31-32
+SIGTERM 15  //:32-33
+SA_RESTORER 0x04000000  //:34-35
+AF_INET 2  //:49-50
+SOCK_STREAM 1  //:50-51
+SOCK_NONBLOCK 0x800  //:51-52
+MAP_FAILED ((void *)-1)  //:58-59
+_NSIG 64  //:62-63
+CPU_SETSIZE 1024  //:69-70
+_NCPUBITS (8 * sizeof(unsigned long))  //:70-71
+CPU_ZERO(set)  //:76-78
+CPU_SET(cpu, set)  //:78-80
+htons(x)  //:83-84
+htonl(x)  //:84-85
+_syscall0(nr)  //:103-104
+_syscall1(nr,a)  //:104-105
+_syscall2(nr,a,b)  //:105-106
+_syscall3(nr,a,b,c)  //:106-107
+_syscall4(nr,a,b,c,d)  //:107-108
+_syscall5(nr,a,b,c,d,e)  //:108-109
+close(fd)  //:178-179
+mmap(addr,len,prot,fl,fd,off)  //:179-180
+munmap(addr,len)  //:180-181
+socket(d,t,p)  //:181-182
+setsockopt(fd,lev,opt,val,len)  //:182-183
+bind(fd,addr,len)  //:183-184
+listen(fd,bl)  //:184-185
+sched_setaffinity(pid,len,mask)  //:185-186
+[functions]
+long _syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6);  //:88-101
+long sys_write(int fd, const void *buf, size_t count);  //:112-114
+int sys_close(int fd);  //:116-118
+void *sys_mmap(void *addr, size_t len, int prot, int flags, int fd, long offset);  //:120-123
+int sys_munmap(void *addr, size_t len);  //:125-127
+int sys_socket(int domain, int type, int protocol);  //:129-131
+int sys_setsockopt(int fd, int level, int optname, const void *optval, int optlen);  //:133-136
+int sys_bind(int fd, const void *addr, int addrlen);  //:138-140
+int sys_listen(int fd, int backlog);  //:142-144
+int sys_sched_setaffinity(int pid, size_t len, const void *mask);  //:146-148
+int sys_io_uring_setup(unsigned entries, void *params);  //:150-152
+int sys_io_uring_register(int fd, unsigned opcode, const void *arg, unsigned nr_args);  //:154-157
+long sys_io_uring_enter(int fd, unsigned to_submit, unsigned min_complete, unsigned flags, const void *arg, size_t argsz);  //:159-164
+int sys_rt_sigaction(int sig, const k_sigaction *act, k_sigaction *oact, size_t sigsetsize);  //:166-169
+void sys_exit_group(int status);  //:171-174
+void __sa_restorer(void);  //:190-192
+int k_sigaction(int sig, void (*handler)(int));  //:194-202
+void _fmt_write(int fd, const char *fmt, ...);  //:208-209
+void _fmt_write(int fd, const char *fmt, ...);  //:211-279
+
+--- uring.h
+[struct]
+uring_sq { u32 *khead; u32 *ktail; io_uring_sqe *sqes; u32 *array; u32 ring_mask; u32 ring_entries; u32 sqe_head; u32 sqe_tail; u32 cached_khead; u32 _pad0; u32 *kflags; u32 *kdropped; u32 *kring_mask; u32 *kring_entries; size_t ring_sz; u8 *ring_ptr; };  //:79-99
+uring_cq { u32 *khead; u32 *ktail; io_uring_cqe *cqes; u32 ring_mask; u32 _pad0; u32 *kring_mask; u32 *kring_entries; u32 *kflags; u32 *koverflow; size_t ring_sz; u8 *ring_ptr; };  //:102-117
+uring { uring_sq sq; uring_cq cq; int ring_fd; int registered_index; u32 features; u32 flags; };  //:120-127
+buf_ring_config { u16 num_buffers; u16 bgid; u32 buffer_size; u32 buffer_shift; u32 flags; };  //:131-137
+buf_ring_group { u16 tail; u16 mask; u16 free_count; u16 free_summary; u32 buffer_shift; u32 buffer_size; u32 ring_offset; u32 data_offset; u64 *free_bitmap; };  //:146-163
+buf_ring_mgr { void *base; size_t total_size; buf_ring_group groups[BUF_RING_MAX_GROUPS]; { u8 num_groups : 2; u8 initialized : 1; u8 _reserved : 5; } meta; u8 _pad[7]; };  //:175-185
+buf_ring { io_uring_buf_ring *br; u8 *buf_base; u16 tail; u16 mask; u32 buffer_size; u32 buffer_shift; };  //:189-196
+[def]
+SOCKET_URING_OP_SETSOCKOPT 0  //:15-16
+IORING_OP_URING_CMD 46  //:19-20
+IORING_SETUP_NO_SQARRAY (1U << 16)  //:24-25
+IORING_FILE_INDEX_ALLOC (~0U)  //:29-30
+IORING_OP_SEND_ZC 53  //:34-35
+IORING_RECVSEND_BUNDLE (1U << 1)  //:38-39
+IORING_CQE_F_NOTIF (1U << 3)  //:42-43
+IORING_REGISTER_RING_FDS 20  //:47-48
+IORING_UNREGISTER_RING_FDS 21  //:51-52
+IORING_ENTER_REGISTERED_RING (1U << 4)  //:55-56
+IORING_REGISTER_FILES2 13  //:60-61
+IORING_RSRC_REGISTER_SPARSE (1U << 0)  //:64-65
+enum { BUF_RING_MAX_GROUPS = 2, BUF_RING_MAX_BUFFERS = 8192, };  //:68-71
+smp_load_acquire(p)  //:75-76
+smp_store_release(p, v)  //:76-77
+BRC_FLAG_ZC (1U << 0)  //:140-141
+brc_is_zc(c)  //:141-142
+BRG_IS_ZC(g)  //:171-172
+BRG_NUM_BUFFERS(g)  //:172-173
+BUF_RING_PTR(mgr, grp)  //:219-221
+BUF_RING_DATA(mgr, grp)  //:222-224
+BUF_RING_ADDR(mgr, grp, idx)  //:225-227
+io_uring_setup(entries, params)  //:229-231
+io_uring_register(fd, opcode, arg, nr_args)  //:231-233
+IS_MMAP_ERR(p)  //:235-236
+MMAP_ERR(p)  //:236-237
+[functions]
+int uring_init(uring *ring, u32 sq_entries, u32 cq_entries);  //:239
+int uring_register_fixed_files(uring *ring, u32 count);  //:240
+int buf_ring_mgr_init(uring *ring, buf_ring_mgr *mgr, const buf_ring_config *configs, u8 num_configs);  //:241-242
+void buf_ring_mgr_destroy(uring *ring, buf_ring_mgr *mgr);  //:243
+int buf_ring_zc_probe(uring *ring);  //:244
+io_uring_sqe *uring_get_sqe(uring *ring);  //:247-264
+int uring_submit(uring *ring);  //:269-281
+int uring_submit_and_wait(uring *ring, unsigned wait_nr, __kernel_timespec *ts);  //:283-313
+void buf_ring_recycle(buf_ring *br, u16 bid);  //:318-330
+void buf_ring_sync(buf_ring *br);  //:333-335
+void buf_ring_mgr_sync(buf_ring_mgr *mgr, buf_ring_group *g);  //:338-342
+void zc_bitmap_set(buf_ring_group *g, u16 idx);  //:349-356
+void zc_bitmap_clear(buf_ring_group *g, u16 idx);  //:359-366
+int zc_bitmap_test(const buf_ring_group *g, u16 idx);  //:368-370
+int zc_bitmap_ffs(const buf_ring_group *g);  //:373-383
+u16 buf_ring_zc_alloc(buf_ring_group *g);  //:386-397
+void buf_ring_zc_recycle(buf_ring_group *g, u16 bid);  //:400-408
+void buf_ring_zc_push(buf_ring_mgr *mgr, buf_ring_group *g, u16 bid, u32 len);  //:411-421
+
+--- event.c
+[struct]
+conn_state { u8 closing : 1; u8 recv_active : 1; u8 reserved : 6; };  //:135-139
+server_ctx { buf_ring br; sig_atomic_t running; int listen_fd; u8 _pad_hot[24]; uring ring; buf_ring_mgr br_mgr; buf_ring_group *recv_grp; buf_ring_group *zc_grp; } ;  //:251-265
+[type]
+enum op_type { OP_ACCEPT = 0, OP_RECV = 1, OP_SEND = 2, OP_CLOSE = 3, OP_SETSOCKOPT = 4, OP_SEND_ZC = 5, };  //:56-63
+[def]
+enum { SQ_ENTRIES = 2048, CQ_ENTRIES = SQ_ENTRIES * 4, NUM_BUFFERS = 4096, BUFFER_SIZE = 2048, BUFFER_SHIFT = 11, BUFFER_GROUP_ID = 0, LISTEN_BACKLOG = 4096, MAX_CONNECTIONS = 65536, };  //:23-32
+HTTP_200_LEN (sizeof(HTTP_200_RESPONSE) - 1)  //:52-53
+CACHE_ALIGN __attribute__((aligned(64)))  //:74-75
+decode_fd(ud)  //:152-153
+decode_op(ud)  //:153-154
+decode_buf_idx(ud)  //:154-155
+prep_multishot_accept_direct(sqe, fd)  //:164-166
+prep_recv_multishot_direct(sqe, fd)  //:167-169
+prep_send_direct(sqe, fd, buf, len, buf_idx)  //:170-174
+prep_close_direct(sqe, fd)  //:175-177
+prep_send_zc_direct(sqe, fd, buf_idx)  //:178-180
+ctx_zc_enabled(ctx)  //:268-269
+[data]
+char HTTP_200_RESPONSE[] = "...";  //:44-50
+io_uring_sqe SQE_TEMPLATE_ACCEPT = { ... };  //:77-83
+io_uring_sqe SQE_TEMPLATE_RECV = { ... };  //:86-92
+io_uring_sqe SQE_TEMPLATE_SEND = { ... };  //:95-99
+io_uring_sqe SQE_TEMPLATE_CLOSE = { ... };  //:102-105
+io_uring_sqe SQE_TEMPLATE_SEND_ZC = { ... };  //:127-132
+conn_state g_conns[MAX_CONNECTIONS];  //:141
+int g_tcp_nodelay_val = 1;  //:144
+server_ctx *g_ctx = NULL;  //:270
+[functions]
+conn_state *get_conn(int fd);  //:146-150
+bool is_benign_err(int err);  //:158-161
+void prep_setsockopt_direct(io_uring_sqe *sqe, int idx, int level, int optname, const void *optval, int optlen);  //:182-196
+int create_listen_socket(u16 port, int cpu);  //:199-236
+int set_cpu_affinity(int cpu);  //:239-248
+void signal_handler(int sig);  //:272-276
+bool queue_accept(server_ctx *ctx);  //:279-287
+bool queue_recv(server_ctx *ctx, int fd);  //:289-304
+bool queue_send(server_ctx *ctx, int fd, u16 buf_idx);  //:306-321
+bool queue_close(server_ctx *ctx, int fd);  //:323-340
+bool queue_setsockopt_nodelay(server_ctx *ctx, int fd);  //:342-351
+bool queue_send_zc(server_ctx *ctx, int fd, const void *data, u32 len);  //:353-380
+void handle_send_zc(server_ctx *ctx, io_uring_cqe *cqe, int fd);  //:382-400
+void handle_setsockopt(server_ctx *ctx, io_uring_cqe *cqe, int fd);  //:402-409
+void handle_accept(server_ctx *ctx, io_uring_cqe *cqe);  //:411-439
+void handle_recv(server_ctx *ctx, io_uring_cqe *cqe, int fd);  //:441-485
+void handle_close(int fd);  //:487-493
+void event_loop(server_ctx *ctx);  //:496-600
+int server_run(u16 port, int cpu);  //:602-718

@@ -1,0 +1,118 @@
+Sidecar Metadata for archmap
+=============================
+
+Problem
+-------
+archmap output is structurally complete but lacks semantic context.
+A reader (human or LLM) seeing `--- nolibc.h` followed by 40 symbols
+has to scan everything to understand the file's role. Some files
+(syscall wrappers, vendored headers, platform shims) are boilerplate
+that any LLM already knows — they consume tokens without adding value.
+
+Two features address this:
+  1. Per-file summaries: a one-line description of the file's purpose.
+  2. Collapse hints: mark files as low-priority so archmap can show
+     only the summary line, hiding the full skeleton.
+
+Sidecar File
+------------
+A `.archmap` file placed in the project root (or any ancestor directory).
+Plain text, one directive per line. Blank lines and # comments allowed.
+
+Format:
+  summary <glob>  <text>
+  collapse <glob>
+
+Example .archmap:
+  # Platform abstraction — not useful for application-level questions
+  summary  nolibc.h       Freestanding Linux syscall wrappers and libc-free primitives
+  collapse nolibc.h
+
+  # SQE prep macros — three ISA variants of the same thing
+  summary  sqe_scalar.h   Scalar SQE preparation macro
+  summary  sqe_avx2.h     AVX2 SQE preparation macro (VMOVDQU)
+  summary  sqe_avx512.h   AVX512 SQE preparation macro (VMOVDQU64)
+  collapse sqe_*.h
+
+  summary  core.h         Logging macros and compiler hints
+  summary  event.h        Public interface: server_run()
+  summary  event.c        io_uring event loop: multishot accept/recv, zero-copy send
+  summary  uring.h        io_uring ring management, buffer ring groups, SQE/CQE helpers
+  summary  uring.c        io_uring setup, mmap, fixed file registration, buffer ring init
+
+Glob matching uses the file's relative path (after common prefix stripping),
+so patterns match against what appears in the `--- ` line.
+
+Output Behavior
+---------------
+When a summary exists for a file, it appears on the --- line:
+
+  --- nolibc.h  @summary: Freestanding Linux syscall wrappers and libc-free primitives
+
+When a file is collapsed, only the summary line is emitted — no sections
+or symbols. If a collapsed file has no summary, the --- line appears alone:
+
+  --- sqe_scalar.h  @summary: Scalar SQE preparation macro
+
+If a file is not collapsed, the summary is still shown on the --- line
+but the full skeleton follows as usual:
+
+  --- event.c  @summary: io_uring event loop: multishot accept/recv, zero-copy send
+  [struct]
+  conn_state { ... };
+  server_ctx { ... };
+  [type]
+  ...
+
+Runtime Override
+----------------
+Collapse is a default that can be overridden at the command line:
+
+  --expand <glob>     Force-expand files that would otherwise be collapsed
+  --collapse <glob>   Collapse files at runtime (adds to sidecar list)
+
+Examples:
+  # Show everything, ignore sidecar collapse hints
+  archmap --expand '*' /home/ccx/uring_events
+
+  # Collapse all headers, expand only the ones you care about
+  archmap --collapse '*.h' --expand 'uring.h,event.h' /home/ccx/uring_events
+
+  # Debug a syscall issue — expand the normally-collapsed nolibc.h
+  archmap --expand nolibc.h /home/ccx/uring_events
+
+CLI flags take precedence over sidecar directives. Later flags override
+earlier ones for the same file.
+
+Sidecar Discovery
+-----------------
+archmap searches for `.archmap` starting from the common prefix directory
+of all processed files, then walks upward to /. The first one found is
+used. This allows a single sidecar at the repo root to cover everything.
+
+Generation Workflow
+-------------------
+The sidecar is written once by hand or by an LLM, then maintained
+alongside the code. Typical workflow:
+
+  1. Run archmap on the project to see the full skeleton.
+  2. Write summaries for each file (or ask an LLM to generate them
+     from the skeleton output).
+  3. Mark boilerplate/vendored files as collapsed.
+  4. Commit the .archmap file alongside the source.
+
+Summaries should be short (under 80 chars), describe the file's role
+in the project (not just its contents), and use domain-specific language
+that helps an LLM understand architectural relationships.
+
+Token Budget Impact
+-------------------
+For the uring_events project (4185 tokens full output):
+
+  Collapsing nolibc.h + sqe_*.h saves ~700 tokens (17% reduction).
+  Summaries add ~50 tokens total (one line per file).
+  Net savings: ~650 tokens, bringing the output to ~3535 tokens for
+  a 75KB codebase (21x compression in tokens).
+
+The collapsed files are still discoverable — an LLM seeing the summary
+can request a targeted re-run with --expand if it needs details.
