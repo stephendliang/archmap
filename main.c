@@ -14,12 +14,7 @@
 
 extern const TSLanguage *tree_sitter_c(void);
 
-/* Verstable string set for struct/enum/union tag deduplication */
-#define NAME tag_set
-#define KEY_TY char *
-#define HASH_FN vt_hash_string
-#define CMPR_FN vt_cmpr_string
-#include "verstable.h"
+#include "hmap_avx512.h"
 
 /* Capture index names — must match order in QUERY_SOURCE */
 enum {
@@ -106,7 +101,7 @@ struct file_entry {
 
 static struct file_entry *g_files;
 static int g_n_files, g_cap_files;
-static tag_set g_tags;
+static saha g_tags;
 
 static int opt_follow_deps;
 static int opt_show_calls;
@@ -853,12 +848,8 @@ static void register_full_tags(TSNode node, const char *source) {
         if (has_body(node)) {
             char *tag = extract_tag_name_src(node, source);
             if (tag) {
-                tag_set_itr itr = tag_set_get(&g_tags, tag);
-                if (tag_set_is_end(itr)) {
-                    tag_set_insert(&g_tags, tag);
-                } else {
-                    free(tag);
-                }
+                saha_insert(&g_tags, tag, strlen(tag));
+                free(tag);
             }
         }
         return;
@@ -1162,8 +1153,7 @@ static void topo_sort_files(void) {
 
 static int is_suppressed_fwd(struct symbol *s) {
     if (s->is_fwd_decl && s->tag_name) {
-        tag_set_itr itr = tag_set_get(&g_tags, s->tag_name);
-        if (!tag_set_is_end(itr))
+        if (saha_contains(&g_tags, s->tag_name, strlen(s->tag_name)))
             return 1;
     }
     return 0;
@@ -1282,12 +1272,7 @@ static void cleanup(void) {
     }
     free(g_files);
 
-    for (tag_set_itr itr = tag_set_first(&g_tags);
-         !tag_set_is_end(itr);
-         itr = tag_set_next(itr)) {
-        free(itr.data->key);
-    }
-    tag_set_cleanup(&g_tags);
+    saha_destroy(&g_tags);
 }
 
 int main(int argc, char *argv[]) {
@@ -1322,7 +1307,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    tag_set_init(&g_tags);
+    saha_init(&g_tags);
 
     TSParser *parser = ts_parser_new();
     ts_parser_set_language(parser, tree_sitter_c());
