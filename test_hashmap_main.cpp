@@ -31,6 +31,8 @@ struct bench_result bench_avx64(const uint64_t *k_ins, const uint64_t *k_pos,
                                 const uint64_t *k_mix, uint64_t n_ops);
 struct bench_result bench_avx64s(const uint64_t *k_ins, const uint64_t *k_pos,
                                  const uint64_t *k_mix, uint64_t n_ops);
+struct bench_result bench_khashl(const uint64_t *k_ins, const uint64_t *k_pos,
+                                  const uint64_t *k_mix, uint64_t n_ops);
 
 } // extern "C"
 
@@ -110,12 +112,14 @@ int main(int argc, char **argv) {
     bench_result r_avx64  = bench_avx64(k_ins, k_pos, k_mix, n_ops);
     bench_result r_boost  = bench_boost(k_ins, k_pos, k_mix, n_ops);
     bench_result r_vt     = bench_vt(k_ins, k_pos, k_mix, n_ops);
+    bench_result r_khashl = bench_khashl(k_ins, k_pos, k_mix, n_ops);
 
     printf("                insert          lookup+         lookup±\n");
     print_row("avx_map64s",  &r_avx64s);
     print_row("avx_map64",   &r_avx64);
     print_row("verstable",   &r_vt);
     print_row("boost",       &r_boost);
+    print_row("khashl",      &r_khashl);
     printf("\n");
     printf("  insert:  %lu unique of %lu (%.1f%% dup)\n",
            (unsigned long)r_avx64.unique, (unsigned long)n_ops, r_avx64.dup_pct);

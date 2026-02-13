@@ -5,6 +5,10 @@
 #include "avx_map64s.h"
 #include "avx_map64.h"
 
+#include "testground/khashl/khashl.h"
+
+KHASHL_SET_INIT(static, kh_u64_t, kh_u64, uint64_t, kh_hash_uint64, kh_eq_generic)
+
 #define NAME vt_u64
 #define KEY_TY uint64_t
 #define HASH_FN vt_hash_integer
@@ -238,5 +242,46 @@ struct bench_result bench_vt(const uint64_t *k_ins, const uint64_t *k_pos,
     r.hit_pct  = 100.0 * (double)hits / (double)n_ops;
 
     vt_u64_cleanup(&set);
+    return r;
+}
+
+/* ================================================================
+ * khashl benchmark
+ * ================================================================ */
+
+struct bench_result bench_khashl(const uint64_t *k_ins, const uint64_t *k_pos,
+                                 const uint64_t *k_mix, uint64_t n_ops) {
+    struct bench_result r;
+    kh_u64_t *h = kh_u64_init();
+
+    uint64_t dups = 0;
+    int absent;
+    double t0 = now_sec();
+    for (uint64_t i = 0; i < n_ops; i++) {
+        kh_u64_put(h, k_ins[i], &absent);
+        if (!absent) dups++;
+    }
+    double elapsed = now_sec() - t0;
+    r.ins_mops = (double)n_ops / elapsed / 1e6;
+    r.unique   = kh_size(h);
+    r.dup_pct  = 100.0 * (double)dups / (double)n_ops;
+
+    t0 = now_sec();
+    for (uint64_t i = 0; i < n_ops; i++)
+        kh_u64_get(h, k_pos[i]);
+    elapsed = now_sec() - t0;
+    r.pos_mops = (double)n_ops / elapsed / 1e6;
+
+    uint64_t hits = 0;
+    t0 = now_sec();
+    for (uint64_t i = 0; i < n_ops; i++) {
+        if (kh_u64_get(h, k_mix[i]) != kh_end(h))
+            hits++;
+    }
+    elapsed = now_sec() - t0;
+    r.mix_mops = (double)n_ops / elapsed / 1e6;
+    r.hit_pct  = 100.0 * (double)hits / (double)n_ops;
+
+    kh_u64_destroy(h);
     return r;
 }
