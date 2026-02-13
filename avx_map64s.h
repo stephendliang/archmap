@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #define AVX64S_INIT_CAP   32
 #define AVX64S_LOAD_NUM   7
@@ -45,6 +46,14 @@ static inline uint16_t avx64s_overflow_bit(uint64_t hash) {
     return (uint16_t)(1u << ((hash >> 32) & 15));
 }
 
+/* --- Prefetch helper --- */
+
+static inline void avx_map64s_prefetch(struct avx_map64s *m, uint64_t key) {
+    uint64_t h = avx64s_hash(key);
+    uint32_t gi = (uint32_t)h & ((m->cap >> 5) - 1);
+    _mm_prefetch((const char *)(m->meta + (gi << 5)), _MM_HINT_T0);
+}
+
 /* --- SIMD helpers --- */
 
 static inline __mmask32 avx64s_match(const uint16_t *meta, uint16_t h2) {
@@ -64,6 +73,8 @@ static void avx64s_alloc(struct avx_map64s *m, uint32_t cap) {
     m->meta = (uint16_t *)aligned_alloc(64, cap * sizeof(uint16_t));
     memset(m->meta, 0, cap * sizeof(uint16_t));
     m->keys = (uint64_t *)malloc(cap * sizeof(uint64_t));
+    madvise(m->meta, cap * sizeof(uint16_t), MADV_HUGEPAGE);
+    madvise(m->keys, cap * sizeof(uint64_t), MADV_HUGEPAGE);
     m->cap   = cap;
     m->count = 0;
 }

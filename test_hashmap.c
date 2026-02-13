@@ -22,6 +22,8 @@ KHASHL_SET_INIT(static, kh_u64_t, kh_u64, uint64_t, kh_hash_uint64, kh_eq_generi
 #include <time.h>
 #include <math.h>
 
+#define PF_DIST 8
+
 /* ================================================================
  * xoshiro256** PRNG (fixed seed for reproducibility)
  * ================================================================ */
@@ -147,14 +149,19 @@ struct bench_result bench_avx64(const uint64_t *k_ins, const uint64_t *k_pos,
     r.dup_pct  = 100.0 * (double)dups / (double)n_ops;
 
     t0 = now_sec();
-    for (uint64_t i = 0; i < n_ops; i++)
+    for (uint64_t i = 0; i < n_ops; i++) {
+        if (i + PF_DIST < n_ops)
+            avx_map64_prefetch(&m, k_pos[i + PF_DIST]);
         avx_map64_contains(&m, k_pos[i]);
+    }
     elapsed = now_sec() - t0;
     r.pos_mops = (double)n_ops / elapsed / 1e6;
 
     uint64_t hits = 0;
     t0 = now_sec();
     for (uint64_t i = 0; i < n_ops; i++) {
+        if (i + PF_DIST < n_ops)
+            avx_map64_prefetch(&m, k_mix[i + PF_DIST]);
         if (avx_map64_contains(&m, k_mix[i]))
             hits++;
     }
@@ -188,14 +195,19 @@ struct bench_result bench_avx64s(const uint64_t *k_ins, const uint64_t *k_pos,
     r.dup_pct  = 100.0 * (double)dups / (double)n_ops;
 
     t0 = now_sec();
-    for (uint64_t i = 0; i < n_ops; i++)
+    for (uint64_t i = 0; i < n_ops; i++) {
+        if (i + PF_DIST < n_ops)
+            avx_map64s_prefetch(&m, k_pos[i + PF_DIST]);
         avx_map64s_contains(&m, k_pos[i]);
+    }
     elapsed = now_sec() - t0;
     r.pos_mops = (double)n_ops / elapsed / 1e6;
 
     uint64_t hits = 0;
     t0 = now_sec();
     for (uint64_t i = 0; i < n_ops; i++) {
+        if (i + PF_DIST < n_ops)
+            avx_map64s_prefetch(&m, k_mix[i + PF_DIST]);
         if (avx_map64s_contains(&m, k_mix[i]))
             hits++;
     }

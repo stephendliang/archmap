@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #define AVX64_INIT_CAP  64    /* 8 groups */
 #define AVX64_LOAD_NUM  3
@@ -26,10 +27,15 @@ struct avx_map64 {
 /* --- Hash: fast integer mixer (same as verstable/fast-hash) --- */
 
 static inline uint64_t avx64_hash(uint64_t key) {
-    key ^= key >> 23;
-    key *= 0x2127599bf4325c37ULL;
-    key ^= key >> 47;
-    return key;
+    return _mm_crc32_u64(_mm_crc32_u64(0, key), key);
+}
+
+/* --- Prefetch helper --- */
+
+static inline void avx_map64_prefetch(struct avx_map64 *m, uint64_t key) {
+    uint64_t h = avx64_hash(key);
+    uint32_t gi = (uint32_t)h & ((m->cap >> 3) - 1);
+    _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
 }
 
 /* --- SIMD helpers --- */
@@ -50,6 +56,7 @@ static inline __mmask8 avx64_empty(const uint64_t *grp) {
 static void avx64_alloc(struct avx_map64 *m, uint32_t cap) {
     m->keys  = (uint64_t *)aligned_alloc(64, cap * sizeof(uint64_t));
     memset(m->keys, 0, cap * sizeof(uint64_t));
+    madvise(m->keys, cap * sizeof(uint64_t), MADV_HUGEPAGE);
     m->cap   = cap;
     m->count = 0;
 }
