@@ -49,11 +49,10 @@ $(TARGET): main.c hmap_avx512.c hmap_avx512.h | $(TS_DIR) $(TSC_DIR)
 BENCH_CFLAGS  = -O3 -march=native -mavx512f -mavx512bw -std=gnu11
 BENCH_CXXFLAGS = -O3 -march=native -mavx512f -mavx512bw -std=gnu++17
 
-test_hashmap: test_hashmap_main.cpp test_hashmap.c hmap_avx512.c hmap_avx512.h avx_map64.h verstable.h
+test_hashmap: test_hashmap_main.cpp test_hashmap.c avx_map64s.h avx_map64.h verstable.h
 	$(CC) $(BENCH_CFLAGS) -c -o test_hashmap_bench.o test_hashmap.c
-	$(CC) $(BENCH_CFLAGS) -c -o test_hashmap_hmap.o hmap_avx512.c
 	g++ $(BENCH_CXXFLAGS) -c -o test_hashmap_main.o test_hashmap_main.cpp
-	g++ $(BENCH_CXXFLAGS) -o $@ test_hashmap_main.o test_hashmap_bench.o test_hashmap_hmap.o -lm
+	g++ $(BENCH_CXXFLAGS) -o $@ test_hashmap_main.o test_hashmap_bench.o -lm
 
 clean:
 	rm -f $(TARGET) test_hashmap test_hashmap_c.o test_hashmap_cpp.o

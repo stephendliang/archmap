@@ -2,7 +2,7 @@
  * C benchmark functions for SAHA tier-1 and verstable.
  * Compiled as C, linked from test_hashmap.cpp.
  */
-#include "hmap_avx512.h"
+#include "avx_map64s.h"
 #include "avx_map64.h"
 
 #define NAME vt_u64
@@ -122,48 +122,6 @@ struct bench_result {
 };
 
 /* ================================================================
- * SAHA tier-1 benchmark
- * ================================================================ */
-
-struct bench_result bench_saha(const uint64_t *k_ins, const uint64_t *k_pos,
-                               const uint64_t *k_mix, uint64_t n_ops) {
-    struct bench_result r;
-    struct saha_tier1 t1;
-    memset(&t1, 0, sizeof(t1));
-
-    uint64_t dups = 0;
-    double t0 = now_sec();
-    for (uint64_t i = 0; i < n_ops; i++) {
-        if (saha_t1_insert(&t1, (const char *)&k_ins[i], 8) == 0)
-            dups++;
-    }
-    double elapsed = now_sec() - t0;
-    r.ins_mops = (double)n_ops / elapsed / 1e6;
-    r.unique   = t1.count;
-    r.dup_pct  = 100.0 * (double)dups / (double)n_ops;
-
-    t0 = now_sec();
-    for (uint64_t i = 0; i < n_ops; i++)
-        saha_t1_contains(&t1, (const char *)&k_pos[i], 8);
-    elapsed = now_sec() - t0;
-    r.pos_mops = (double)n_ops / elapsed / 1e6;
-
-    uint64_t hits = 0;
-    t0 = now_sec();
-    for (uint64_t i = 0; i < n_ops; i++) {
-        if (saha_t1_contains(&t1, (const char *)&k_mix[i], 8))
-            hits++;
-    }
-    elapsed = now_sec() - t0;
-    r.mix_mops = (double)n_ops / elapsed / 1e6;
-    r.hit_pct  = 100.0 * (double)hits / (double)n_ops;
-
-    free(t1.meta);
-    free(t1.keys);
-    return r;
-}
-
-/* ================================================================
  * avx_map64 benchmark
  * ================================================================ */
 
@@ -201,6 +159,47 @@ struct bench_result bench_avx64(const uint64_t *k_ins, const uint64_t *k_pos,
     r.hit_pct  = 100.0 * (double)hits / (double)n_ops;
 
     avx_map64_destroy(&m);
+    return r;
+}
+
+/* ================================================================
+ * avx_map64s benchmark
+ * ================================================================ */
+
+struct bench_result bench_avx64s(const uint64_t *k_ins, const uint64_t *k_pos,
+                                 const uint64_t *k_mix, uint64_t n_ops) {
+    struct bench_result r;
+    struct avx_map64s m;
+    avx_map64s_init(&m);
+
+    uint64_t dups = 0;
+    double t0 = now_sec();
+    for (uint64_t i = 0; i < n_ops; i++) {
+        if (avx_map64s_insert(&m, k_ins[i]) == 0)
+            dups++;
+    }
+    double elapsed = now_sec() - t0;
+    r.ins_mops = (double)n_ops / elapsed / 1e6;
+    r.unique   = m.count;
+    r.dup_pct  = 100.0 * (double)dups / (double)n_ops;
+
+    t0 = now_sec();
+    for (uint64_t i = 0; i < n_ops; i++)
+        avx_map64s_contains(&m, k_pos[i]);
+    elapsed = now_sec() - t0;
+    r.pos_mops = (double)n_ops / elapsed / 1e6;
+
+    uint64_t hits = 0;
+    t0 = now_sec();
+    for (uint64_t i = 0; i < n_ops; i++) {
+        if (avx_map64s_contains(&m, k_mix[i]))
+            hits++;
+    }
+    elapsed = now_sec() - t0;
+    r.mix_mops = (double)n_ops / elapsed / 1e6;
+    r.hit_pct  = 100.0 * (double)hits / (double)n_ops;
+
+    avx_map64s_destroy(&m);
     return r;
 }
 
