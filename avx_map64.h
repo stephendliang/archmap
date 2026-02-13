@@ -53,10 +53,18 @@ static inline __mmask8 avx64_empty(const uint64_t *grp) {
 
 /* --- Alloc / grow --- */
 
+static size_t avx64_mapsize(uint32_t cap) {
+    size_t raw = (size_t)cap * sizeof(uint64_t);
+    return (raw + (2u << 20) - 1) & ~((size_t)(2u << 20) - 1); /* round to 2MB */
+}
+
 static void avx64_alloc(struct avx_map64 *m, uint32_t cap) {
-    m->keys  = (uint64_t *)aligned_alloc(64, cap * sizeof(uint64_t));
-    memset(m->keys, 0, cap * sizeof(uint64_t));
-    madvise(m->keys, cap * sizeof(uint64_t), MADV_HUGEPAGE);
+    size_t total = avx64_mapsize(cap);
+    m->keys = (uint64_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (m->keys == MAP_FAILED)
+        m->keys = (uint64_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     m->cap   = cap;
     m->count = 0;
 }
@@ -84,7 +92,7 @@ static void avx64_grow(struct avx_map64 *m) {
             gi = (gi + 1) & (ng - 1);
         }
     }
-    free(old_keys);
+    munmap(old_keys, avx64_mapsize(old_cap));
 }
 
 /* --- Public API --- */
@@ -94,7 +102,7 @@ static inline void avx_map64_init(struct avx_map64 *m) {
 }
 
 static inline void avx_map64_destroy(struct avx_map64 *m) {
-    free(m->keys);
+    if (m->keys) munmap(m->keys, avx64_mapsize(m->cap));
 }
 
 static inline int avx_map64_insert(struct avx_map64 *m, uint64_t key) {

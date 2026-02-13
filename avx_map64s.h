@@ -78,12 +78,18 @@ static inline __mmask32 avx64s_empty(const uint16_t *meta) {
 
 /* --- Alloc / grow --- */
 
+static size_t avx64s_mapsize(uint32_t cap) {
+    size_t raw = (size_t)(cap >> 5) * AVX64S_GROUP_BYTES;
+    return (raw + (2u << 20) - 1) & ~((size_t)(2u << 20) - 1); /* round to 2MB */
+}
+
 static void avx64s_alloc(struct avx_map64s *m, uint32_t cap) {
-    uint32_t ng = cap >> 5;
-    size_t total = (size_t)ng * AVX64S_GROUP_BYTES;
-    m->data = (char *)aligned_alloc(64, total);
-    memset(m->data, 0, total);
-    madvise(m->data, total, MADV_HUGEPAGE);
+    size_t total = avx64s_mapsize(cap);
+    m->data = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (m->data == MAP_FAILED)
+        m->data = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     m->cap   = cap;
     m->count = 0;
 }
@@ -123,7 +129,7 @@ static void avx64s_grow(struct avx_map64s *m) {
             }
         }
     }
-    free(old_data);
+    munmap(old_data, avx64s_mapsize(old_cap));
 }
 
 /* --- Public API --- */
@@ -133,7 +139,7 @@ static inline void avx_map64s_init(struct avx_map64s *m) {
 }
 
 static inline void avx_map64s_destroy(struct avx_map64s *m) {
-    free(m->data);
+    if (m->data) munmap(m->data, avx64s_mapsize(m->cap));
 }
 
 static inline int avx_map64s_insert(struct avx_map64s *m, uint64_t key) {
