@@ -68,12 +68,12 @@ static inline void avx_map64s_prefetch(const struct avx_map64s *m, uint64_t key)
 static inline __mmask32 avx64s_match(const uint16_t *meta, uint16_t h2) {
     __m512i group  = _mm512_load_si512((const __m512i *)meta);
     __m512i needle = _mm512_set1_epi16((short)h2);
-    return _mm512_mask_cmpeq_epi16_mask(AVX64S_DATA_MASK, group, needle);
+    return _mm512_cmpeq_epi16_mask(group, needle) & AVX64S_DATA_MASK;
 }
 
 static inline __mmask32 avx64s_empty(const uint16_t *meta) {
     __m512i group = _mm512_load_si512((const __m512i *)meta);
-    return _mm512_mask_cmpeq_epi16_mask(AVX64S_DATA_MASK, group, _mm512_setzero_si512());
+    return _mm512_testn_epi16_mask(group, group) & AVX64S_DATA_MASK;
 }
 
 /* --- Alloc / grow --- */
@@ -196,7 +196,7 @@ static inline int avx_map64s_contains(struct avx_map64s *m, uint64_t key) {
             if (kp[pos] == key) return 1;
             mm &= mm - 1;
         }
-        if (!(base[31] & avx64s_overflow_bit(h))) return 0;
+        if (!((base[31] >> ((uint32_t)(h >> 32) & 15)) & 1)) return 0;
         gi = (gi + 1) & (ng - 1);
     }
 }
