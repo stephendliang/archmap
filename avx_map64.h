@@ -126,7 +126,7 @@ static inline int avx_map64_insert(struct avx_map64 *m, uint64_t key) {
 }
 
 static inline int avx_map64_contains(struct avx_map64 *m, uint64_t key) {
-    if (m->cap == 0) return 0;
+    if (__builtin_expect(m->cap == 0, 0)) return 0;
 
     uint32_t gi = avx64_hash(key) & m->mask;
 

@@ -26,24 +26,27 @@ struct avx_map64s {
     char *data;          /* interleaved groups: [meta 64B | keys 256B] × ng */
     uint32_t count;
     uint32_t cap;        /* ng * 32 (includes sentinel positions) */
+    uint32_t mask;       /* (cap >> 5) - 1, precomputed for group index */
 };
 
-/* --- Hash: chained CRC32 mixer (full 64-bit output) --- */
+/* --- Hash: chained CRC32 mixer (two 32-bit halves) --- */
 
-static inline uint64_t avx64s_hash(uint64_t key) {
-    uint64_t lo = _mm_crc32_u64(0, key);
-    uint64_t hi = _mm_crc32_u64(lo, key);
-    return lo | (hi << 32);
+struct avx64s_h { uint32_t lo, hi; };
+
+static inline struct avx64s_h avx64s_hash(uint64_t key) {
+    uint32_t lo = (uint32_t)_mm_crc32_u64(0, key);
+    uint32_t hi = (uint32_t)_mm_crc32_u64(lo, key);
+    return (struct avx64s_h){lo, hi};
 }
 
 /* --- Metadata encoding --- */
 
-static inline uint16_t avx64s_h2(uint64_t hash) {
-    return (uint16_t)((hash >> 49) | 0x8000);
+static inline uint16_t avx64s_h2(uint32_t hi) {
+    return (uint16_t)((hi >> 17) | 0x8000);
 }
 
-static inline uint16_t avx64s_overflow_bit(uint64_t hash) {
-    return (uint16_t)(1u << ((hash >> 32) & 15));
+static inline uint16_t avx64s_overflow_bit(uint32_t hi) {
+    return (uint16_t)(1u << (hi & 15));
 }
 
 /* --- Group access helpers --- */
@@ -56,7 +59,7 @@ static inline char *avx64s_group(const struct avx_map64s *m, uint32_t gi) {
 
 static inline void avx_map64s_prefetch(const struct avx_map64s *m, uint64_t key) {
     uint32_t lo = (uint32_t)_mm_crc32_u64(0, key);
-    uint32_t gi = lo & ((m->cap >> 5) - 1);
+    uint32_t gi = lo & m->mask;
     const char *grp = avx64s_group(m, gi);
     _mm_prefetch(grp, _MM_HINT_T0);        /* metadata cache line */
     _mm_prefetch(grp + 64, _MM_HINT_T0);   /* keys[0..7] */
@@ -91,6 +94,7 @@ static void avx64s_alloc(struct avx_map64s *m, uint32_t cap) {
         m->data = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     m->cap   = cap;
+    m->mask  = (cap >> 5) - 1;
     m->count = 0;
 }
 
@@ -100,7 +104,7 @@ static void avx64s_grow(struct avx_map64s *m) {
     uint32_t old_ng   = old_cap >> 5;
 
     avx64s_alloc(m, old_cap * 2);
-    uint32_t ng = m->cap >> 5;
+    uint32_t mask = m->mask;
 
     for (uint32_t g = 0; g < old_ng; g++) {
         const char     *old_grp = old_data + (size_t)g * AVX64S_GROUP_BYTES;
@@ -109,9 +113,9 @@ static void avx64s_grow(struct avx_map64s *m) {
         for (int s = 0; s < 31; s++) {
             if (!(om[s] & 0x8000)) continue;
             uint64_t key = ok[s];
-            uint64_t h   = avx64s_hash(key);
-            uint16_t h2  = avx64s_h2(h);
-            uint32_t gi  = (uint32_t)h & (ng - 1);
+            struct avx64s_h h = avx64s_hash(key);
+            uint16_t h2  = avx64s_h2(h.hi);
+            uint32_t gi  = h.lo & mask;
             for (;;) {
                 char     *grp  = avx64s_group(m, gi);
                 uint16_t *base = (uint16_t *)grp;
@@ -124,8 +128,8 @@ static void avx64s_grow(struct avx_map64s *m) {
                     m->count++;
                     break;
                 }
-                base[31] |= avx64s_overflow_bit(h);
-                gi = (gi + 1) & (ng - 1);
+                base[31] |= avx64s_overflow_bit(h.hi);
+                gi = (gi + 1) & mask;
             }
         }
     }
@@ -147,10 +151,9 @@ static inline int avx_map64s_insert(struct avx_map64s *m, uint64_t key) {
     if (m->count * AVX64S_LOAD_DEN >= m->cap * AVX64S_LOAD_NUM)
         avx64s_grow(m);
 
-    uint64_t h  = avx64s_hash(key);
-    uint16_t h2 = avx64s_h2(h);
-    uint32_t ng = m->cap >> 5;
-    uint32_t gi = (uint32_t)h & (ng - 1);
+    struct avx64s_h h = avx64s_hash(key);
+    uint16_t h2 = avx64s_h2(h.hi);
+    uint32_t gi = h.lo & m->mask;
 
     for (;;) {
         char     *grp  = avx64s_group(m, gi);
@@ -172,18 +175,17 @@ static inline int avx_map64s_insert(struct avx_map64s *m, uint64_t key) {
             m->count++;
             return 1;
         }
-        base[31] |= avx64s_overflow_bit(h);
-        gi = (gi + 1) & (ng - 1);
+        base[31] |= avx64s_overflow_bit(h.hi);
+        gi = (gi + 1) & m->mask;
     }
 }
 
 static inline int avx_map64s_contains(struct avx_map64s *m, uint64_t key) {
-    if (m->cap == 0) return 0;
+    if (__builtin_expect(m->cap == 0, 0)) return 0;
 
-    uint64_t h  = avx64s_hash(key);
-    uint16_t h2 = avx64s_h2(h);
-    uint32_t ng = m->cap >> 5;
-    uint32_t gi = (uint32_t)h & (ng - 1);
+    struct avx64s_h h = avx64s_hash(key);
+    uint16_t h2 = avx64s_h2(h.hi);
+    uint32_t gi = h.lo & m->mask;
 
     for (;;) {
         const char     *grp  = avx64s_group(m, gi);
@@ -196,8 +198,8 @@ static inline int avx_map64s_contains(struct avx_map64s *m, uint64_t key) {
             if (kp[pos] == key) return 1;
             mm &= mm - 1;
         }
-        if (!((base[31] >> ((uint32_t)(h >> 32) & 15)) & 1)) return 0;
-        gi = (gi + 1) & (ng - 1);
+        if (!((base[31] >> (h.hi & 15)) & 1)) return 0;
+        gi = (gi + 1) & m->mask;
     }
 }
 
