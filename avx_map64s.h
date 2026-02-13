@@ -27,13 +27,12 @@ struct avx_map64s {
     uint32_t cap;       /* ng * 32 (includes sentinel positions) */
 };
 
-/* --- Hash: same fast integer mixer as avx_map64 --- */
+/* --- Hash: chained CRC32 mixer (full 64-bit output) --- */
 
 static inline uint64_t avx64s_hash(uint64_t key) {
-    key ^= key >> 23;
-    key *= 0x2127599bf4325c37ULL;
-    key ^= key >> 47;
-    return key;
+    uint64_t lo = _mm_crc32_u64(0, key);
+    uint64_t hi = _mm_crc32_u64(lo, key);
+    return lo | (hi << 32);
 }
 
 /* --- Metadata encoding --- */
