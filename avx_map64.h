@@ -129,11 +129,13 @@ static inline int avx_map64_contains(struct avx_map64 *m, uint64_t key) {
     if (__builtin_expect(m->cap == 0, 0)) return 0;
 
     uint32_t gi = avx64_hash(key) & m->mask;
+    __m512i needle = _mm512_set1_epi64((long long)key);
 
     for (;;) {
         uint64_t *grp = m->keys + (gi << 3);
-        if (avx64_match(grp, key)) return 1;
-        if (avx64_empty(grp))      return 0;
+        __m512i group = _mm512_load_si512((const __m512i *)grp);
+        if (_mm512_cmpeq_epi64_mask(group, needle))        return 1;
+        if (_mm512_testn_epi64_mask(group, group))          return 0;
         gi = (gi + 1) & m->mask;
     }
 }
@@ -145,18 +147,21 @@ static inline int avx_map64_delete(struct avx_map64 *m, uint64_t key) {
 
     uint32_t gi   = avx64_hash(key) & m->mask;
     uint32_t mask = m->mask;
+    __m512i needle = _mm512_set1_epi64((long long)key);
 
-    /* locate the key (same probe as contains) */
+    /* locate the key — single SIMD load, dual mask extraction */
     for (;;) {
         uint64_t *grp = m->keys + (gi << 3);
-        __mmask8 mm = avx64_match(grp, key);
+        __m512i group = _mm512_load_si512((__m512i *)grp);
+        __mmask8 mm    = _mm512_cmpeq_epi64_mask(group, needle);
+        __mmask8 empty = _mm512_testn_epi64_mask(group, group);
+
         if (mm) {
             grp[__builtin_ctz(mm)] = 0;
             m->count--;
 
-            /* group already had empties → no probe chain to fix */
-            if (__builtin_popcount(avx64_empty(grp)) > 1)
-                return 1;
+            /* group was non-full before delete → no probe chain to fix */
+            if (empty) return 1;
 
             /* backshift: pull displaced keys toward their home group.
              *
@@ -168,39 +173,46 @@ static inline int avx_map64_delete(struct avx_map64 *m, uint64_t key) {
              * one key per group back to fill each successive hole.
              */
             uint32_t hole_gi = gi;
+            int hole_slot = __builtin_ctz(mm); /* slot we just zeroed */
             uint32_t scan_gi = (gi + 1) & mask;
 
             for (;;) {
-                uint64_t *scan_grp = m->keys + (scan_gi << 3);
-                __mmask8 empty = avx64_empty(scan_grp);
+                /* prefetch 2 groups ahead — sequential scan is predictable */
+                uint32_t pf_gi = (scan_gi + 2) & mask;
+                _mm_prefetch((const char *)(m->keys + (pf_gi << 3)), _MM_HINT_T0);
 
-                if (empty == 0xFF) break; /* fully empty group — chain over */
+                uint64_t *scan_grp = m->keys + (scan_gi << 3);
+                __m512i scan_group = _mm512_load_si512((__m512i *)scan_grp);
+                __mmask8 scan_empty = _mm512_testn_epi64_mask(scan_group, scan_group);
+
+                if (scan_empty == 0xFF) break; /* fully empty group — chain over */
 
                 int moved = 0;
-                for (__mmask8 todo = (~empty) & 0xFF; todo; todo &= todo - 1) {
+                for (__mmask8 todo = (~scan_empty) & 0xFF; todo; todo &= todo - 1) {
                     int s = __builtin_ctz(todo);
                     uint32_t home = avx64_hash(scan_grp[s]) & mask;
                     /* does this key's probe path cross hole_gi? */
                     if (((hole_gi - home) & mask) < ((scan_gi - home) & mask)) {
                         uint64_t *hole_grp = m->keys + (hole_gi << 3);
-                        hole_grp[__builtin_ctz(avx64_empty(hole_grp))] = scan_grp[s];
+                        hole_grp[hole_slot] = scan_grp[s];
                         scan_grp[s] = 0;
 
                         /* scan group already had empties → chain ends here */
-                        if (empty) return 1;
+                        if (scan_empty) return 1;
 
                         hole_gi = scan_gi;
+                        hole_slot = s; /* moved key's slot is the new hole */
                         moved = 1;
                         break;
                     }
                 }
 
-                if (!moved && empty) break; /* empties, no candidates — done */
+                if (!moved && scan_empty) break; /* empties, no candidates — done */
                 scan_gi = (scan_gi + 1) & mask;
             }
             return 1;
         }
-        if (avx64_empty(grp)) return 0; /* key not found */
+        if (empty) return 0; /* key not found */
         gi = (gi + 1) & mask;
     }
 }

@@ -22,7 +22,7 @@ KHASHL_SET_INIT(static, kh_u64_t, kh_u64, uint64_t, kh_hash_uint64, kh_eq_generi
 #include <time.h>
 #include <math.h>
 
-#define PF_DIST 8
+#define PF_DIST 12
 
 /* ================================================================
  * xoshiro256** PRNG (fixed seed for reproducibility)
@@ -407,6 +407,10 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
         }
     }
 
+    /* free CDF table before timed section to avoid L2/L3 cache pollution */
+    free(zipf_cdf);
+    zipf_cdf = NULL;
+
     /* execute with prefetch pipeline */
     tot = 0;
     t0 = now_sec();
@@ -450,8 +454,6 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     (void)tot;
     free(op_keys);
     free(op_type);
-    free(zipf_cdf);
-    zipf_cdf = NULL;
     avx_map64_destroy(&m);
     free(pool);
     return r;
