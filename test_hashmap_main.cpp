@@ -34,6 +34,20 @@ struct bench_result bench_avx64s(const uint64_t *k_ins, const uint64_t *k_pos,
 struct bench_result bench_khashl(const uint64_t *k_ins, const uint64_t *k_pos,
                                   const uint64_t *k_mix, uint64_t n_ops);
 
+struct bench_del_result {
+    double del_mops;
+    double mixed_mops;
+    uint64_t pool_size;
+    uint64_t final_live;
+    uint64_t n_lookups;
+    uint64_t n_inserts;
+    uint64_t n_deletes;
+    int verified;
+};
+
+struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops,
+                                        double zipf_s);
+
 } // extern "C"
 
 /* ================================================================
@@ -124,6 +138,18 @@ int main(int argc, char **argv) {
     printf("  insert:  %lu unique of %lu (%.1f%% dup)\n",
            (unsigned long)r_avx64.unique, (unsigned long)n_ops, r_avx64.dup_pct);
     printf("  lookup±: %.1f%% hit\n", r_avx64.hit_pct);
+
+    bench_del_result r_del = bench_avx64_del(N, n_ops, zipf_s);
+    printf("\n  avx_map64 delete:  %6.1f Mops/s   (pool=%lu keys)\n",
+           r_del.del_mops, (unsigned long)r_del.pool_size);
+    printf("  avx_map64 mixed:   %6.1f Mops/s   (%.0f/%.0f/%.0f lkp/ins/del, z=%.1f)\n",
+           r_del.mixed_mops,
+           100.0 * (double)r_del.n_lookups / (double)n_ops,
+           100.0 * (double)r_del.n_inserts / (double)n_ops,
+           100.0 * (double)r_del.n_deletes / (double)n_ops,
+           zipf_s);
+    printf("  mixed verify: %s  (live=%lu)\n",
+           r_del.verified ? "OK" : "FAIL", (unsigned long)r_del.final_live);
 
     free(k_ins);
     free(k_pos);

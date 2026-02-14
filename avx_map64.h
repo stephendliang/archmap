@@ -138,4 +138,71 @@ static inline int avx_map64_contains(struct avx_map64 *m, uint64_t key) {
     }
 }
 
+/* --- Backshift delete: O(1) expected, no tombstones --- */
+
+static inline int avx_map64_delete(struct avx_map64 *m, uint64_t key) {
+    if (__builtin_expect(m->cap == 0, 0)) return 0;
+
+    uint32_t gi   = avx64_hash(key) & m->mask;
+    uint32_t mask = m->mask;
+
+    /* locate the key (same probe as contains) */
+    for (;;) {
+        uint64_t *grp = m->keys + (gi << 3);
+        __mmask8 mm = avx64_match(grp, key);
+        if (mm) {
+            grp[__builtin_ctz(mm)] = 0;
+            m->count--;
+
+            /* group already had empties → no probe chain to fix */
+            if (__builtin_popcount(avx64_empty(grp)) > 1)
+                return 1;
+
+            /* backshift: pull displaced keys toward their home group.
+             *
+             * Invariant: for key K at group G with home H, groups H..G-1
+             * are all completely full.  We just punched a hole in a full
+             * group, so any key downstream whose probe path crossed this
+             * group is now unreachable via contains (which stops at the
+             * first group with an empty slot).  Walk forward and pull
+             * one key per group back to fill each successive hole.
+             */
+            uint32_t hole_gi = gi;
+            uint32_t scan_gi = (gi + 1) & mask;
+
+            for (;;) {
+                uint64_t *scan_grp = m->keys + (scan_gi << 3);
+                __mmask8 empty = avx64_empty(scan_grp);
+
+                if (empty == 0xFF) break; /* fully empty group — chain over */
+
+                int moved = 0;
+                for (__mmask8 todo = (~empty) & 0xFF; todo; todo &= todo - 1) {
+                    int s = __builtin_ctz(todo);
+                    uint32_t home = avx64_hash(scan_grp[s]) & mask;
+                    /* does this key's probe path cross hole_gi? */
+                    if (((hole_gi - home) & mask) < ((scan_gi - home) & mask)) {
+                        uint64_t *hole_grp = m->keys + (hole_gi << 3);
+                        hole_grp[__builtin_ctz(avx64_empty(hole_grp))] = scan_grp[s];
+                        scan_grp[s] = 0;
+
+                        /* scan group already had empties → chain ends here */
+                        if (empty) return 1;
+
+                        hole_gi = scan_gi;
+                        moved = 1;
+                        break;
+                    }
+                }
+
+                if (!moved && empty) break; /* empties, no candidates — done */
+                scan_gi = (scan_gi + 1) & mask;
+            }
+            return 1;
+        }
+        if (avx64_empty(grp)) return 0; /* key not found */
+        gi = (gi + 1) & mask;
+    }
+}
+
 #endif /* AVX_MAP64_H */
