@@ -343,7 +343,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     double t0 = now_sec();
     for (uint64_t i = 0; i < pool_size; i++) {
         if (i + PF_DIST < pool_size)
-            avx_map64_prefetch(&m, pool[i + PF_DIST]);
+            avx_map64_prefetch2(&m, pool[i + PF_DIST]);
         tot += (uint64_t)avx_map64_delete(&m, pool[i]);
     }
     double elapsed = now_sec() - t0;
@@ -416,7 +416,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     t0 = now_sec();
     for (uint64_t i = 0; i < n_mixed_ops; i++) {
         if (i + PF_DIST < n_mixed_ops)
-            avx_map64_prefetch(&m, op_keys[i + PF_DIST]);
+            avx_map64_prefetch2(&m, op_keys[i + PF_DIST]);
         switch (op_type[i]) {
             case 0: tot += (uint64_t)avx_map64_contains(&m, op_keys[i]); break;
             case 1: tot += (uint64_t)avx_map64_insert(&m, op_keys[i]); break;

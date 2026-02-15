@@ -38,6 +38,14 @@ static inline void avx_map64_prefetch(struct avx_map64 *m, uint64_t key) {
     _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
 }
 
+/* prefetch home group + overflow group for multi-probe chains */
+static inline void avx_map64_prefetch2(struct avx_map64 *m, uint64_t key) {
+    uint32_t gi = avx64_hash(key) & m->mask;
+    _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
+    gi = (gi + 1) & m->mask;
+    _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
+}
+
 /* --- SIMD helpers --- */
 
 static inline __mmask8 avx64_match(const uint64_t *grp, uint64_t key) {
