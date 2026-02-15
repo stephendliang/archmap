@@ -24,6 +24,7 @@ struct bench_result {
 
 void     bench_seed_rng(void);
 uint64_t *bench_gen_zipf_keys(uint64_t n, double s, uint64_t n_ops);
+void     bench_free_keys(uint64_t *keys, uint64_t n_ops);
 
 struct bench_result bench_vt(const uint64_t *k_ins, const uint64_t *k_pos,
                              const uint64_t *k_mix, uint64_t n_ops);
@@ -171,8 +172,8 @@ int main(int argc, char **argv) {
                rp.mixed_mops, rp.verified ? "OK" : "FAIL");
     }
 
-    free(k_ins);
-    free(k_pos);
-    free(k_mix);
+    bench_free_keys(k_ins, n_ops);
+    bench_free_keys(k_pos, n_ops);
+    bench_free_keys(k_mix, n_ops);
     return 0;
 }

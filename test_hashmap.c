@@ -21,6 +21,31 @@ KHASHL_SET_INIT(static, kh_u64_t, kh_u64, uint64_t, kh_hash_uint64, kh_eq_generi
 #include <stdint.h>
 #include <time.h>
 #include <math.h>
+#include <sys/mman.h>
+
+/* ================================================================
+ * Hugepage mmap allocator — replaces malloc for all large arrays.
+ * Ensures every buffer is backed by 2MB hugepages.
+ * ================================================================ */
+
+#define HP_ROUND(sz) (((sz) + (2u<<20) - 1) & ~((size_t)(2u<<20) - 1))
+
+static void *hp_alloc(size_t bytes) {
+    size_t total = HP_ROUND(bytes);
+    void *p = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE,
+                   -1, 0);
+    if (p == MAP_FAILED) {
+        p = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (p != MAP_FAILED) madvise(p, total, MADV_HUGEPAGE);
+    }
+    return p;
+}
+
+static void hp_free(void *p, size_t bytes) {
+    if (p) munmap(p, HP_ROUND(bytes));
+}
 
 #define PF_DIST     12   /* prefetch distance: insert/lookup/pure-delete */
 #define PF_DIST_MIX  4   /* prefetch distance: mixed workload (shorter is better
@@ -73,7 +98,7 @@ static uint64_t zipf_n;
 
 static void zipf_setup(uint64_t n, double s) {
     zipf_n = n;
-    zipf_cdf = (double *)malloc(n * sizeof(double));
+    zipf_cdf = (double *)hp_alloc(n * sizeof(double));
     double sum = 0.0;
     for (uint64_t i = 0; i < n; i++) {
         sum += 1.0 / pow((double)(i + 1), s);
@@ -97,14 +122,18 @@ static inline uint64_t zipf_sample(void) {
 }
 
 uint64_t *bench_gen_zipf_keys(uint64_t n, double s, uint64_t n_ops) {
-    free(zipf_cdf);
+    hp_free(zipf_cdf, zipf_n * sizeof(double));
     zipf_setup(n, s);
-    uint64_t *keys = (uint64_t *)malloc(n_ops * sizeof(uint64_t));
+    uint64_t *keys = (uint64_t *)hp_alloc(n_ops * sizeof(uint64_t));
     for (uint64_t i = 0; i < n_ops; i++)
         keys[i] = zipf_sample();
-    free(zipf_cdf);
+    hp_free(zipf_cdf, zipf_n * sizeof(double));
     zipf_cdf = NULL;
     return keys;
+}
+
+void bench_free_keys(uint64_t *keys, uint64_t n_ops) {
+    hp_free(keys, n_ops * sizeof(uint64_t));
 }
 
 /* ================================================================
@@ -329,7 +358,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     (void)pct_delete; /* implicit: 100 - thresh_ins */
 
     /* --- generate pool of unique non-zero keys --- */
-    uint64_t *pool = (uint64_t *)malloc(pool_size * sizeof(uint64_t));
+    uint64_t *pool = (uint64_t *)hp_alloc(pool_size * sizeof(uint64_t));
     struct avx_map64 m;
     avx_map64_init(&m);
 
@@ -379,8 +408,8 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
 
     zipf_setup(live, zipf_s);
 
-    uint64_t *op_keys = (uint64_t *)malloc(n_mixed_ops * sizeof(uint64_t));
-    uint8_t  *op_type = (uint8_t *)malloc(n_mixed_ops);
+    uint64_t *op_keys = (uint64_t *)hp_alloc(n_mixed_ops * sizeof(uint64_t));
+    uint8_t  *op_type = (uint8_t *)hp_alloc(n_mixed_ops);
 
     for (uint64_t i = 0; i < n_mixed_ops; i++) {
         uint32_t pct = (uint32_t)(xoshiro256ss() >> 32) % 100;
@@ -416,7 +445,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     }
 
     /* free CDF table before timed section to avoid L2/L3 cache pollution */
-    free(zipf_cdf);
+    hp_free(zipf_cdf, zipf_n * sizeof(double));
     zipf_cdf = NULL;
 
     /* execute with unified dispatch:
@@ -461,9 +490,9 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     }
 
     (void)tot;
-    free(op_keys);
-    free(op_type);
+    hp_free(op_keys, n_mixed_ops * sizeof(uint64_t));
+    hp_free(op_type, n_mixed_ops);
     avx_map64_destroy(&m);
-    free(pool);
+    hp_free(pool, pool_size * sizeof(uint64_t));
     return r;
 }
