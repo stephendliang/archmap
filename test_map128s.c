@@ -184,6 +184,23 @@ int main(void) {
     ok = ok && cap_ok;
     avx_map128s_destroy(&m2);
 
+    /* --- insert_unique: bulk load without dup check --- */
+    struct avx_map128s m3;
+    avx_map128s_init_cap(&m3, N);
+    int uniq_ok = 1;
+    for (int i = 0; i < N; i++)
+        avx_map128s_insert_unique(&m3, keys_lo[i], keys_hi[i]);
+    if (m3.count != (uint32_t)N) uniq_ok = 0;
+    for (int i = 0; i < 1000; i++) {
+        if (!avx_map128s_contains(&m3, keys_lo[i], keys_hi[i])) {
+            uniq_ok = 0; break;
+        }
+    }
+    printf("  insert_unique: %s (count=%u)\n",
+           uniq_ok ? "PASS" : "FAIL", m3.count);
+    ok = ok && uniq_ok;
+    avx_map128s_destroy(&m3);
+
     free(keys_lo);
     free(keys_hi);
 
