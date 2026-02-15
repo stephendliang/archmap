@@ -68,11 +68,20 @@ static size_t avx64_mapsize(uint32_t cap) {
 
 static void avx64_alloc(struct avx_map64 *m, uint32_t cap) {
     size_t total = avx64_mapsize(cap);
+    /* Try explicit 2MB hugepages with MAP_POPULATE (pre-fault all pages,
+     * eliminates minor faults during first-touch and ensures the OS
+     * commits physical hugepages immediately rather than on demand). */
     m->keys = (uint64_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-    if (m->keys == MAP_FAILED)
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB
+                               | MAP_POPULATE, -1, 0);
+    if (m->keys == MAP_FAILED) {
+        /* Fallback: regular pages + THP hint + populate */
         m->keys = (uint64_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
-                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                                   MAP_PRIVATE | MAP_ANONYMOUS
+                                   | MAP_POPULATE, -1, 0);
+        if (m->keys != MAP_FAILED)
+            madvise(m->keys, total, MADV_HUGEPAGE);
+    }
     m->cap   = cap;
     m->mask  = (cap >> 3) - 1;
     m->count = 0;
