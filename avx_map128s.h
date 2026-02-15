@@ -41,26 +41,30 @@ struct avx_map128s {
     uint32_t mask;       /* (cap >> 5) - 1, precomputed for group index */
 };
 
-/* --- Hash: 2-round CRC32 mixer ---
+/* --- Hash: split CRC32 — 3-cycle gi/h2, deferred overflow ---
  *
- * Two serial CRC32 rounds (6 cycles) instead of three (9 cycles).
- * Round a = crc32(0, klo): used only for overflow partition (4 bits, rare path).
- * Round b = crc32(a, khi): provides both gi (lower bits) and h2 (upper 15 bits).
- * No bit overlap: mask uses at most 17 bits, h2 uses bits [17:31].
+ * Round a = crc32(khi[31:0], klo): folds both key halves in one round.
+ *   → gi from lower bits, h2 from upper 15 bits. Available at 3 cycles.
+ * Round b = crc32(a, khi): overflow partition (4 bits). Depends on a but
+ *   executes in parallel with address computation and memory load via OoO.
+ *   Only consumed after SIMD compare completes — never on critical path.
+ *
+ * Critical path to first load: 3 cy (hash) + 2 cy (address) = 5 cycles.
+ * Previous 2-round: 6 cy (hash) + 2 cy (address) = 8 cycles.
  */
 
 struct avx128s_h { uint32_t lo, hi; };
 
 static inline struct avx128s_h avx128s_hash(uint64_t klo, uint64_t khi) {
-    uint32_t a = (uint32_t)_mm_crc32_u64(0, klo);
+    uint32_t a = (uint32_t)_mm_crc32_u64((uint32_t)khi, klo);
     uint32_t b = (uint32_t)_mm_crc32_u64(a, khi);
-    return (struct avx128s_h){b, a};
+    return (struct avx128s_h){a, b};
 }
 
 /* --- Metadata encoding ---
  *
- * h2 extracted from hash.lo (round b), bits [17:31] → 15 bits + 0x8000 occupied flag.
- * overflow_bit from hash.hi (round a), bits [0:3] → 16 partitions.
+ * h2 extracted from hash.lo (round a), bits [17:31] → 15 bits + 0x8000 occupied flag.
+ * overflow_bit from hash.hi (round b), bits [0:3] → 16 partitions.
  */
 
 static inline uint16_t avx128s_h2(uint32_t lo) {
@@ -81,9 +85,9 @@ static inline char *avx128s_group(const struct avx_map128s *m, uint32_t gi) {
 
 static inline void avx_map128s_prefetch(const struct avx_map128s *m,
                                         uint64_t klo, uint64_t khi) {
-    uint32_t a  = (uint32_t)_mm_crc32_u64(0, klo);
-    uint32_t b  = (uint32_t)_mm_crc32_u64(a, khi);
-    uint32_t gi = b & m->mask;
+    /* Only need gi — single CRC32 round (3 cycles total) */
+    uint32_t a  = (uint32_t)_mm_crc32_u64((uint32_t)khi, klo);
+    uint32_t gi = a & m->mask;
     const char *grp = avx128s_group(m, gi);
     _mm_prefetch(grp, _MM_HINT_T0);        /* metadata cache line */
     _mm_prefetch(grp + 64, _MM_HINT_T0);   /* keys[0..3] */
