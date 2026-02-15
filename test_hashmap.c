@@ -22,10 +22,10 @@ KHASHL_SET_INIT(static, kh_u64_t, kh_u64, uint64_t, kh_hash_uint64, kh_eq_generi
 #include <time.h>
 #include <math.h>
 
-#define PF_DIST       12     /* prefetch distance for read-heavy / high load */
-#define PF_DIST_MUT   4      /* prefetch distance for mutation-heavy / low load */
-#define PF_ADAPT_WIN  1024   /* ops between adaptive PF recalculations */
-#define PF_ADAPT_MASK (PF_ADAPT_WIN - 1)
+#define PF_DIST     12   /* prefetch distance: insert/lookup/pure-delete */
+#define PF_DIST_MIX  4   /* prefetch distance: mixed workload (shorter is better
+                          * when hashmap ops are inlined — per-op latency is low
+                          * enough that PF=4 lead time covers L2/L3 hits) */
 
 /* ================================================================
  * xoshiro256** PRNG (fixed seed for reproducibility)
@@ -346,17 +346,12 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
         uint64_t tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
     }
 
-    /* --- pure delete: drain the entire table ---
-     * Adaptive PF: high load (>50%) → PF=12, low load → PF=4.
-     * At high load, probe chains are longer so more look-ahead helps. */
+    /* --- pure delete: drain the entire table --- */
     uint64_t tot = 0;
-    int pf_dist = PF_DIST;
     double t0 = now_sec();
     for (uint64_t i = 0; i < pool_size; i++) {
-        if (__builtin_expect((i & PF_ADAPT_MASK) == 0 && i > 0, 0))
-            pf_dist = (m.count * 2 > m.cap) ? PF_DIST : PF_DIST_MUT;
-        if (i + pf_dist < pool_size)
-            avx_map64_prefetch2(&m, pool[i + pf_dist]);
+        if (i + PF_DIST < pool_size)
+            avx_map64_prefetch2(&m, pool[i + PF_DIST]);
         tot += (uint64_t)avx_map64_delete(&m, pool[i]);
     }
     double elapsed = now_sec() - t0;
@@ -424,25 +419,19 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     free(zipf_cdf);
     zipf_cdf = NULL;
 
-    /* execute with adaptive prefetch pipeline:
-     * Track mutation fraction in sliding window of PF_ADAPT_WIN ops.
-     * >50% mutations → PF=4 (mutation-heavy), else PF=12 (read-heavy).
+    /* execute with prefetch pipeline:
+     * PF_DIST_MIX=4 — with inlined hashmap ops, per-iteration latency
+     * is low enough that short prefetch distance covers L2/L3 hits.
+     * Controlled A/B showed PF=4 beats PF=12 on all mixed profiles.
      * lookups → prefetch (1 line), mutations → prefetch2 (2 lines). */
     tot = 0;
-    pf_dist = PF_DIST;
-    uint32_t mut_count = 0;
     t0 = now_sec();
     for (uint64_t i = 0; i < n_mixed_ops; i++) {
-        mut_count += (op_type[i] != 0);
-        if (__builtin_expect((i & PF_ADAPT_MASK) == 0 && i > 0, 0)) {
-            pf_dist = (mut_count > PF_ADAPT_WIN / 2) ? PF_DIST_MUT : PF_DIST;
-            mut_count = 0;
-        }
-        if (i + pf_dist < n_mixed_ops) {
-            if (op_type[i + pf_dist] == 0)
-                avx_map64_prefetch(&m, op_keys[i + pf_dist]);
+        if (i + PF_DIST_MIX < n_mixed_ops) {
+            if (op_type[i + PF_DIST_MIX] == 0)
+                avx_map64_prefetch(&m, op_keys[i + PF_DIST_MIX]);
             else
-                avx_map64_prefetch2(&m, op_keys[i + pf_dist]);
+                avx_map64_prefetch2(&m, op_keys[i + PF_DIST_MIX]);
         }
         switch (op_type[i]) {
             case 0: tot += (uint64_t)avx_map64_contains(&m, op_keys[i]); break;

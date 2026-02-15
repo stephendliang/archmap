@@ -1,17 +1,24 @@
-# Adaptive Prefetch Distance for AVX-512 Open-Addressing Hash Maps
+# Prefetch Distance Optimization for AVX-512 Open-Addressing Hash Maps
 
 ## Abstract
 
-We investigate workload-adaptive prefetch distance (PF_DIST) tuning for
-`avx_map64`, an AVX-512 SIMD open-addressing hash map with backshift deletion.
-Through systematic exploration of four delete strategies, instrumented
-backshift analysis, and a PF_DIST parameter sweep across five workload
-profiles, we find that **prefetch distance is the dominant optimization lever**
-for mixed workloads — not the deletion algorithm itself.  A counter-based
-adaptive scheme (zero timing overhead, inspired by CLOCK/Sieve cache
-replacement) selects PF=12 for read-heavy regimes and PF=4 for
-mutation-heavy regimes, achieving +3% to +19% throughput improvement across
-all profiles with no regression.
+We investigate prefetch distance (PF_DIST) tuning for `avx_map64`, an AVX-512
+SIMD open-addressing hash map with backshift deletion.  Through systematic
+exploration of four delete strategies, instrumented backshift analysis, a
+PF_DIST sweep across five workload profiles, three adaptive PF approaches
+(clock_gettime, RDTSC, counter-based), and a hyperparameter sweep with
+counter decay variants, we find:
+
+1. **Prefetch distance is the dominant optimization lever** for mixed
+   workloads — not the deletion algorithm itself.
+2. **Adaptation overhead exceeds its benefit** for constant-ratio workloads.
+   Controlled A/B testing showed all adaptive variants (hard reset, >>1 decay,
+   >>2 decay, various windows/thresholds) perform 10-20% worse than fixed PF.
+3. **PF=4 is universally optimal** for mixed workloads with inlined hashmap
+   ops; PF=12 is optimal for pure-delete and lookup-only phases.
+4. **The Sieve cache replacement principle** (simple counters beat precise
+   measurement) has a corollary: **when the signal has zero entropy
+   (constant-ratio workloads), even a 1-bit counter is wasted work.**
 
 ## 1. Experimental Setup
 
@@ -174,7 +181,7 @@ However:
 - The fundamental feedback-loop problem (§4.1 point 1) remains regardless
   of timing source.
 
-### 4.3 Adopted Approach: Counter-Based (Sieve Analogy)
+### 4.3 Counter-Based Approach (Sieve Analogy)
 
 The key insight: **we don't need to measure how fast we're going.  We need
 to know what kind of work we're doing.**  This is a qualitative signal
@@ -188,48 +195,96 @@ to know what kind of work we're doing.**  This is a qualitative signal
 
 **Cost**: One `add` instruction per iteration (`mut_count += (op_type[i] != 0)`).
 Compiles to `cmp` + `adc` or `cmov` — branchless, 1 cycle, no serialization.
-The window boundary check uses `(i & 1023) == 0` — a single `test` + branch
-that's trivially predicted (taken once per 1024 iterations).
 
-**Sieve/CLOCK analogy**: This mirrors the evolution in cache replacement
-algorithms.  LHD (Least Hit Density) and ARC track per-object hit rates with
-precise timestamps and complex metadata — high accuracy but high overhead in
-the eviction hot path.  Sieve (a recent refinement of CLOCK) uses a single
-bit per entry swept by a clock hand: dramatically simpler, yet matches or
-beats LHD on real workloads.  The reason: **the marginal information gain
-from precise measurement doesn't justify the overhead in the critical path.**
+**Sieve/CLOCK analogy**: This mirrors cache replacement algorithm evolution.
+LHD (Least Hit Density) and ARC track per-object hit rates with precise
+timestamps.  Sieve uses a single bit per entry: dramatically simpler, yet
+matches or beats LHD.  The reason: **the marginal information gain from
+precise measurement doesn't justify the overhead in the critical path.**
 
-Our counter-based PF_DIST adaptation follows the same principle:
-- We don't track per-operation latency (the "LHD" approach via clock_gettime)
-- We don't even measure elapsed time (the "ARC" approach via RDTSC)
-- We count a 1-bit signal per operation (mutation or not) and make a binary
-  decision (the "Sieve" approach)
+Initial cross-session benchmarks appeared to show +3% to +19% gains for the
+counter-based adaptive approach vs. fixed PF=12.  However, this comparison
+was unreliable (see §4.4).
 
-A potential refinement: replace the hard counter reset with exponential decay
-via right shift (`mut_count >>= 1` instead of `mut_count = 0`).  This gives
-old windows exponentially decreasing influence (weight 2^-K after K windows),
-smoothing transitions for workloads that change character over time.  We chose
-hard reset for this implementation because our benchmark profiles have uniform
-ratios — the simpler approach produces identical results and is easier to
-reason about.
+### 4.4 Hyperparameter Sweep and Counter Decay
 
-### 4.4 Results
+A systematic sweep (`test_pf_sweep.c`) explored the parameter space:
 
-Three-run average, N=1M, 10M ops, Zipf s=1.0:
+- **Counter decay**: hard reset (0), >>1, >>2
+- **Window size**: 256, 512, 1024, 2048
+- **Mutation threshold**: 30%, 40%, 50%, 60%, 70%
+- **PF pair**: {3,12}, {4,10}, {4,12}, {4,14}, {6,12}, {6,14}
+- **Load factor threshold** (pure delete): >25%, >33%, >50%, >67%
 
-| Profile | PF=12 (fixed) | Adaptive | Delta |
-|---|---|---|---|
-| pure-delete | 81.2 | **88.2** | **+8.6%** |
-| read-heavy | 171.6 | 170.5 | −0.6% (noise) |
-| balanced | 57.9 | **59.5** | **+2.8%** |
-| churn | 52.1 | **56.6** | **+8.6%** |
-| write-heavy | 39.8 | **47.3** | **+18.8%** |
-| eviction | 116.6 | **127.5** | **+9.3%** |
+**Key findings**:
 
-The adaptive scheme captures the best of both fixed values and exceeds them
-on pure-delete and write-heavy (where the load factor / mutation fraction
-changes within a single run, allowing the adaptive to use PF=12 for the
-hard phase and PF=4 for the easy phase).
+1. **Flat landscape**: All decay mechanisms, window sizes, and thresholds
+   produce results within ±3% of each other.  Hard reset ≈ >>1 decay ≈
+   >>2 decay.  There are no significantly better hyperparameters.
+
+2. **Decay math**: With >>s shift decay, the counter at steady state
+   converges to `f × WIN` (where f = mutation fraction), regardless of s.
+   This means the threshold values are equivalent across decay modes after
+   normalization.  Decay only adds value for workloads that change character
+   over time — which our constant-ratio benchmarks do not.
+
+### 4.5 Controlled A/B: Adaptation is a Net Negative
+
+The cross-session comparisons that showed adaptive winning were unreliable.
+A controlled A/B test (`test_pf_ab2.c`) with order-rotated execution
+(each variant runs first in one of 4 interleaved rounds, eliminating cache
+ordering bias) and `__attribute__((noinline))` to prevent cross-function
+optimization revealed:
+
+**Mixed workloads** (4-run average, order-rotated, noinline):
+
+| Profile | fixed12 | **fixed4** | adapt(reset) | adapt(>>1) |
+|---|---|---|---|---|
+| read-heavy | 114.9 | **122.9** | 102.3 | 99.7 |
+| balanced | 56.7 | **60.3** | 49.6 | 47.5 |
+| churn | 56.0 | **58.5** | 51.6 | 51.3 |
+| write-heavy | 48.9 | **50.0** | 44.5 | 44.8 |
+| eviction | 132.1 | **163.4** | 118.1 | 118.0 |
+
+**Pure delete** (4-run average):
+```
+fixed12 = 90.3    LF>50% = 78.3    LF>25% = 87.4
+```
+
+**Analysis**:
+
+1. **Fixed PF=4 wins every mixed profile** — even read-heavy (+7% over
+   PF=12).  With inlined hashmap ops, per-iteration latency is ~7-10ns,
+   so PF=4's ~28-40ns lead time suffices for L2 hits (~10ns) and most L3
+   hits (~30-40ns).  PF=12's ~84-120ns lead time is excessive — prefetched
+   lines may be evicted from L1d before the op reaches them.
+
+2. **Both adaptive variants lose by 10-20%** on every profile.  The
+   adaptation overhead — counter increment, variable `pf_dist` (vs.
+   compile-time constant), boundary check — disrupts the tight inner loop.
+   The variable pf_dist forces the compiler to compute `i + pf_dist`
+   dynamically (vs. `i + 4` which folds into addressing), and prevents
+   certain loop optimizations.
+
+3. **The Sieve principle has a corollary**: if the signal has zero entropy
+   (constant-ratio workloads), even a 1-bit counter is wasted work.
+   The overhead of asking "what kind of work am I doing?" exceeds the
+   value of the answer when the answer never changes.
+
+### 4.6 Final Design
+
+Based on the controlled A/B evidence:
+- **Pure delete**: Fixed PF=12 (probe chains are long at high load,
+  need maximum look-ahead)
+- **Mixed workloads**: Fixed PF=4 (shorter lead time matches inlined
+  per-op latency; avoids L1d eviction from over-prefetching)
+- **Insert/lookup-only**: Fixed PF=12 (simple loop with low per-op
+  latency benefits from longer look-ahead)
+
+No runtime adaptation.  The optimal PF is determined by the operation
+mix, which is known at the call site.  Users running dynamic workloads
+can call `avx_map64_prefetch` or `avx_map64_prefetch2` explicitly with
+application-appropriate distances.
 
 ## 5. AMD uProf Profiling
 
@@ -302,6 +357,29 @@ In order of estimated impact:
 - `test_del_explore.c` — Four delete variant comparison (vtable dispatch)
 - `test_del_h2h.c` — Direct-call head-to-head: backshift vs. tombstone
 - `test_pfdist.c` — PF_DIST sweep across 10 values × 5 profiles + dual-distance
+- `test_pf_sweep.c` — Hyperparameter sweep: decay × window × threshold × PF pair
+- `test_pf_ab.c` — A/B test of adaptive variants (initial, ordering-biased)
+- `test_pf_ab2.c` — Controlled A/B: order-rotated, eliminates cache bias
+
+## 8. Methodological Lessons
+
+1. **Cross-session comparisons are unreliable** for <20% differences.
+   CPU frequency, cache state, background processes, and NUMA effects
+   all vary between runs.  Always use interleaved A/B within the same
+   process invocation.
+
+2. **`__attribute__((noinline))` is not the same as separate compilation**,
+   but it prevents the most egregious cross-function optimizations.  For
+   header-only libraries (like avx_map64.h), the inlined case IS the
+   real-world use case.
+
+3. **Execution ordering bias is real**.  The first variant in a sequence
+   benefits from warmer cache.  Order-rotation (each variant runs first
+   in one round) is essential for fair comparison.
+
+4. **Vtable dispatch artifacts** can dominate micro-benchmark results.
+   Function-pointer overhead penalizes code paths with more instructions
+   disproportionately.  Always validate with direct/inlined calls.
 
 ## References
 
@@ -310,3 +388,7 @@ In order of estimated impact:
 - AdaptSize (NSDI '17): Berger et al.  Markov chain model adapts cache
   admission parameter.  Inspired our exploration of adaptive parameters,
   though we found a simpler signal (mutation fraction) sufficient.
+- The Sieve corollary discovered here: when the optimization parameter is
+  constant (or nearly so) across a workload, measurement overhead of ANY
+  kind — including trivial integer counters — is wasted.  The parameter
+  should be set statically, either at compile time or per call site.
