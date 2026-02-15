@@ -89,9 +89,13 @@ static inline void avx_map128s_prefetch(const struct avx_map128s *m,
     uint32_t a  = (uint32_t)_mm_crc32_u64((uint32_t)khi, klo);
     uint32_t gi = a & m->mask;
     const char *grp = avx128s_group(m, gi);
-    _mm_prefetch(grp, _MM_HINT_T0);        /* metadata cache line */
+    /* Prefetch metadata + first 4 key CLs (5 total). Sequential pattern
+     * triggers L2 stream prefetcher for remaining key CLs 5-8. */
+    _mm_prefetch(grp, _MM_HINT_T0);        /* metadata */
     _mm_prefetch(grp + 64, _MM_HINT_T0);   /* keys[0..3] */
     _mm_prefetch(grp + 128, _MM_HINT_T0);  /* keys[4..7] */
+    _mm_prefetch(grp + 192, _MM_HINT_T0);  /* keys[8..11] */
+    _mm_prefetch(grp + 256, _MM_HINT_T0);  /* keys[12..15] */
 }
 
 /* --- SIMD helpers --- */
