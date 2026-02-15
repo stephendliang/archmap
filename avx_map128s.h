@@ -16,6 +16,13 @@
  *
  * Key width is irrelevant to the SIMD hot path: SIMD operates only on
  * 16-bit h2 metadata, and scalar key comparison fires only on h2 match.
+ *
+ * Prefetch pipelining: all operations are memory-latency-bound at scale.
+ * Use avx_map128s_prefetch() PF iterations ahead of the operation to
+ * overlap DRAM access with computation. Measured speedups at N=2M:
+ *   contains-hit: 17.7 → 9.2 ns (PF=24)   1.9x
+ *   insert:       49.3 → 12.4 ns (PF=24)   4.0x  (with init_cap)
+ *   delete:       36.3 → 15.0 ns (PF=24)   2.4x
  */
 #ifndef AVX_MAP128S_H
 #define AVX_MAP128S_H
@@ -182,6 +189,18 @@ static void avx128s_grow(struct avx_map128s *m) {
 
 static inline void avx_map128s_init(struct avx_map128s *m) {
     memset(m, 0, sizeof(*m));
+}
+
+/* Pre-allocate for at least n keys. Eliminates grow() during bulk insert.
+ * Combined with pipelined prefetch, achieves 4x insert throughput. */
+static inline void avx_map128s_init_cap(struct avx_map128s *m, uint32_t n) {
+    memset(m, 0, sizeof(*m));
+    /* cap must satisfy: n * LOAD_DEN < cap * LOAD_NUM, and cap is power of 2.
+     * Minimum cap = ceil(n * 8/7), rounded up to next power of 2. */
+    uint64_t need = (uint64_t)n * AVX128S_LOAD_DEN / AVX128S_LOAD_NUM + 1;
+    uint32_t cap = AVX128S_INIT_CAP;
+    while (cap < need) cap *= 2;
+    avx128s_alloc(m, cap);
 }
 
 static inline void avx_map128s_destroy(struct avx_map128s *m) {

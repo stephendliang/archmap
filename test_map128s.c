@@ -159,6 +159,31 @@ int main(void) {
     ok = ok && del_all_ok;
 
     avx_map128s_destroy(&m);
+
+    /* --- init_cap: pre-allocate, insert, verify --- */
+    struct avx_map128s m2;
+    avx_map128s_init_cap(&m2, N);
+    int cap_ok = 1;
+    /* Must have enough capacity for N keys without grow */
+    if (m2.cap == 0 || m2.data == NULL) cap_ok = 0;
+    uint32_t cap_before = m2.cap;
+    for (int i = 0; i < N; i++)
+        avx_map128s_insert(&m2, keys_lo[i], keys_hi[i]);
+    /* Cap should not have changed (no grow needed) */
+    if (m2.cap != cap_before) cap_ok = 0;
+    if (m2.count != (uint32_t)N) cap_ok = 0;
+    /* Spot-check containment */
+    for (int i = 0; i < 1000; i++) {
+        if (!avx_map128s_contains(&m2, keys_lo[i], keys_hi[i])) {
+            cap_ok = 0; break;
+        }
+    }
+    printf("  init_cap:     %s (cap stable=%s, count=%u)\n",
+           cap_ok ? "PASS" : "FAIL",
+           m2.cap == cap_before ? "yes" : "NO", m2.count);
+    ok = ok && cap_ok;
+    avx_map128s_destroy(&m2);
+
     free(keys_lo);
     free(keys_hi);
 
