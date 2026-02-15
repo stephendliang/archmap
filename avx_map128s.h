@@ -41,21 +41,30 @@ struct avx_map128s {
     uint32_t mask;       /* (cap >> 5) - 1, precomputed for group index */
 };
 
-/* --- Hash: chained CRC32 mixer (three 32-bit rounds over both halves) --- */
+/* --- Hash: 2-round CRC32 mixer ---
+ *
+ * Two serial CRC32 rounds (6 cycles) instead of three (9 cycles).
+ * Round a = crc32(0, klo): used only for overflow partition (4 bits, rare path).
+ * Round b = crc32(a, khi): provides both gi (lower bits) and h2 (upper 15 bits).
+ * No bit overlap: mask uses at most 17 bits, h2 uses bits [17:31].
+ */
 
 struct avx128s_h { uint32_t lo, hi; };
 
 static inline struct avx128s_h avx128s_hash(uint64_t klo, uint64_t khi) {
     uint32_t a = (uint32_t)_mm_crc32_u64(0, klo);
     uint32_t b = (uint32_t)_mm_crc32_u64(a, khi);
-    uint32_t c = (uint32_t)_mm_crc32_u64(b, klo);
-    return (struct avx128s_h){b, c};
+    return (struct avx128s_h){b, a};
 }
 
-/* --- Metadata encoding --- */
+/* --- Metadata encoding ---
+ *
+ * h2 extracted from hash.lo (round b), bits [17:31] → 15 bits + 0x8000 occupied flag.
+ * overflow_bit from hash.hi (round a), bits [0:3] → 16 partitions.
+ */
 
-static inline uint16_t avx128s_h2(uint32_t hi) {
-    return (uint16_t)((hi >> 17) | 0x8000);
+static inline uint16_t avx128s_h2(uint32_t lo) {
+    return (uint16_t)((lo >> 17) | 0x8000);
 }
 
 static inline uint16_t avx128s_overflow_bit(uint32_t hi) {
@@ -139,7 +148,7 @@ static void avx128s_grow(struct avx_map128s *m) {
             uint64_t klo = ok[s].lo;
             uint64_t khi = ok[s].hi;
             struct avx128s_h h = avx128s_hash(klo, khi);
-            uint16_t h2  = avx128s_h2(h.hi);
+            uint16_t h2  = avx128s_h2(h.lo);
             uint32_t gi  = h.lo & mask;
             for (;;) {
                 char     *grp  = avx128s_group(m, gi);
@@ -178,7 +187,7 @@ static inline int avx_map128s_insert(struct avx_map128s *m,
         avx128s_grow(m);
 
     struct avx128s_h h = avx128s_hash(klo, khi);
-    uint16_t h2 = avx128s_h2(h.hi);
+    uint16_t h2 = avx128s_h2(h.lo);
     uint32_t gi = h.lo & m->mask;
 
     for (;;) {
@@ -220,7 +229,7 @@ static inline int avx_map128s_delete(struct avx_map128s *m,
     if (__builtin_expect(m->cap == 0, 0)) return 0;
 
     struct avx128s_h h = avx128s_hash(klo, khi);
-    uint16_t h2 = avx128s_h2(h.hi);
+    uint16_t h2 = avx128s_h2(h.lo);
     uint32_t gi = h.lo & m->mask;
 
     for (;;) {
@@ -249,7 +258,7 @@ static inline int avx_map128s_contains(struct avx_map128s *m,
     if (__builtin_expect(m->cap == 0, 0)) return 0;
 
     struct avx128s_h h = avx128s_hash(klo, khi);
-    uint16_t h2 = avx128s_h2(h.hi);
+    uint16_t h2 = avx128s_h2(h.lo);
     uint32_t gi = h.lo & m->mask;
 
     for (;;) {
