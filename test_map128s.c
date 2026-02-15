@@ -87,10 +87,80 @@ int main(void) {
     printf("  insert:   %.1f ns/op\n", ins_ns);
     printf("  contains: %.1f ns/op\n", hit_ns);
 
+    int ok = (m.count == N) && dup_ok && (miss == 0) && (false_pos == 0) && (partial_fp == 0);
+
+    /* --- Delete hit: delete first N/2, verify misses, verify remainder --- */
+    int del_hit_ok = 1;
+    for (int i = 0; i < N / 2; i++) {
+        int r = avx_map128s_delete(&m, keys_lo[i], keys_hi[i]);
+        if (r != 1) { del_hit_ok = 0; break; }
+    }
+    if (m.count != (uint32_t)(N - N / 2)) del_hit_ok = 0;
+    /* deleted keys must miss */
+    for (int i = 0; i < N / 2; i++) {
+        if (avx_map128s_contains(&m, keys_lo[i], keys_hi[i])) {
+            del_hit_ok = 0; break;
+        }
+    }
+    /* remaining keys must still hit */
+    for (int i = N / 2; i < N; i++) {
+        if (!avx_map128s_contains(&m, keys_lo[i], keys_hi[i])) {
+            del_hit_ok = 0; break;
+        }
+    }
+    printf("  delete hit:   %s (count=%u)\n",
+           del_hit_ok ? "PASS" : "FAIL", m.count);
+    ok = ok && del_hit_ok;
+
+    /* --- Delete miss: deleting non-existent keys returns 0 --- */
+    int del_miss_ok = 1;
+    uint64_t dm_seed_lo = 0xAAAABBBBCCCCDDDDULL;
+    uint64_t dm_seed_hi = 0x1111222233334444ULL;
+    for (int i = 0; i < 1000; i++) {
+        uint64_t mlo = splitmix64(&dm_seed_lo);
+        uint64_t mhi = splitmix64(&dm_seed_hi);
+        if (avx_map128s_delete(&m, mlo, mhi) != 0) {
+            del_miss_ok = 0; break;
+        }
+    }
+    printf("  delete miss:  %s\n", del_miss_ok ? "PASS" : "FAIL");
+    ok = ok && del_miss_ok;
+
+    /* --- Re-insert after delete: deleted slots are reusable --- */
+    int reins_ok = 1;
+    for (int i = 0; i < N / 2; i++) {
+        int r = avx_map128s_insert(&m, keys_lo[i], keys_hi[i]);
+        if (r != 1) { reins_ok = 0; break; }
+    }
+    for (int i = 0; i < N / 2; i++) {
+        if (!avx_map128s_contains(&m, keys_lo[i], keys_hi[i])) {
+            reins_ok = 0; break;
+        }
+    }
+    if (m.count != (uint32_t)N) reins_ok = 0;
+    printf("  re-insert:    %s (count=%u)\n",
+           reins_ok ? "PASS" : "FAIL", m.count);
+    ok = ok && reins_ok;
+
+    /* --- Delete all: delete every key, verify count==0 and all miss --- */
+    int del_all_ok = 1;
+    for (int i = 0; i < N; i++) {
+        int r = avx_map128s_delete(&m, keys_lo[i], keys_hi[i]);
+        if (r != 1) { del_all_ok = 0; break; }
+    }
+    if (m.count != 0) del_all_ok = 0;
+    for (int i = 0; i < N; i++) {
+        if (avx_map128s_contains(&m, keys_lo[i], keys_hi[i])) {
+            del_all_ok = 0; break;
+        }
+    }
+    printf("  delete all:   %s (count=%u)\n",
+           del_all_ok ? "PASS" : "FAIL", m.count);
+    ok = ok && del_all_ok;
+
     avx_map128s_destroy(&m);
     free(keys_lo);
     free(keys_hi);
 
-    int ok = (m.count == N) && dup_ok && (miss == 0) && (false_pos == 0) && (partial_fp == 0);
     return ok ? 0 : 1;
 }

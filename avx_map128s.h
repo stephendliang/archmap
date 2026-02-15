@@ -199,6 +199,109 @@ static inline int avx_map128s_insert(struct avx_map128s *m,
     }
 }
 
+/* --- Backshift helper: repair probe chain after deletion --- */
+
+static inline void avx128s_backshift_at(struct avx_map128s *m,
+                                         uint32_t gi, int slot) {
+    uint32_t mask = m->mask;
+    uint32_t hole_gi = gi;
+    int hole_slot = slot;
+    uint32_t scan_gi = (gi + 1) & mask;
+
+    for (;;) {
+        /* prefetch metadata + first 2 key cache lines of group 2 ahead */
+        char *pf_grp = avx128s_group(m, (scan_gi + 2) & mask);
+        _mm_prefetch(pf_grp, _MM_HINT_T0);
+        _mm_prefetch(pf_grp + 64, _MM_HINT_T0);
+        _mm_prefetch(pf_grp + 128, _MM_HINT_T0);
+
+        char *scan_raw = avx128s_group(m, scan_gi);
+        uint16_t *scan_base = (uint16_t *)scan_raw;
+        struct avx128s_kv *scan_kp = (struct avx128s_kv *)(scan_raw + 64);
+        __mmask32 scan_empty = avx128s_empty(scan_base);
+
+        if ((scan_empty & AVX128S_DATA_MASK) == AVX128S_DATA_MASK)
+            return; /* fully empty group — chain over */
+
+        /* collect occupied candidates and hash them */
+        uint32_t cand_homes[31];
+        int cand_slots[31];
+        int n_cand = 0;
+
+        __mmask32 occupied = (~scan_empty) & AVX128S_DATA_MASK;
+        while (occupied) {
+            cand_slots[n_cand++] = __builtin_ctz(occupied);
+            occupied &= occupied - 1;
+        }
+
+        for (int j = 0; j < n_cand; j++)
+            cand_homes[j] = avx128s_hash(scan_kp[cand_slots[j]].lo,
+                                          scan_kp[cand_slots[j]].hi).lo & mask;
+
+        /* find first movable candidate */
+        int moved = 0;
+        for (int j = 0; j < n_cand; j++) {
+            if (((hole_gi - cand_homes[j]) & mask) <
+                ((scan_gi - cand_homes[j]) & mask)) {
+                char *hole_raw = avx128s_group(m, hole_gi);
+                uint16_t *hole_base = (uint16_t *)hole_raw;
+                struct avx128s_kv *hole_kp =
+                    (struct avx128s_kv *)(hole_raw + 64);
+
+                hole_base[hole_slot] = scan_base[cand_slots[j]];
+                hole_kp[hole_slot] = scan_kp[cand_slots[j]];
+                scan_base[cand_slots[j]] = 0;
+                scan_kp[cand_slots[j]] = (struct avx128s_kv){0, 0};
+
+                /* scan group already had empties → chain ends here */
+                if (scan_empty) return;
+
+                hole_gi = scan_gi;
+                hole_slot = cand_slots[j];
+                moved = 1;
+                break;
+            }
+        }
+
+        if (!moved && scan_empty) return; /* empties, no candidates — done */
+        scan_gi = (scan_gi + 1) & mask;
+    }
+}
+
+/* --- Backshift delete: find key via overflow chain, delete + backshift --- */
+
+static inline int avx_map128s_delete(struct avx_map128s *m,
+                                     uint64_t klo, uint64_t khi) {
+    if (__builtin_expect(m->cap == 0, 0)) return 0;
+
+    struct avx128s_h h = avx128s_hash(klo, khi);
+    uint16_t h2 = avx128s_h2(h.hi);
+    uint32_t gi = h.lo & m->mask;
+
+    for (;;) {
+        char *grp = avx128s_group(m, gi);
+        uint16_t *base = (uint16_t *)grp;
+        struct avx128s_kv *kp = (struct avx128s_kv *)(grp + 64);
+
+        __mmask32 mm = avx128s_match(base, h2);
+        while (mm) {
+            int pos = __builtin_ctz(mm);
+            if (kp[pos].lo == klo && kp[pos].hi == khi) {
+                /* Found. Check empties BEFORE zeroing. */
+                __mmask32 em = avx128s_empty(base);
+                base[pos] = 0;
+                kp[pos] = (struct avx128s_kv){0, 0};
+                m->count--;
+                if (!em) avx128s_backshift_at(m, gi, pos);
+                return 1;
+            }
+            mm &= mm - 1;
+        }
+        if (!((base[31] >> (h.hi & 15)) & 1)) return 0;
+        gi = (gi + 1) & m->mask;
+    }
+}
+
 static inline int avx_map128s_contains(struct avx_map128s *m,
                                        uint64_t klo, uint64_t khi) {
     if (__builtin_expect(m->cap == 0, 0)) return 0;
