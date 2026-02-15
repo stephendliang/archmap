@@ -19,10 +19,17 @@
  *
  * Prefetch pipelining: all operations are memory-latency-bound at scale.
  * Use avx_map128s_prefetch() PF iterations ahead of the operation to
- * overlap DRAM access with computation. Measured speedups at N=2M:
- *   contains-hit: 17.7 → 9.2 ns (PF=24)   1.9x
- *   insert:       49.3 → 12.4 ns (PF=24)   4.0x  (with init_cap)
- *   delete:       36.3 → 15.0 ns (PF=24)   2.4x
+ * overlap DRAM access with computation. Measured on EPYC 9845 at N=2M:
+ *
+ *   operation          raw       pipelined   speedup
+ *   contains-hit     16.8 ns     8.9 ns      1.9x     (112M ops/sec)
+ *   insert           59.5 ns    11.0 ns      5.4x     (91M ops/sec)
+ *   delete           36.4 ns    12.8 ns      2.8x
+ *   contains-miss     3.9 ns       —           —
+ *
+ * Insert uses init_cap() + insert_unique() + PF=24. These numbers are
+ * within 8–12% of the theoretical cycle minimum (serial dependency chain:
+ * hash→address→L1 load→SIMD→tzcnt→key load→compare ≈ 21 cycles).
  */
 #ifndef AVX_MAP128S_H
 #define AVX_MAP128S_H
