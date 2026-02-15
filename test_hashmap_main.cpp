@@ -46,7 +46,9 @@ struct bench_del_result {
 };
 
 struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops,
-                                        double zipf_s);
+                                        double zipf_s,
+                                        int pct_lookup, int pct_insert,
+                                        int pct_delete);
 
 } // extern "C"
 
@@ -139,17 +141,35 @@ int main(int argc, char **argv) {
            (unsigned long)r_avx64.unique, (unsigned long)n_ops, r_avx64.dup_pct);
     printf("  lookup±: %.1f%% hit\n", r_avx64.hit_pct);
 
-    bench_del_result r_del = bench_avx64_del(N, n_ops, zipf_s);
-    printf("\n  avx_map64 delete:  %6.1f Mops/s   (pool=%lu keys)\n",
+    /* --- deletion + mixed workload profiles --- */
+    struct { const char *name; int lkp, ins, del; } profiles[] = {
+        { "read-heavy",  90,  5,  5 },
+        { "balanced",    50, 25, 25 },
+        { "churn",       33, 33, 34 },
+        { "write-heavy", 10, 50, 40 },
+        { "eviction",    20, 10, 70 },
+    };
+    int n_profiles = (int)(sizeof(profiles) / sizeof(profiles[0]));
+
+    /* first run to get pure-delete number (same for all profiles) */
+    bench_del_result r_del = bench_avx64_del(N, n_ops, zipf_s,
+                                              profiles[0].lkp, profiles[0].ins,
+                                              profiles[0].del);
+    printf("\n  avx_map64 delete:  %6.1f Mops/s  (pool=%lu)\n",
            r_del.del_mops, (unsigned long)r_del.pool_size);
-    printf("  avx_map64 mixed:   %6.1f Mops/s   (%.0f/%.0f/%.0f lkp/ins/del, z=%.1f)\n",
-           r_del.mixed_mops,
-           100.0 * (double)r_del.n_lookups / (double)n_ops,
-           100.0 * (double)r_del.n_inserts / (double)n_ops,
-           100.0 * (double)r_del.n_deletes / (double)n_ops,
-           zipf_s);
-    printf("  mixed verify: %s  (live=%lu)\n",
-           r_del.verified ? "OK" : "FAIL", (unsigned long)r_del.final_live);
+    printf("  mixed workloads (z=%.1f):\n", zipf_s);
+    printf("    %-12s %d/%d/%d:  %6.1f Mops/s   verify: %s\n",
+           profiles[0].name, profiles[0].lkp, profiles[0].ins, profiles[0].del,
+           r_del.mixed_mops, r_del.verified ? "OK" : "FAIL");
+
+    for (int p = 1; p < n_profiles; p++) {
+        bench_del_result rp = bench_avx64_del(N, n_ops, zipf_s,
+                                               profiles[p].lkp, profiles[p].ins,
+                                               profiles[p].del);
+        printf("    %-12s %d/%d/%d:  %6.1f Mops/s   verify: %s\n",
+               profiles[p].name, profiles[p].lkp, profiles[p].ins, profiles[p].del,
+               rp.mixed_mops, rp.verified ? "OK" : "FAIL");
+    }
 
     free(k_ins);
     free(k_pos);

@@ -314,11 +314,16 @@ struct bench_del_result {
 };
 
 struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops,
-                                        double zipf_s) {
+                                        double zipf_s,
+                                        int pct_lookup, int pct_insert,
+                                        int pct_delete) {
     struct bench_del_result r;
     memset(&r, 0, sizeof(r));
     r.pool_size = pool_size;
     r.verified  = 1;
+
+    int thresh_ins = pct_lookup + pct_insert; /* cumulative threshold */
+    (void)pct_delete; /* implicit: 100 - thresh_ins */
 
     /* --- generate pool of unique non-zero keys --- */
     uint64_t *pool = (uint64_t *)malloc(pool_size * sizeof(uint64_t));
@@ -356,7 +361,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     }
     avx_map64_destroy(&m);
 
-    /* --- mixed workload: 50% lookup / 25% insert / 25% delete ---
+    /* --- mixed workload with parameterized ratios ---
      *
      * Pool partition: pool[0..live-1] = live (in map),
      *                 pool[live..total-1] = dead (not in map).
@@ -377,12 +382,12 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     for (uint64_t i = 0; i < n_mixed_ops; i++) {
         uint32_t pct = (uint32_t)(xoshiro256ss() >> 32) % 100;
 
-        if (pct < 50 && live > 0) {
+        if (pct < (uint32_t)pct_lookup && live > 0) {
             /* lookup: Zipf-distributed from live pool */
             op_type[i] = 0;
             op_keys[i] = pool[(zipf_sample() - 1) % live];
             r.n_lookups++;
-        } else if (pct < 75 && live < total) {
+        } else if (pct < (uint32_t)thresh_ins && live < total) {
             /* insert: uniform from dead pool */
             op_type[i] = 1;
             uint32_t di = live + (uint32_t)(xoshiro256ss() >> 32) % (total - live);
@@ -411,12 +416,18 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     free(zipf_cdf);
     zipf_cdf = NULL;
 
-    /* execute with prefetch pipeline */
+    /* execute with adaptive prefetch pipeline:
+     * lookups rarely need overflow group → prefetch (1 line)
+     * inserts/deletes may probe further → prefetch2 (2 lines) */
     tot = 0;
     t0 = now_sec();
     for (uint64_t i = 0; i < n_mixed_ops; i++) {
-        if (i + PF_DIST < n_mixed_ops)
-            avx_map64_prefetch2(&m, op_keys[i + PF_DIST]);
+        if (i + PF_DIST < n_mixed_ops) {
+            if (op_type[i + PF_DIST] == 0)
+                avx_map64_prefetch(&m, op_keys[i + PF_DIST]);
+            else
+                avx_map64_prefetch2(&m, op_keys[i + PF_DIST]);
+        }
         switch (op_type[i]) {
             case 0: tot += (uint64_t)avx_map64_contains(&m, op_keys[i]); break;
             case 1: tot += (uint64_t)avx_map64_insert(&m, op_keys[i]); break;

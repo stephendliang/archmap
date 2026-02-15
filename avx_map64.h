@@ -195,21 +195,36 @@ static inline int avx_map64_delete(struct avx_map64 *m, uint64_t key) {
 
                 if (scan_empty == 0xFF) break; /* fully empty group — chain over */
 
-                int moved = 0;
+                /* pre-hash all occupied keys — independent CRC32s
+                 * pipeline at 1-cycle throughput via OoO execution */
+                uint64_t cand_keys[8];
+                uint32_t cand_homes[8];
+                int cand_slots[8];
+                int n_cand = 0;
+
                 for (__mmask8 todo = (~scan_empty) & 0xFF; todo; todo &= todo - 1) {
                     int s = __builtin_ctz(todo);
-                    uint32_t home = avx64_hash(scan_grp[s]) & mask;
-                    /* does this key's probe path cross hole_gi? */
-                    if (((hole_gi - home) & mask) < ((scan_gi - home) & mask)) {
+                    cand_keys[n_cand] = scan_grp[s];
+                    cand_slots[n_cand] = s;
+                    n_cand++;
+                }
+
+                for (int j = 0; j < n_cand; j++)
+                    cand_homes[j] = avx64_hash(cand_keys[j]) & mask;
+
+                /* find first movable candidate */
+                int moved = 0;
+                for (int j = 0; j < n_cand; j++) {
+                    if (((hole_gi - cand_homes[j]) & mask) < ((scan_gi - cand_homes[j]) & mask)) {
                         uint64_t *hole_grp = m->keys + (hole_gi << 3);
-                        hole_grp[hole_slot] = scan_grp[s];
-                        scan_grp[s] = 0;
+                        hole_grp[hole_slot] = cand_keys[j];
+                        scan_grp[cand_slots[j]] = 0;
 
                         /* scan group already had empties → chain ends here */
                         if (scan_empty) return 1;
 
                         hole_gi = scan_gi;
-                        hole_slot = s; /* moved key's slot is the new hole */
+                        hole_slot = cand_slots[j];
                         moved = 1;
                         break;
                     }
