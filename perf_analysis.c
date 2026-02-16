@@ -242,6 +242,42 @@ static int has_tool(const char *name) {
     return system(cmd) == 0;
 }
 
+/* Resolve a tool to its full path, checking PATH then well-known dirs.
+   Returns static buffer — valid until next call. */
+static const char *find_tool(const char *name) {
+    static char path[PATH_MAX];
+
+    /* Check PATH first */
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "which '%s' 2>/dev/null", name);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(path, sizeof(path), fp)) {
+            char *nl = strchr(path, '\n');
+            if (nl) *nl = '\0';
+            if (pclose(fp) == 0 && path[0] == '/')
+                return path;
+        } else {
+            pclose(fp);
+        }
+    }
+
+    /* Well-known install locations */
+    static const char *search_dirs[] = {
+        "/opt/AMDuProf/bin",
+        "/opt/AMDuProf_5.0/bin",
+        "/opt/AMDuProf_4.2/bin",
+        "/usr/local/bin",
+        NULL
+    };
+    for (const char **d = search_dirs; *d; d++) {
+        snprintf(path, sizeof(path), "%s/%s", *d, name);
+        if (access(path, X_OK) == 0)
+            return path;
+    }
+    return NULL;
+}
+
 /* ── Phase 1: Build ──────────────────────────────────────────────────── */
 
 static int phase_build(struct perf_opts *opts) {
@@ -470,7 +506,8 @@ static int run_perf_annotate(struct perf_opts *opts,
 
 static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     if (opts->uprof_mode < 0) return 0;
-    if (!has_tool("AMDuProfCLI")) {
+    const char *uprof_bin = find_tool("AMDuProfCLI");
+    if (!uprof_bin) {
         if (opts->uprof_mode > 0) {
             fprintf(stderr,
                 "error: --uprof specified but AMDuProfCLI not found\n");
@@ -482,78 +519,132 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     char uprof_dir[PATH_MAX];
     snprintf(uprof_dir, sizeof(uprof_dir), "%s/uprof", g_tmpdir);
 
+    /* Phase 1: collect with assess config (IPC + L1d + branches + misaligned) */
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-        "AMDuProfCLI collect --config cpi -o '%s' -- %s 2>&1",
-        uprof_dir, opts->cmd_str);
+        "'%s' collect --config assess -o '%s' %s 2>&1",
+        uprof_bin, uprof_dir, opts->cmd_str);
 
     int status;
     char *out = run_cmd(cmd, &status, opts->verbose);
+
+    /* Extract data directory from collect output:
+       "Generated data files path: /path/to/AMDuProf-xxx" */
+    char data_dir[PATH_MAX] = {0};
+    if (out) {
+        const char *tag = "Generated data files path: ";
+        char *p = strstr(out, tag);
+        if (p) {
+            p += strlen(tag);
+            char *nl = strchr(p, '\n');
+            size_t len = nl ? (size_t)(nl - p) : strlen(p);
+            while (len > 0 && (p[len-1] == '\r' || p[len-1] == ' '))
+                len--;
+            if (len < sizeof(data_dir)) {
+                memcpy(data_dir, p, len);
+                data_dir[len] = '\0';
+            }
+        }
+    }
     free(out);
-    if (status != 0) {
+
+    if (status != 0 || !data_dir[0]) {
         if (opts->uprof_mode > 0)
             fprintf(stderr, "AMDuProfCLI collect failed\n");
         return opts->uprof_mode > 0 ? -1 : 0;
     }
 
+    /* Phase 2: generate report */
     snprintf(cmd, sizeof(cmd),
-        "AMDuProfCLI report -i '%s' --category cpu 2>&1", uprof_dir);
+        "'%s' report -i '%s' --category cpu 2>&1", uprof_bin, data_dir);
     out = run_cmd(cmd, &status, opts->verbose);
-    if (!out) return 0;
+    free(out);
+    if (status != 0) return 0;
+
+    /* Phase 3: read and parse report.csv */
+    char csv_path[PATH_MAX];
+    snprintf(csv_path, sizeof(csv_path), "%s/report.csv", data_dir);
+
+    FILE *fp = fopen(csv_path, "r");
+    if (!fp) return 0;
 
     int cap = 16;
     prof->uprof_funcs = malloc((size_t)cap * sizeof(*prof->uprof_funcs));
     prof->n_uprof_funcs = 0;
 
-    /* Parse report — look for known hot function names */
-    int header_seen = 0;
-    char *line = out;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        if (!header_seen) {
-            if (strstr(line, "Function") && strstr(line, "CPI"))
-                header_seen = 1;
-            line = nl ? nl + 1 : NULL;
+    /* Find the "HOTTEST FUNCTIONS" section header line, then parse rows.
+       CSV columns (assess config):
+       FUNCTION, CYCLES, RETIRED_INST, IPC, CPI,
+       BR_MISP(PTI), %BR_MISP, L1_DC_ACC(PTI), L1_DC_MISS(PTI),
+       %L1_DC_MISS, L1_REFILL_LOCAL(PTI), L1_REFILL_REMOTE(PTI),
+       MISALIGNED(PTI), Module */
+    char line[4096];
+    int in_funcs = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "HOTTEST FUNCTIONS")) {
+            /* Next line is the column header — skip it */
+            fgets(line, sizeof(line), fp);
+            in_funcs = 1;
             continue;
         }
+        if (!in_funcs) continue;
 
-        for (int f = 0; f < prof->n_funcs; f++) {
-            if (!strstr(line, prof->funcs[f].name)) continue;
-
-            double cpi = 0;
-            uint64_t dc = 0, ic = 0;
-            char *p = strstr(line, prof->funcs[f].name);
-            if (p) p += strlen(prof->funcs[f].name);
-
-            /* Skip past commas to CPI field */
-            int commas = 0;
-            while (p && *p && commas < 2) {
-                if (*p == ',') commas++;
-                p++;
-            }
-            if (p)
-                sscanf(p, " %lf , %" SCNu64 " , %" SCNu64,
-                       &cpi, &dc, &ic);
-
-            if (prof->n_uprof_funcs >= cap) {
-                cap *= 2;
-                prof->uprof_funcs = realloc(prof->uprof_funcs,
-                    (size_t)cap * sizeof(*prof->uprof_funcs));
-            }
-            struct uprof_func *uf =
-                &prof->uprof_funcs[prof->n_uprof_funcs++];
-            uf->name = strdup(prof->funcs[f].name);
-            uf->cpi = cpi;
-            uf->dc_misses = dc;
-            uf->ic_misses = ic;
+        /* Empty line ends the function table */
+        if (line[0] == '\n' || line[0] == '\r' || line[0] == '\0')
             break;
-        }
 
-        line = nl ? nl + 1 : NULL;
+        /* Extract quoted function name */
+        if (line[0] != '"') break;
+        char *name_end = strchr(line + 1, '"');
+        if (!name_end) continue;
+        *name_end = '\0';
+        const char *func_name = line + 1;
+
+        /* Match against known hot functions */
+        int matched = 0;
+        for (int f = 0; f < prof->n_funcs; f++) {
+            if (strcmp(func_name, prof->funcs[f].name) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) continue;
+
+        /* Parse CSV fields after the function name:
+           ,CYCLES,RETIRED_INST,IPC,CPI,BR_MISP_PTI,%BR_MISP,
+           L1_DC_ACC_PTI,L1_DC_MISS_PTI,%L1_DC_MISS,
+           L1_REFILL_LOCAL_PTI,L1_REFILL_REMOTE_PTI,MISALIGNED_PTI,Module */
+        char *p = name_end + 1;
+        double cycles_val = 0, inst_val = 0, ipc = 0, cpi = 0;
+        double br_misp_pti = 0, br_misp_pct = 0;
+        double l1_dc_acc_pti = 0, l1_dc_miss_pti = 0, l1_dc_miss_pct = 0;
+        double l1_refill_local = 0, l1_refill_remote = 0;
+        double misaligned_pti = 0;
+
+        if (sscanf(p,
+            ",%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,",
+            &cycles_val, &inst_val, &ipc, &cpi,
+            &br_misp_pti, &br_misp_pct,
+            &l1_dc_acc_pti, &l1_dc_miss_pti, &l1_dc_miss_pct,
+            &l1_refill_local, &l1_refill_remote,
+            &misaligned_pti) < 4)
+            continue;
+
+        if (prof->n_uprof_funcs >= cap) {
+            cap *= 2;
+            prof->uprof_funcs = realloc(prof->uprof_funcs,
+                (size_t)cap * sizeof(*prof->uprof_funcs));
+        }
+        struct uprof_func *uf =
+            &prof->uprof_funcs[prof->n_uprof_funcs++];
+        uf->name = strdup(func_name);
+        uf->ipc = ipc;
+        uf->cpi = cpi;
+        uf->l1_dc_miss_pct = l1_dc_miss_pct;
+        uf->br_misp_pti = br_misp_pti;
+        uf->misaligned_pti = misaligned_pti;
     }
-    free(out);
+    fclose(fp);
     return 0;
 }
 
@@ -1377,13 +1468,16 @@ static void print_report(struct perf_opts *opts,
 
     /* AMDuProf */
     if (prof->n_uprof_funcs > 0) {
-        printf("--- uprof ---\n");
+        printf("--- uprof (per-function) ---\n");
         for (int i = 0; i < prof->n_uprof_funcs; i++) {
             struct uprof_func *uf = &prof->uprof_funcs[i];
-            printf("%s: CPI %.2f, L1d miss %" PRIu64
-                   ", L1i miss %" PRIu64 "\n",
-                   uf->name, uf->cpi,
-                   uf->dc_misses, uf->ic_misses);
+            printf("%s: IPC %.2f, CPI %.2f, L1d miss %.1f%%",
+                   uf->name, uf->ipc, uf->cpi, uf->l1_dc_miss_pct);
+            if (uf->br_misp_pti > 0.01)
+                printf(", br mispredict %.1f/Ki", uf->br_misp_pti);
+            if (uf->misaligned_pti > 0.01)
+                printf(", misaligned %.1f/Ki", uf->misaligned_pti);
+            printf("\n");
         }
         printf("\n");
     }
