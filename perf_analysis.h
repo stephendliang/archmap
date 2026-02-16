@@ -85,7 +85,7 @@ struct hot_insn {
 
 struct uprof_func {
     char *name;
-    double ipc, cpi;
+    double ipc;
     double l1_dc_miss_pct;
     double br_misp_pti;      /* branch mispredicts per 1K insns */
     double misaligned_pti;   /* misaligned loads per 1K insns */

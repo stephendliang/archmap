@@ -615,7 +615,7 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
            L1_DC_ACC_PTI,L1_DC_MISS_PTI,%L1_DC_MISS,
            L1_REFILL_LOCAL_PTI,L1_REFILL_REMOTE_PTI,MISALIGNED_PTI,Module */
         char *p = name_end + 1;
-        double cycles_val = 0, inst_val = 0, ipc = 0, cpi = 0;
+        double cycles_val, inst_val, ipc, cpi_unused;
         double br_misp_pti = 0, br_misp_pct = 0;
         double l1_dc_acc_pti = 0, l1_dc_miss_pti = 0, l1_dc_miss_pct = 0;
         double l1_refill_local = 0, l1_refill_remote = 0;
@@ -623,7 +623,7 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
 
         if (sscanf(p,
             ",%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,",
-            &cycles_val, &inst_val, &ipc, &cpi,
+            &cycles_val, &inst_val, &ipc, &cpi_unused,
             &br_misp_pti, &br_misp_pct,
             &l1_dc_acc_pti, &l1_dc_miss_pti, &l1_dc_miss_pct,
             &l1_refill_local, &l1_refill_remote,
@@ -639,7 +639,6 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
             &prof->uprof_funcs[prof->n_uprof_funcs++];
         uf->name = strdup(func_name);
         uf->ipc = ipc;
-        uf->cpi = cpi;
         uf->l1_dc_miss_pct = l1_dc_miss_pct;
         uf->br_misp_pti = br_misp_pti;
         uf->misaligned_pti = misaligned_pti;
@@ -1471,8 +1470,8 @@ static void print_report(struct perf_opts *opts,
         printf("--- uprof (per-function) ---\n");
         for (int i = 0; i < prof->n_uprof_funcs; i++) {
             struct uprof_func *uf = &prof->uprof_funcs[i];
-            printf("%s: IPC %.2f, CPI %.2f, L1d miss %.1f%%",
-                   uf->name, uf->ipc, uf->cpi, uf->l1_dc_miss_pct);
+            printf("%s: IPC %.2f, L1d miss %.1f%%",
+                   uf->name, uf->ipc, uf->l1_dc_miss_pct);
             if (uf->br_misp_pti > 0.01)
                 printf(", br mispredict %.1f/Ki", uf->br_misp_pti);
             if (uf->misaligned_pti > 0.01)
