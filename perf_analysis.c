@@ -1468,15 +1468,12 @@ static void print_report(struct perf_opts *opts,
     /* AMDuProf */
     if (prof->n_uprof_funcs > 0) {
         printf("--- uprof (per-function) ---\n");
+        printf("function,IPC,L1d miss%%,br misp/Ki,misalign/Ki\n");
         for (int i = 0; i < prof->n_uprof_funcs; i++) {
             struct uprof_func *uf = &prof->uprof_funcs[i];
-            printf("%s: IPC %.2f, L1d miss %.1f%%",
-                   uf->name, uf->ipc, uf->l1_dc_miss_pct);
-            if (uf->br_misp_pti > 0.01)
-                printf(", br mispredict %.1f/Ki", uf->br_misp_pti);
-            if (uf->misaligned_pti > 0.01)
-                printf(", misaligned %.1f/Ki", uf->misaligned_pti);
-            printf("\n");
+            printf("%s,%.2f,%.1f,%.1f,%.1f\n",
+                   uf->name, uf->ipc, uf->l1_dc_miss_pct,
+                   uf->br_misp_pti, uf->misaligned_pti);
         }
         printf("\n");
     }
@@ -1515,14 +1512,13 @@ static void print_report(struct perf_opts *opts,
     /* llvm-mca throughput */
     if (prof->n_mca_blocks > 0) {
         printf("--- throughput (llvm-mca) ---\n");
+        printf("function,RThroughput,uops,IPC,bottleneck\n");
         for (int i = 0; i < prof->n_mca_blocks; i++) {
             struct mca_block *mb = &prof->mca_blocks[i];
-            printf("%s: RThroughput %.2f cyc, %d uops, IPC %.2f",
+            printf("%s,%.2f,%d,%.2f,%s\n",
                    mb->func_name, mb->block_rthroughput,
-                   mb->n_uops, mb->ipc);
-            if (mb->bottleneck)
-                printf(" (%s)", mb->bottleneck);
-            printf("\n");
+                   mb->n_uops, mb->ipc,
+                   mb->bottleneck ? mb->bottleneck : "");
         }
         printf("\n");
     }
@@ -1530,19 +1526,14 @@ static void print_report(struct perf_opts *opts,
     /* pahole data layout */
     if (prof->n_layouts > 0) {
         printf("--- data layout ---\n");
+        printf("type,bytes,cachelines,holes,padding,used_by\n");
         for (int i = 0; i < prof->n_layouts; i++) {
             struct struct_layout *sl = &prof->layouts[i];
-            printf("%s: %uB (%u cacheline%s)",
-                   sl->type_name, sl->size,
-                   sl->cachelines,
-                   sl->cachelines != 1 ? "s" : "");
-            if (sl->holes > 0)
-                printf(", %u hole%s (%uB wasted)",
-                       sl->holes,
-                       sl->holes != 1 ? "s" : "",
-                       sl->padding > 0 ? sl->padding :
-                       sl->holes * 4);
-            printf("  [used by %s]\n", sl->func_name);
+            printf("%s,%u,%u,%u,%u,%s\n",
+                   sl->type_name, sl->size, sl->cachelines,
+                   sl->holes,
+                   sl->padding > 0 ? sl->padding : sl->holes * 4,
+                   sl->func_name);
         }
         printf("\n");
     }
