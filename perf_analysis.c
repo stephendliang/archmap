@@ -406,16 +406,13 @@ static int run_perf_annotate(struct perf_opts *opts,
     prof->n_insns = 0;
 
     for (int f = 0; f < prof->n_funcs; f++) {
-        char clean_name[256];
-        snprintf(clean_name, sizeof(clean_name), "%s",
-                 prof->funcs[f].name);
-        strip_compiler_suffix(clean_name);
+        const char *raw_name = prof->funcs[f].name;
 
         char cmd[4096];
         snprintf(cmd, sizeof(cmd),
             "perf annotate --stdio --symbol='%s' "
             "-i '%s/perf.data' 2>/dev/null",
-            clean_name, g_tmpdir);
+            raw_name, g_tmpdir);
 
         int status;
         char *out = run_cmd(cmd, &status, opts->verbose);
@@ -747,15 +744,12 @@ static int run_cache_misses(struct perf_opts *opts,
     int limit = prof->n_funcs < opts->top_n ?
                 prof->n_funcs : opts->top_n;
     for (int f = 0; f < limit; f++) {
-        char clean_name[256];
-        snprintf(clean_name, sizeof(clean_name), "%s",
-                 prof->funcs[f].name);
-        strip_compiler_suffix(clean_name);
+        const char *raw_name = prof->funcs[f].name;
 
         snprintf(cmd, sizeof(cmd),
             "perf annotate --stdio --symbol='%s' "
             "-i '%s' 2>/dev/null",
-            clean_name, cm_data);
+            raw_name, cm_data);
 
         out = run_cmd(cmd, &status, opts->verbose);
         if (!out) continue;
@@ -833,17 +827,15 @@ static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
     int limit = prof->n_funcs < opts->top_n ?
                 prof->n_funcs : opts->top_n;
     for (int f = 0; f < limit; f++) {
-        char clean_name[256];
-        snprintf(clean_name, sizeof(clean_name), "%s",
-                 prof->funcs[f].name);
-        strip_compiler_suffix(clean_name);
+        const char *raw_name = prof->funcs[f].name;
 
-        /* Extract disassembly for this function */
+        /* Extract disassembly for this function — use raw name
+           (may include .constprop.N/.isra.N from LTO) */
         char cmd[4096];
         snprintf(cmd, sizeof(cmd),
             "objdump -d --no-show-raw-insn '%s' 2>/dev/null | "
             "awk '/^[0-9a-f]+ <%s>:$/,/^$/' ",
-            opts->binary_path, clean_name);
+            opts->binary_path, raw_name);
 
         char *disas = run_cmd(cmd, &status, opts->verbose);
         if (!disas || !*disas) { free(disas); continue; }
