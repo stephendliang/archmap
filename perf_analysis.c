@@ -105,17 +105,42 @@ static char *run_cmd(const char *cmd, int *out_status, int verbose) {
     return buf;
 }
 
+static int needs_shell_quote(const char *s) {
+    for (; *s; s++) {
+        if (*s == ' ' || *s == '\t' || *s == '&' || *s == '|' ||
+            *s == ';' || *s == '(' || *s == ')' || *s == '<' ||
+            *s == '>' || *s == '*' || *s == '?' || *s == '[' ||
+            *s == '$' || *s == '`' || *s == '"' || *s == '\\' ||
+            *s == '\n' || *s == '!')
+            return 1;
+    }
+    return 0;
+}
+
 static char *join_argv(char **argv, int argc) {
     size_t total = 0;
     for (int i = 0; i < argc; i++)
-        total += strlen(argv[i]) + 4;
+        total += strlen(argv[i]) * 4 + 4;
     char *cmd = malloc(total + 1);
     char *p = cmd;
     for (int i = 0; i < argc; i++) {
         if (i > 0) *p++ = ' ';
-        size_t al = strlen(argv[i]);
-        memcpy(p, argv[i], al);
-        p += al;
+        if (needs_shell_quote(argv[i])) {
+            *p++ = '\'';
+            for (const char *c = argv[i]; *c; c++) {
+                if (*c == '\'') {
+                    memcpy(p, "'\\''", 4);
+                    p += 4;
+                } else {
+                    *p++ = *c;
+                }
+            }
+            *p++ = '\'';
+        } else {
+            size_t al = strlen(argv[i]);
+            memcpy(p, argv[i], al);
+            p += al;
+        }
     }
     *p = '\0';
     return cmd;
@@ -283,8 +308,13 @@ static int run_perf_record(struct perf_opts *opts) {
     int status;
     char *out = run_cmd(cmd, &status, opts->verbose);
     free(out);
-    if (status != 0) {
-        fprintf(stderr, "perf record failed (exit %d)\n", status);
+
+    /* perf record passes through the profiled command's exit code.
+       Check if perf.data was actually created instead. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/perf.data", g_tmpdir);
+    if (access(path, F_OK) != 0) {
+        fprintf(stderr, "perf record failed — no perf.data created\n");
         return -1;
     }
     return 0;
