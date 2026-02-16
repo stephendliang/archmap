@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <fts.h>
 #include <inttypes.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include <tree_sitter/api.h>
@@ -34,12 +35,14 @@ struct perf_opts {
     int mca_mode;
     int cachemiss_mode;
     int pahole_mode;
+    int remarks_mode;     /* 0=auto, 1=force, -1=skip */
     const char *source_dir;
     int verbose;
     char **cmd_argv;
     int cmd_argc;
     char *binary_path;
     char *cmd_str;
+    const char *vs_binary;
 };
 
 enum {
@@ -54,6 +57,9 @@ enum {
     PERF_OPT_NO_CACHEMISS,
     PERF_OPT_PAHOLE,
     PERF_OPT_NO_PAHOLE,
+    PERF_OPT_VS,
+    PERF_OPT_REMARKS,
+    PERF_OPT_NO_REMARKS,
 };
 
 static struct option perf_long_options[] = {
@@ -72,6 +78,9 @@ static struct option perf_long_options[] = {
     {"no-cache-misses",no_argument,       NULL, PERF_OPT_NO_CACHEMISS},
     {"pahole",         no_argument,       NULL, PERF_OPT_PAHOLE},
     {"no-pahole",      no_argument,       NULL, PERF_OPT_NO_PAHOLE},
+    {"vs",             required_argument, NULL, PERF_OPT_VS},
+    {"remarks",        no_argument,       NULL, PERF_OPT_REMARKS},
+    {"no-remarks",     no_argument,       NULL, PERF_OPT_NO_REMARKS},
     {"source",         required_argument, NULL, 's'},
     {"verbose",   no_argument,       NULL, 'v'},
     {"help",      no_argument,       NULL, 'h'},
@@ -93,6 +102,8 @@ static void perf_usage(const char *prog) {
         "  --mca / --no-mca             Force/skip llvm-mca throughput analysis\n"
         "  --cache-misses / --no-cache-misses  Force/skip cache miss attribution\n"
         "  --pahole / --no-pahole       Force/skip struct layout analysis\n"
+        "  --remarks / --no-remarks     Force/skip compiler optimization remarks\n"
+        "  --vs BINARY                  A/B comparison: baseline binary (A)\n"
         "  -s, --source DIR     Source dir for skeleton xref (default \".\")\n"
         "  -v, --verbose        Print tool commands\n",
         prog);
@@ -430,6 +441,261 @@ static int parse_perf_report(struct perf_opts *opts, struct perf_profile *prof) 
         line = nl ? nl + 1 : NULL;
     }
     free(out);
+    return 0;
+}
+
+/* ── Phase 2b2: caller context ───────────────────────────────────────── */
+
+/* Names that are too generic to be useful as "caller" */
+static int is_boring_caller(const char *name) {
+    if (name[0] == '0' && name[1] == 'x') return 1; /* hex address */
+    static const char *boring[] = {
+        "_start", "__libc_start_main", "__libc_start_call_main",
+        "__GI___clone3", "start_thread", "__clone3", "_dl_start_user",
+        NULL
+    };
+    for (const char **b = boring; *b; b++)
+        if (strcmp(name, *b) == 0) return 1;
+    return 0;
+}
+
+/* Extract a clean function name from a tree line.
+   Returns pointer into 'buf' or NULL.  Strips " (inlined)" suffix. */
+static char *extract_tree_name(const char *raw, char *buf, size_t bufsz) {
+    const char *p = raw;
+    while (*p == ' ' || *p == '\t' || *p == '|') p++;
+    if (!*p || *p == '#' || *p == '\n') return NULL;
+    size_t len = strlen(p);
+    while (len > 0 && (p[len-1] == ' ' || p[len-1] == '\n')) len--;
+    /* Strip " (inlined)" suffix */
+    if (len > 10 && strncmp(p + len - 10, " (inlined)", 10) == 0)
+        len -= 10;
+    if (len == 0 || len >= bufsz) return NULL;
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static void add_caller_entry(struct hot_func *hf, const char *name, double pct) {
+    /* Filter: @plt stubs, __x86_ thunks */
+    if (strstr(name, "@plt") || strncmp(name, "__x86_", 6) == 0) return;
+    /* Filter: self-recursive (compare with stripped LTO suffixes) */
+    char cn[256], cf[256];
+    snprintf(cn, sizeof(cn), "%s", name);
+    strip_compiler_suffix(cn);
+    snprintf(cf, sizeof(cf), "%s", hf->name);
+    strip_compiler_suffix(cf);
+    if (strcmp(cn, cf) == 0) return;
+    /* Merge duplicate caller names */
+    for (int k = 0; k < hf->n_callers; k++) {
+        if (strcmp(hf->callers[k].name, name) == 0) {
+            hf->callers[k].pct += pct;
+            return;
+        }
+    }
+    if (hf->n_callers >= 5) return;
+    hf->callers = realloc(hf->callers,
+        (size_t)(hf->n_callers + 1) * sizeof(*hf->callers));
+    hf->callers[hf->n_callers].name = strdup(name);
+    hf->callers[hf->n_callers].pct = pct;
+    hf->n_callers++;
+}
+
+static int parse_callers(struct perf_opts *opts, struct perf_profile *prof) {
+    if (prof->n_funcs == 0) return 0;
+
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "perf report --stdio -g caller --no-children "
+        "--percent-limit 0.5 -i '%s/perf.data' 2>/dev/null",
+        g_tmpdir);
+
+    int status;
+    char *out = run_cmd(cmd, &status, opts->verbose);
+    if (!out) return -1;
+
+    /*
+     * perf report -g caller output formats:
+     *
+     * Multi-caller (branching at depth-1):
+     *   XX.XX%  cmd  obj  [.] FUNC
+     *           |--10.22%--bench_full_response
+     *           |          hpack_decode (inlined)
+     *           |          ...
+     *            --8.57%--bench_decode
+     *                      hpack_decode (inlined)
+     *
+     * Single-chain (100% from one path):
+     *   XX.XX%  cmd  obj  [.] FUNC
+     *           ---_start
+     *              __libc_start_main
+     *              main
+     *              bench_huffman_pair
+     *              hpack_huff_decode (inlined)
+     *
+     * Strategy:
+     * 1. Match function header [.] FUNC_NAME
+     * 2. Look for depth-1 entries:
+     *    a. |--XX%--NAME or --XX%--NAME → caller with percentage
+     *    b. ---NAME → single chain (100%)
+     * 3. For boring depth-1 names, follow chain to find better name.
+     *    "Better" = last non-boring name before self or a sub-branch.
+     * 4. Record column of first depth-1 to distinguish sub-branches.
+     */
+    int cur_func = -1;
+    int depth1_col = -1;     /* column of '--' for depth-1 entries */
+    int in_chain = 0;        /* inside a chain after depth-1 entry */
+    double chain_pct = 0;    /* pct for current chain */
+    char chain_best[256];    /* best (non-boring) name seen in chain */
+    char nbuf[256];
+
+    char *line = out;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        /* Function header: " XX.XX%  cmd  obj  [.] func_name" */
+        char *bracket = strstr(line, "[.] ");
+        if (bracket) {
+            /* Flush any pending chain */
+            if (in_chain && cur_func >= 0 && chain_best[0])
+                add_caller_entry(&prof->funcs[cur_func],
+                                 chain_best, chain_pct);
+            cur_func = -1;
+            depth1_col = -1;
+            in_chain = 0;
+            char *name = bracket + 4;
+            size_t nlen = strlen(name);
+            while (nlen > 0 &&
+                   (name[nlen-1] == ' ' || name[nlen-1] == '\n'))
+                nlen--;
+            for (int f = 0; f < prof->n_funcs; f++) {
+                if (strlen(prof->funcs[f].name) == nlen &&
+                    strncmp(prof->funcs[f].name, name, nlen) == 0) {
+                    cur_func = f;
+                    break;
+                }
+            }
+            goto next_line;
+        }
+
+        if (cur_func < 0) goto next_line;
+
+        /* Blank line → end of this function's tree */
+        {
+            const char *t = line;
+            while (*t == ' ' || *t == '\t') t++;
+            if (*t == '\0' || *t == '\n') {
+                if (in_chain && chain_best[0])
+                    add_caller_entry(&prof->funcs[cur_func],
+                                     chain_best, chain_pct);
+                in_chain = 0;
+                cur_func = -1;
+                goto next_line;
+            }
+        }
+
+        /* Check for percentage branch: |--XX.XX%--NAME or --XX.XX%--NAME */
+        char *pctdash = strstr(line, "%--");
+        if (pctdash) {
+            /* Find the '--' before the percentage */
+            char *dd = pctdash;
+            while (dd > line && !(dd[-1] == '-' && dd[0] == '-')) dd--;
+            if (dd > line) dd--;
+            int col = (int)(dd - line);
+
+            /* Parse percentage */
+            double pct = 0;
+            char *numstart = dd + 2; /* skip '--' */
+            sscanf(numstart, "%lf", &pct);
+
+            /* Only accept depth-1 entries (matching first column seen) */
+            if (depth1_col < 0)
+                depth1_col = col;
+
+            if (col == depth1_col) {
+                /* Flush previous chain */
+                if (in_chain && chain_best[0])
+                    add_caller_entry(&prof->funcs[cur_func],
+                                     chain_best, chain_pct);
+                /* Extract caller name after "%--" */
+                char *cname = pctdash + 3;
+                char *n = extract_tree_name(cname, nbuf, sizeof(nbuf));
+                if (n) {
+                    chain_pct = pct;
+                    if (is_boring_caller(n)) {
+                        chain_best[0] = '\0'; /* hope to find better below */
+                        in_chain = 1;
+                    } else {
+                        snprintf(chain_best, sizeof(chain_best), "%s", n);
+                        in_chain = 1;
+                    }
+                }
+            }
+            /* Sub-branches (col != depth1_col) are ignored */
+            goto next_line;
+        }
+
+        /* Check for single-chain start: ---NAME (no percentage) */
+        char *triple = strstr(line, "---");
+        if (triple && !strstr(line, "%--")) {
+            /* Flush previous chain */
+            if (in_chain && chain_best[0])
+                add_caller_entry(&prof->funcs[cur_func],
+                                 chain_best, chain_pct);
+            int col = (int)(triple - line);
+            if (depth1_col < 0)
+                depth1_col = col;
+            char *n = extract_tree_name(triple + 3, nbuf, sizeof(nbuf));
+            chain_pct = 100.0;
+            chain_best[0] = '\0';
+            if (n && !is_boring_caller(n))
+                snprintf(chain_best, sizeof(chain_best), "%s", n);
+            in_chain = 1;
+            goto next_line;
+        }
+
+        /* Chain continuation line — just a function name.
+           Update chain_best to the last non-boring, non-self name
+           (closest to the hot function in the call chain). */
+        if (in_chain) {
+            char *n = extract_tree_name(line, nbuf, sizeof(nbuf));
+            if (n && !is_boring_caller(n)) {
+                /* Skip if this is the hot function itself
+                   (match after stripping LTO suffixes) */
+                char cn[256], cf[256];
+                snprintf(cn, sizeof(cn), "%s", n);
+                strip_compiler_suffix(cn);
+                snprintf(cf, sizeof(cf), "%s",
+                         prof->funcs[cur_func].name);
+                strip_compiler_suffix(cf);
+                if (strcmp(cn, cf) != 0)
+                    snprintf(chain_best, sizeof(chain_best), "%s", n);
+            }
+        }
+
+    next_line:
+        line = nl ? nl + 1 : NULL;
+    }
+
+    /* Flush final chain */
+    if (in_chain && cur_func >= 0 && chain_best[0])
+        add_caller_entry(&prof->funcs[cur_func], chain_best, chain_pct);
+
+    free(out);
+
+    /* Sort callers by descending pct */
+    for (int f = 0; f < prof->n_funcs; f++) {
+        struct hot_func *hf = &prof->funcs[f];
+        for (int i = 0; i < hf->n_callers - 1; i++)
+            for (int j = i + 1; j < hf->n_callers; j++)
+                if (hf->callers[j].pct > hf->callers[i].pct) {
+                    struct caller_entry tmp = hf->callers[i];
+                    hf->callers[i] = hf->callers[j];
+                    hf->callers[j] = tmp;
+                }
+    }
+
     return 0;
 }
 
@@ -1310,13 +1576,24 @@ static void xref_skeleton(struct perf_opts *opts,
 
     if (xref_cache) cache_close(xref_cache);
 
-    /* Match hot functions → collected symbols */
+    /* Match hot functions → collected symbols.
+       When multiple files define the same symbol (e.g. main), prefer
+       the file whose basename is a substring of the binary name. */
+    const char *bin_base = opts->binary_path ?
+        strrchr(opts->binary_path, '/') : NULL;
+    bin_base = bin_base ? bin_base + 1 :
+               (opts->binary_path ? opts->binary_path : "");
+
     for (int f = 0; f < prof->n_funcs; f++) {
         struct hot_func *hf = &prof->funcs[f];
         char clean[256];
         snprintf(clean, sizeof(clean), "%s", hf->name);
         strip_compiler_suffix(clean);
         size_t clen = strlen(clean);
+
+        struct file_entry *best_fe = NULL;
+        struct symbol *best_sym = NULL;
+        int best_score = -1;
 
         for (int i = 0; i < g_n_files; i++) {
             struct file_entry *fe = &g_files[i];
@@ -1339,27 +1616,321 @@ static void xref_skeleton(struct perf_opts *opts,
                     after != ';' && after != '\0')
                     continue;
 
-                hf->skeleton_sig = strdup(sym->text);
-                hf->source_file = strdup(fe->abs_path);
-                hf->start_line = sym->start_line;
-                hf->end_line = sym->end_line;
-
-                if (sym->n_callees > 0) {
-                    hf->n_callees = sym->n_callees;
-                    hf->callees = malloc(
-                        (size_t)sym->n_callees * sizeof(char *));
-                    for (int k = 0; k < sym->n_callees; k++)
-                        hf->callees[k] =
-                            strdup(sym->callees[k]);
+                /* Score: prefer source file related to binary name */
+                int score = 0;
+                if (*bin_base) {
+                    const char *src_base = strrchr(fe->abs_path, '/');
+                    src_base = src_base ? src_base + 1 : fe->abs_path;
+                    char src_stem[256];
+                    snprintf(src_stem, sizeof(src_stem), "%s", src_base);
+                    char *dot = strrchr(src_stem, '.');
+                    if (dot) *dot = '\0';
+                    if (strstr(bin_base, src_stem))
+                        score = 2;
                 }
-                goto next_func;
+
+                if (score > best_score) {
+                    best_fe = fe;
+                    best_sym = sym;
+                    best_score = score;
+                }
             }
         }
-        next_func:;
+
+        if (best_sym) {
+            hf->skeleton_sig = strdup(best_sym->text);
+            hf->source_file = strdup(best_fe->abs_path);
+            hf->start_line = best_sym->start_line;
+            hf->end_line = best_sym->end_line;
+
+            if (best_sym->n_callees > 0) {
+                hf->n_callees = best_sym->n_callees;
+                hf->callees = malloc(
+                    (size_t)best_sym->n_callees * sizeof(char *));
+                for (int k = 0; k < best_sym->n_callees; k++)
+                    hf->callees[k] =
+                        strdup(best_sym->callees[k]);
+            }
+        }
     }
 
     ts_query_delete(query);
     ts_parser_delete(parser);
+}
+
+/* ── Phase 3c: Compiler optimization remarks ─────────────────────────── */
+
+static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
+    if (opts->remarks_mode < 0) return 0;
+
+    /* Detect compiler */
+    int status;
+    char *cc_out = run_cmd("cc --version 2>&1", &status, 0);
+    int is_gcc = 0, is_clang = 0;
+    if (cc_out) {
+        /* Lowercase scan */
+        for (char *p = cc_out; *p; p++)
+            *p = (*p >= 'A' && *p <= 'Z') ? *p + 32 : *p;
+        if (strstr(cc_out, "gcc") || strstr(cc_out, "g++"))
+            is_gcc = 1;
+        else if (strstr(cc_out, "clang"))
+            is_clang = 1;
+        free(cc_out);
+    }
+    if (!is_gcc && !is_clang) {
+        if (opts->remarks_mode > 0)
+            fprintf(stderr, "error: --remarks requires gcc or clang as cc\n");
+        return opts->remarks_mode > 0 ? -1 : 0;
+    }
+
+    /* Collect unique source files from hot functions */
+    char *src_files[64];
+    int n_src = 0;
+    for (int f = 0; f < prof->n_funcs && n_src < 64; f++) {
+        if (!prof->funcs[f].source_file) continue;
+        int dup = 0;
+        for (int s = 0; s < n_src; s++) {
+            if (strcmp(src_files[s], prof->funcs[f].source_file) == 0) {
+                dup = 1; break;
+            }
+        }
+        if (!dup)
+            src_files[n_src++] = prof->funcs[f].source_file;
+    }
+    if (n_src == 0) return 0;
+
+    int cap = 64;
+    prof->remarks = malloc((size_t)cap * sizeof(*prof->remarks));
+    prof->n_remarks = 0;
+
+    /* Try to read compile_commands.json */
+    char ccjson_path[PATH_MAX];
+    snprintf(ccjson_path, sizeof(ccjson_path), "%s/compile_commands.json",
+             opts->source_dir);
+    char *ccjson = NULL;
+    {
+        FILE *fp = fopen(ccjson_path, "r");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long flen = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (flen > 0 && flen < 10*1024*1024) {
+                ccjson = malloc((size_t)flen + 1);
+                fread(ccjson, 1, (size_t)flen, fp);
+                ccjson[flen] = '\0';
+            }
+            fclose(fp);
+        }
+    }
+
+    for (int s = 0; s < n_src; s++) {
+        /* Build compile command for this source file */
+        char cmd[8192];
+        int found_cmd = 0;
+
+        /* Try compile_commands.json first */
+        if (ccjson) {
+            const char *basename = strrchr(src_files[s], '/');
+            basename = basename ? basename + 1 : src_files[s];
+
+            /* Find "file":"...basename" entry */
+            char needle[PATH_MAX];
+            snprintf(needle, sizeof(needle), "\"file\":\"%s\"", basename);
+            /* Also try with path components */
+            char *entry = strstr(ccjson, needle);
+            if (!entry) {
+                snprintf(needle, sizeof(needle), "\"%s\"", basename);
+                /* Search for file field containing our basename */
+                char *p = ccjson;
+                while ((p = strstr(p, "\"file\"")) != NULL) {
+                    char *colon = strchr(p + 6, ':');
+                    if (!colon) break;
+                    char *q = colon + 1;
+                    while (*q == ' ') q++;
+                    if (*q == '"') {
+                        q++;
+                        char *end = strchr(q, '"');
+                        if (end) {
+                            /* Check if this file entry matches */
+                            const char *fn = end;
+                            while (fn > q && fn[-1] != '/') fn--;
+                            if ((size_t)(end - fn) == strlen(basename) &&
+                                strncmp(fn, basename, strlen(basename)) == 0) {
+                                entry = p;
+                                break;
+                            }
+                        }
+                    }
+                    p += 6;
+                }
+            }
+            if (entry) {
+                /* Find "command" in same object (search backwards/forwards) */
+                char *cmd_field = NULL;
+                /* Search forward within ~2KB */
+                char *search = entry;
+                for (int tries = 0; tries < 2000 && *search; tries++, search++) {
+                    if (strncmp(search, "\"command\"", 9) == 0) {
+                        cmd_field = search;
+                        break;
+                    }
+                }
+                /* Also search backward */
+                if (!cmd_field) {
+                    search = entry;
+                    for (int tries = 0; tries < 2000 && search > ccjson;
+                         tries++, search--) {
+                        if (strncmp(search, "\"command\"", 9) == 0) {
+                            cmd_field = search;
+                            break;
+                        }
+                    }
+                }
+                if (cmd_field) {
+                    char *colon = strchr(cmd_field + 9, ':');
+                    if (colon) {
+                        char *q = colon + 1;
+                        while (*q == ' ') q++;
+                        if (*q == '"') {
+                            q++;
+                            char orig_cmd[4096];
+                            int ci = 0;
+                            while (*q && *q != '"' &&
+                                   ci < (int)sizeof(orig_cmd) - 1) {
+                                if (*q == '\\' && q[1]) { q++; }
+                                orig_cmd[ci++] = *q++;
+                            }
+                            orig_cmd[ci] = '\0';
+                            /* Modify: replace -o ... with -S -o /dev/null,
+                               append remark flags */
+                            const char *rflags = is_gcc ?
+                                "-fopt-info-optimized-missed" :
+                                "-Rpass=.* -Rpass-missed=.*";
+                            snprintf(cmd, sizeof(cmd),
+                                "%s -S -o /dev/null %s 2>&1",
+                                orig_cmd, rflags);
+                            found_cmd = 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Fallback: standalone compilation */
+        if (!found_cmd) {
+            const char *rflags = is_gcc ?
+                "-fopt-info-optimized-missed" :
+                "-Rpass=.* -Rpass-missed=.*";
+            snprintf(cmd, sizeof(cmd),
+                "cc -S -o /dev/null -O3 -march=native -I'%s' '%s' %s 2>&1",
+                opts->source_dir, src_files[s], rflags);
+        }
+
+        char *out = run_cmd(cmd, &status, opts->verbose);
+        if (!out) continue;
+
+        /* Parse remark lines: file:line:col: category: message */
+        char *line = out;
+        while (line && *line) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+
+            /* Match: "file:line:col: note/optimized/remark: ..." for both
+               GCC and Clang formats */
+            char rfile[PATH_MAX];
+            uint32_t rline;
+            uint32_t rcol;
+            char category[64];
+            char message[512];
+
+            int matched = 0;
+            /* GCC: file:line:col: optimized: message
+               Clang: file:line:col: remark: message */
+            if (sscanf(line, "%[^:]:%u:%u: %63[^:]: %511[^\n]",
+                       rfile, &rline, &rcol, category, message) == 5)
+                matched = 1;
+
+            if (matched) {
+                /* Normalize category */
+                char *cat = category;
+                while (*cat == ' ') cat++;
+                /* Trim trailing spaces */
+                size_t catlen = strlen(cat);
+                while (catlen > 0 && cat[catlen-1] == ' ')
+                    cat[--catlen] = '\0';
+
+                const char *norm_cat = NULL;
+                if (strstr(cat, "optimized") || strstr(cat, "remark"))
+                    norm_cat = "optimized";
+                else if (strstr(cat, "missed") || strstr(cat, "note"))
+                    norm_cat = "missed";
+                else {
+                    line = nl ? nl + 1 : NULL;
+                    continue;
+                }
+
+                /* Check if this line belongs to any hot function */
+                for (int f = 0; f < prof->n_funcs; f++) {
+                    struct hot_func *hf = &prof->funcs[f];
+                    if (!hf->source_file) continue;
+
+                    /* Match source file */
+                    const char *hf_base = strrchr(hf->source_file, '/');
+                    hf_base = hf_base ? hf_base + 1 : hf->source_file;
+                    const char *rf_base = strrchr(rfile, '/');
+                    rf_base = rf_base ? rf_base + 1 : rfile;
+                    if (strcmp(hf_base, rf_base) != 0) continue;
+
+                    /* Check line range */
+                    if (rline < hf->start_line || rline > hf->end_line)
+                        continue;
+
+                    /* Count existing remarks for this function */
+                    int func_remarks = 0;
+                    for (int r = 0; r < prof->n_remarks; r++) {
+                        if (strcmp(prof->remarks[r].func_name,
+                                   hf->name) == 0)
+                            func_remarks++;
+                    }
+                    if (func_remarks >= 10) break;
+
+                    if (prof->n_remarks >= cap) {
+                        cap *= 2;
+                        prof->remarks = realloc(prof->remarks,
+                            (size_t)cap * sizeof(*prof->remarks));
+                    }
+                    struct remark_entry *re =
+                        &prof->remarks[prof->n_remarks++];
+                    re->func_name = strdup(hf->name);
+                    re->source_file = strdup(hf->source_file);
+                    re->line = rline;
+                    re->category = strdup(norm_cat);
+                    re->message = strdup(message);
+                    break;
+                }
+            }
+
+            line = nl ? nl + 1 : NULL;
+        }
+        free(out);
+    }
+    free(ccjson);
+
+    /* Sort: "missed" before "optimized" within each function */
+    for (int i = 0; i < prof->n_remarks - 1; i++)
+        for (int j = i + 1; j < prof->n_remarks; j++) {
+            int same_func = strcmp(prof->remarks[i].func_name,
+                                   prof->remarks[j].func_name) == 0;
+            if (same_func &&
+                strcmp(prof->remarks[i].category, "optimized") == 0 &&
+                strcmp(prof->remarks[j].category, "missed") == 0) {
+                struct remark_entry tmp = prof->remarks[i];
+                prof->remarks[i] = prof->remarks[j];
+                prof->remarks[j] = tmp;
+            }
+        }
+
+    return 0;
 }
 
 /* ── Phase 4: Output ─────────────────────────────────────────────────── */
@@ -1429,6 +2000,13 @@ static void print_report(struct perf_opts *opts,
                 for (int k = 0; k < hf->n_callees; k++)
                     printf("%s%s", hf->callees[k],
                            k < hf->n_callees - 1 ? ", " : "\n");
+            }
+            if (hf->n_callers > 0) {
+                printf("       <- ");
+                for (int k = 0; k < hf->n_callers; k++)
+                    printf("%s (%.1f%%)%s",
+                           hf->callers[k].name, hf->callers[k].pct,
+                           k < hf->n_callers - 1 ? ", " : "\n");
             }
         }
         printf("\n");
@@ -1523,6 +2101,32 @@ static void print_report(struct perf_opts *opts,
         printf("\n");
     }
 
+    /* Compiler remarks */
+    if (prof->n_remarks > 0) {
+        printf("--- compiler remarks ---\n");
+        const char *cur_func = NULL;
+        for (int i = 0; i < prof->n_remarks; i++) {
+            struct remark_entry *re = &prof->remarks[i];
+            if (!cur_func || strcmp(cur_func, re->func_name) != 0) {
+                cur_func = re->func_name;
+                /* Find source info */
+                for (int f = 0; f < prof->n_funcs; f++) {
+                    if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
+                        prof->funcs[f].source_file) {
+                        const char *sp = short_path(
+                            prof->funcs[f].source_file, opts->source_dir);
+                        printf("[%s]  //%s:%u-%u\n", cur_func, sp,
+                               prof->funcs[f].start_line,
+                               prof->funcs[f].end_line);
+                        break;
+                    }
+                }
+            }
+            printf("  :%u  %s: %s\n", re->line, re->category, re->message);
+        }
+        printf("\n");
+    }
+
     /* pahole data layout */
     if (prof->n_layouts > 0) {
         printf("--- data layout ---\n");
@@ -1539,6 +2143,407 @@ static void print_report(struct perf_opts *opts,
     }
 }
 
+/* ── Pipeline ────────────────────────────────────────────────────────── */
+
+static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof,
+                        int has_debug) {
+    fprintf(stderr, "profiling: %s\n", opts->cmd_str);
+
+    if (run_perf_stat(opts, &prof->stats) != 0)
+        fprintf(stderr, "warning: perf stat failed, continuing\n");
+
+    run_topdown(opts, prof);
+
+    if (run_perf_record(opts) != 0) {
+        fprintf(stderr, "error: perf record failed\n");
+        return -1;
+    }
+
+    parse_perf_report(opts, prof);
+    parse_callers(opts, prof);
+    run_perf_annotate(opts, prof);
+    run_cache_misses(opts, prof);
+    run_mca(opts, prof);
+    run_uprof(opts, prof);
+    xref_skeleton(opts, prof);
+    run_remarks(opts, prof);
+    run_pahole(opts, prof, has_debug);
+
+    return 0;
+}
+
+/* ── A/B Comparison output ───────────────────────────────────────────── */
+
+static void print_comparison(struct perf_opts *opts,
+                              struct perf_profile *prof_a, const char *a_cmd,
+                              struct perf_profile *prof_b, const char *b_cmd) {
+    struct perf_stats *sa = &prof_a->stats;
+    struct perf_stats *sb = &prof_b->stats;
+
+    printf("=== perf A/B: %s vs %s ===\n", a_cmd, b_cmd);
+
+    /* Stats CSV with deltas */
+    printf("metric,A,B,delta,%%change\n");
+
+    {
+        char ca[32], cb[32];
+        fmt_count(ca, sizeof(ca), sa->cycles);
+        fmt_count(cb, sizeof(cb), sb->cycles);
+        char cd[32]; fmt_count(cd, sizeof(cd),
+            sa->cycles > sb->cycles ? sa->cycles - sb->cycles :
+                                      sb->cycles - sa->cycles);
+        double pct = sa->cycles ? 100.0 * ((double)sb->cycles - sa->cycles)
+                                         / sa->cycles : 0;
+        printf("cycles,%s,%s,%s%s,%.1f%%\n", ca, cb,
+               sb->cycles < sa->cycles ? "-" : "+", cd, pct);
+    }
+    {
+        char ia[32], ib[32];
+        fmt_count(ia, sizeof(ia), sa->instructions);
+        fmt_count(ib, sizeof(ib), sb->instructions);
+        char id[32]; fmt_count(id, sizeof(id),
+            sa->instructions > sb->instructions ?
+                sa->instructions - sb->instructions :
+                sb->instructions - sa->instructions);
+        double pct = sa->instructions ?
+            100.0 * ((double)sb->instructions - sa->instructions)
+                   / sa->instructions : 0;
+        printf("insns,%s,%s,%s%s,%.1f%%\n", ia, ib,
+               sb->instructions < sa->instructions ? "-" : "+", id, pct);
+    }
+    printf("IPC,%.2f,%.2f,%+.2f,%.1f%%\n",
+           sa->ipc, sb->ipc, sb->ipc - sa->ipc,
+           sa->ipc ? 100.0 * (sb->ipc - sa->ipc) / sa->ipc : 0);
+    printf("wall,%.2fs,%.2fs,%+.2fs,%.1f%%\n",
+           sa->wall_seconds, sb->wall_seconds,
+           sb->wall_seconds - sa->wall_seconds,
+           sa->wall_seconds ? 100.0 * (sb->wall_seconds - sa->wall_seconds)
+                              / sa->wall_seconds : 0);
+    printf("cache miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%\n",
+           sa->cache_miss_pct, sb->cache_miss_pct,
+           sb->cache_miss_pct - sa->cache_miss_pct,
+           sa->cache_miss_pct ? 100.0 * (sb->cache_miss_pct - sa->cache_miss_pct)
+                                / sa->cache_miss_pct : 0);
+    printf("branch miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%\n",
+           sa->branch_miss_pct, sb->branch_miss_pct,
+           sb->branch_miss_pct - sa->branch_miss_pct,
+           sa->branch_miss_pct ? 100.0 * (sb->branch_miss_pct - sa->branch_miss_pct)
+                                  / sa->branch_miss_pct : 0);
+    printf("\n");
+
+    /* Hot function delta — merge by name, with caller info */
+    printf("--- hot functions (A -> B) ---\n");
+    printf("  A%%    B%%   delta  function\n");
+
+    /* Print functions in B, matching against A */
+    for (int b = 0; b < prof_b->n_funcs; b++) {
+        char bclean[256];
+        snprintf(bclean, sizeof(bclean), "%s", prof_b->funcs[b].name);
+        strip_compiler_suffix(bclean);
+
+        double a_pct = 0;
+        int a_idx = -1;
+        for (int a = 0; a < prof_a->n_funcs; a++) {
+            char aclean[256];
+            snprintf(aclean, sizeof(aclean), "%s", prof_a->funcs[a].name);
+            strip_compiler_suffix(aclean);
+            if (strcmp(aclean, bclean) == 0) {
+                a_pct = prof_a->funcs[a].overhead_pct;
+                a_idx = a;
+                break;
+            }
+        }
+
+        double delta = prof_b->funcs[b].overhead_pct - a_pct;
+        const char *src = NULL;
+        if (prof_b->funcs[b].source_file)
+            src = short_path(prof_b->funcs[b].source_file, opts->source_dir);
+        printf("%5.1f  %5.1f  %+5.1f   %s",
+               a_pct, prof_b->funcs[b].overhead_pct, delta,
+               prof_b->funcs[b].name);
+        if (a_idx < 0) printf("  [NEW]");
+        if (src) printf("  //%s", src);
+        printf("\n");
+
+        /* Caller delta */
+        struct hot_func *hfb = &prof_b->funcs[b];
+        struct hot_func *hfa = a_idx >= 0 ? &prof_a->funcs[a_idx] : NULL;
+        if (hfb->n_callers > 0 || (hfa && hfa->n_callers > 0)) {
+            printf("       <- ");
+            int first = 1;
+            for (int c = 0; c < hfb->n_callers; c++) {
+                if (!first) printf(", ");
+                first = 0;
+                char cclean[256];
+                snprintf(cclean, sizeof(cclean), "%s", hfb->callers[c].name);
+                strip_compiler_suffix(cclean);
+                double a_cpct = -1;
+                if (hfa) {
+                    for (int ac = 0; ac < hfa->n_callers; ac++) {
+                        char acclean[256];
+                        snprintf(acclean, sizeof(acclean), "%s",
+                                 hfa->callers[ac].name);
+                        strip_compiler_suffix(acclean);
+                        if (strcmp(cclean, acclean) == 0) {
+                            a_cpct = hfa->callers[ac].pct;
+                            break;
+                        }
+                    }
+                }
+                printf("%s (", hfb->callers[c].name);
+                if (a_cpct >= 0)
+                    printf("%.0f%% -> %.0f%%", a_cpct, hfb->callers[c].pct);
+                else
+                    printf("%.0f%% [NEW]", hfb->callers[c].pct);
+                printf(")");
+            }
+            /* A-only callers (gone in B) */
+            if (hfa) {
+                for (int ac = 0; ac < hfa->n_callers; ac++) {
+                    char acclean[256];
+                    snprintf(acclean, sizeof(acclean), "%s",
+                             hfa->callers[ac].name);
+                    strip_compiler_suffix(acclean);
+                    int in_b = 0;
+                    for (int c = 0; c < hfb->n_callers; c++) {
+                        char bcclean[256];
+                        snprintf(bcclean, sizeof(bcclean), "%s",
+                                 hfb->callers[c].name);
+                        strip_compiler_suffix(bcclean);
+                        if (strcmp(acclean, bcclean) == 0) { in_b = 1; break; }
+                    }
+                    if (!in_b) {
+                        if (!first) printf(", ");
+                        first = 0;
+                        printf("%s (%.0f%% [GONE])",
+                               hfa->callers[ac].name, hfa->callers[ac].pct);
+                    }
+                }
+            }
+            printf("\n");
+        }
+    }
+
+    /* Print A-only functions (GONE in B) */
+    for (int a = 0; a < prof_a->n_funcs; a++) {
+        char aclean[256];
+        snprintf(aclean, sizeof(aclean), "%s", prof_a->funcs[a].name);
+        strip_compiler_suffix(aclean);
+
+        int found_b = 0;
+        for (int b = 0; b < prof_b->n_funcs; b++) {
+            char bclean[256];
+            snprintf(bclean, sizeof(bclean), "%s", prof_b->funcs[b].name);
+            strip_compiler_suffix(bclean);
+            if (strcmp(aclean, bclean) == 0) { found_b = 1; break; }
+        }
+        if (!found_b) {
+            printf("%5.1f   0.0  %+5.1f   %s  [GONE]\n",
+                   prof_a->funcs[a].overhead_pct,
+                   -prof_a->funcs[a].overhead_pct,
+                   prof_a->funcs[a].name);
+        }
+    }
+    printf("\n");
+
+    /* Per-function cache miss hotspots — top 3 per matched function */
+    if (prof_a->n_cm_sites > 0 && prof_b->n_cm_sites > 0) {
+        printf("--- cache miss hotspots A -> B ---\n");
+        for (int b = 0; b < prof_b->n_funcs; b++) {
+            char bclean[256];
+            snprintf(bclean, sizeof(bclean), "%s", prof_b->funcs[b].name);
+            strip_compiler_suffix(bclean);
+
+            int found_a = 0;
+            for (int a = 0; a < prof_a->n_funcs; a++) {
+                char aclean[256];
+                snprintf(aclean, sizeof(aclean), "%s",
+                         prof_a->funcs[a].name);
+                strip_compiler_suffix(aclean);
+                if (strcmp(aclean, bclean) == 0) { found_a = 1; break; }
+            }
+            if (!found_a) continue;
+
+            printf("[%s]\n", prof_b->funcs[b].name);
+            int count = 0;
+            for (int i = 0; i < prof_a->n_cm_sites && count < 3; i++) {
+                char cmn[256];
+                snprintf(cmn, sizeof(cmn), "%s",
+                         prof_a->cm_sites[i].func_name);
+                strip_compiler_suffix(cmn);
+                if (strcmp(cmn, bclean) == 0) {
+                    printf("  A: %5.1f%%  %s\n",
+                           prof_a->cm_sites[i].pct,
+                           prof_a->cm_sites[i].asm_text);
+                    count++;
+                }
+            }
+            count = 0;
+            for (int i = 0; i < prof_b->n_cm_sites && count < 3; i++) {
+                char cmn[256];
+                snprintf(cmn, sizeof(cmn), "%s",
+                         prof_b->cm_sites[i].func_name);
+                strip_compiler_suffix(cmn);
+                if (strcmp(cmn, bclean) == 0) {
+                    printf("  B: %5.1f%%  %s\n",
+                           prof_b->cm_sites[i].pct,
+                           prof_b->cm_sites[i].asm_text);
+                    count++;
+                }
+            }
+        }
+        printf("\n");
+    }
+
+    /* Hot instruction summary — top 3 per matched function */
+    if (prof_a->n_insns > 0 && prof_b->n_insns > 0) {
+        printf("--- hot instructions A -> B ---\n");
+        for (int b = 0; b < prof_b->n_funcs; b++) {
+            char bclean[256];
+            snprintf(bclean, sizeof(bclean), "%s", prof_b->funcs[b].name);
+            strip_compiler_suffix(bclean);
+
+            int found_a = 0;
+            for (int a = 0; a < prof_a->n_funcs; a++) {
+                char aclean[256];
+                snprintf(aclean, sizeof(aclean), "%s",
+                         prof_a->funcs[a].name);
+                strip_compiler_suffix(aclean);
+                if (strcmp(aclean, bclean) == 0) { found_a = 1; break; }
+            }
+            if (!found_a) continue;
+
+            printf("[%s]\n", prof_b->funcs[b].name);
+            int count = 0;
+            for (int i = 0; i < prof_a->n_insns && count < 3; i++) {
+                char iclean[256];
+                snprintf(iclean, sizeof(iclean), "%s",
+                         prof_a->insns[i].func_name);
+                strip_compiler_suffix(iclean);
+                if (strcmp(iclean, bclean) == 0) {
+                    printf("  A: %5.1f%%  %s\n",
+                           prof_a->insns[i].pct,
+                           prof_a->insns[i].asm_text);
+                    count++;
+                }
+            }
+            count = 0;
+            for (int i = 0; i < prof_b->n_insns && count < 3; i++) {
+                char iclean[256];
+                snprintf(iclean, sizeof(iclean), "%s",
+                         prof_b->insns[i].func_name);
+                strip_compiler_suffix(iclean);
+                if (strcmp(iclean, bclean) == 0) {
+                    printf("  B: %5.1f%%  %s\n",
+                           prof_b->insns[i].pct,
+                           prof_b->insns[i].asm_text);
+                    count++;
+                }
+            }
+        }
+        printf("\n");
+    }
+
+    /* MCA throughput delta */
+    if (prof_a->n_mca_blocks > 0 || prof_b->n_mca_blocks > 0) {
+        printf("--- throughput A -> B (llvm-mca) ---\n");
+        printf("function,A_rthru,B_rthru,delta,A_IPC,B_IPC\n");
+        for (int b = 0; b < prof_b->n_mca_blocks; b++) {
+            char bclean[256];
+            snprintf(bclean, sizeof(bclean), "%s",
+                     prof_b->mca_blocks[b].func_name);
+            strip_compiler_suffix(bclean);
+
+            double a_rt = 0, a_ipc = 0;
+            for (int a = 0; a < prof_a->n_mca_blocks; a++) {
+                char aclean[256];
+                snprintf(aclean, sizeof(aclean), "%s",
+                         prof_a->mca_blocks[a].func_name);
+                strip_compiler_suffix(aclean);
+                if (strcmp(aclean, bclean) == 0) {
+                    a_rt = prof_a->mca_blocks[a].block_rthroughput;
+                    a_ipc = prof_a->mca_blocks[a].ipc;
+                    break;
+                }
+            }
+            printf("%s,%.2f,%.2f,%+.2f,%.2f,%.2f\n",
+                   prof_b->mca_blocks[b].func_name,
+                   a_rt, prof_b->mca_blocks[b].block_rthroughput,
+                   prof_b->mca_blocks[b].block_rthroughput - a_rt,
+                   a_ipc, prof_b->mca_blocks[b].ipc);
+        }
+        printf("\n");
+    }
+
+    /* Topdown delta */
+    if (prof_a->has_topdown && prof_b->has_topdown) {
+        struct topdown_metrics *ta = &prof_a->topdown;
+        struct topdown_metrics *tb = &prof_b->topdown;
+        printf("--- topdown A -> B ---\n");
+        printf("category,A,B,delta\n");
+        printf("retiring,%.1f%%,%.1f%%,%+.1fpp\n",
+               ta->retiring, tb->retiring, tb->retiring - ta->retiring);
+        if (ta->bad_spec > 0.05 || tb->bad_spec > 0.05)
+            printf("bad_spec,%.1f%%,%.1f%%,%+.1fpp\n",
+                   ta->bad_spec, tb->bad_spec, tb->bad_spec - ta->bad_spec);
+        printf("frontend,%.1f%%,%.1f%%,%+.1fpp\n",
+               ta->frontend, tb->frontend, tb->frontend - ta->frontend);
+        printf("backend,%.1f%%,%.1f%%,%+.1fpp\n",
+               ta->backend, tb->backend, tb->backend - ta->backend);
+        printf("\n");
+    }
+
+    /* Remarks diff */
+    if (prof_a->n_remarks > 0 || prof_b->n_remarks > 0) {
+        printf("--- remarks diff (A -> B) ---\n");
+        int *b_matched = calloc((size_t)prof_b->n_remarks, sizeof(int));
+        int any_diff = 0;
+        const char *cur_func = NULL;
+
+        /* A-only remarks (lost or changed in B) */
+        for (int i = 0; i < prof_a->n_remarks; i++) {
+            struct remark_entry *ra = &prof_a->remarks[i];
+            int found = 0;
+            for (int j = 0; j < prof_b->n_remarks; j++) {
+                struct remark_entry *rb = &prof_b->remarks[j];
+                if (strcmp(ra->category, rb->category) == 0 &&
+                    strcmp(ra->message, rb->message) == 0 &&
+                    strcmp(ra->func_name, rb->func_name) == 0) {
+                    b_matched[j] = 1;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                if (!cur_func || strcmp(cur_func, ra->func_name) != 0) {
+                    cur_func = ra->func_name;
+                    printf("[%s]\n", cur_func);
+                }
+                printf("  A only: :%u  %s: %s\n",
+                       ra->line, ra->category, ra->message);
+                any_diff = 1;
+            }
+        }
+        /* B-only remarks (new in B) */
+        cur_func = NULL;
+        for (int j = 0; j < prof_b->n_remarks; j++) {
+            if (b_matched[j]) continue;
+            struct remark_entry *rb = &prof_b->remarks[j];
+            if (!cur_func || strcmp(cur_func, rb->func_name) != 0) {
+                cur_func = rb->func_name;
+                printf("[%s]\n", cur_func);
+            }
+            printf("  B only: :%u  %s: %s\n",
+                   rb->line, rb->category, rb->message);
+            any_diff = 1;
+        }
+        free(b_matched);
+        if (!any_diff)
+            printf("  (no differences)\n");
+        printf("\n");
+    }
+}
+
 /* ── Cleanup ─────────────────────────────────────────────────────────── */
 
 static void free_profile(struct perf_profile *prof) {
@@ -1549,6 +2554,9 @@ static void free_profile(struct perf_profile *prof) {
         for (int k = 0; k < prof->funcs[i].n_callees; k++)
             free(prof->funcs[i].callees[k]);
         free(prof->funcs[i].callees);
+        for (int k = 0; k < prof->funcs[i].n_callers; k++)
+            free(prof->funcs[i].callers[k].name);
+        free(prof->funcs[i].callers);
     }
     free(prof->funcs);
 
@@ -1579,6 +2587,14 @@ static void free_profile(struct perf_profile *prof) {
         free(prof->layouts[i].func_name);
     }
     free(prof->layouts);
+
+    for (int i = 0; i < prof->n_remarks; i++) {
+        free(prof->remarks[i].func_name);
+        free(prof->remarks[i].source_file);
+        free(prof->remarks[i].category);
+        free(prof->remarks[i].message);
+    }
+    free(prof->remarks);
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────── */
@@ -1615,6 +2631,9 @@ int perf_main(int argc, char *argv[]) {
         case PERF_OPT_NO_CACHEMISS:opts.cachemiss_mode = -1; break;
         case PERF_OPT_PAHOLE:      opts.pahole_mode   =  1; break;
         case PERF_OPT_NO_PAHOLE:   opts.pahole_mode   = -1; break;
+        case PERF_OPT_VS:          opts.vs_binary     = optarg; break;
+        case PERF_OPT_REMARKS:     opts.remarks_mode  =  1; break;
+        case PERF_OPT_NO_REMARKS:  opts.remarks_mode  = -1; break;
         case 's': opts.source_dir = optarg;     break;
         case 'v': opts.verbose    = 1;          break;
         case 'h': perf_usage(argv[0]); return 0;
@@ -1654,6 +2673,88 @@ int perf_main(int argc, char *argv[]) {
         goto fail;
     }
 
+    if (opts.vs_binary) {
+        /* ── A/B comparison mode ─────────────────────────────── */
+        char top_tmpdir[PATH_MAX];
+        strcpy(top_tmpdir, g_tmpdir);
+
+        /* --- Run A (baseline) --- */
+        char *a_binary = resolve_binary(opts.vs_binary);
+        if (access(a_binary, X_OK) != 0) {
+            fprintf(stderr, "error: baseline binary not executable: %s\n",
+                    a_binary);
+            free(a_binary);
+            goto fail;
+        }
+
+        /* Build A command: a_binary + B's trailing args */
+        char **a_argv = malloc((size_t)opts.cmd_argc * sizeof(char *));
+        a_argv[0] = a_binary;
+        for (int i = 1; i < opts.cmd_argc; i++)
+            a_argv[i] = opts.cmd_argv[i];
+        char *a_cmd_str = join_argv(a_argv, opts.cmd_argc);
+
+        /* Save B's state */
+        char *b_cmd_str = opts.cmd_str;
+        char *b_binary = opts.binary_path;
+
+        /* Run A pipeline */
+        char a_dir[PATH_MAX];
+        snprintf(a_dir, sizeof(a_dir), "%s/a", top_tmpdir);
+        mkdir(a_dir, 0700);
+        strcpy(g_tmpdir, a_dir);
+
+        opts.cmd_str = a_cmd_str;
+        opts.binary_path = a_binary;
+        int saved_no_build = opts.no_build;
+        opts.no_build = 1;  /* A is pre-built */
+
+        int has_debug_a = check_debug_symbols(a_binary);
+        struct perf_profile prof_a;
+        memset(&prof_a, 0, sizeof(prof_a));
+
+        fprintf(stderr, "=== A (baseline): %s ===\n", a_cmd_str);
+        int a_ok = run_pipeline(&opts, &prof_a, has_debug_a);
+
+        /* Run B pipeline */
+        char b_dir[PATH_MAX];
+        snprintf(b_dir, sizeof(b_dir), "%s/b", top_tmpdir);
+        mkdir(b_dir, 0700);
+        strcpy(g_tmpdir, b_dir);
+
+        opts.cmd_str = b_cmd_str;
+        opts.binary_path = b_binary;
+        opts.no_build = saved_no_build;
+
+        int has_debug_b = check_debug_symbols(b_binary);
+        struct perf_profile prof_b;
+        memset(&prof_b, 0, sizeof(prof_b));
+
+        fprintf(stderr, "=== B (new): %s ===\n", b_cmd_str);
+        int b_ok = run_pipeline(&opts, &prof_b, has_debug_b);
+
+        /* Restore g_tmpdir for cleanup */
+        strcpy(g_tmpdir, top_tmpdir);
+
+        if (a_ok == 0 && b_ok == 0)
+            print_comparison(&opts, &prof_a, a_cmd_str,
+                             &prof_b, b_cmd_str);
+        else
+            fprintf(stderr, "error: pipeline failed "
+                    "(A=%s, B=%s)\n",
+                    a_ok ? "FAIL" : "ok", b_ok ? "FAIL" : "ok");
+
+        free_profile(&prof_a);
+        free_profile(&prof_b);
+        free(a_cmd_str);
+        free(a_argv);
+        free(a_binary);
+        free(opts.cmd_str);
+        free(opts.binary_path);
+        return (a_ok == 0 && b_ok == 0) ? 0 : 1;
+    }
+
+    /* ── Normal single-profile path ──────────────────────── */
     int has_debug = check_debug_symbols(opts.binary_path);
     if (!has_debug)
         fprintf(stderr,
@@ -1661,38 +2762,12 @@ int perf_main(int argc, char *argv[]) {
             "(build with -g for source annotations)\n",
             opts.binary_path);
 
-    /* Phase 2: Profile */
     struct perf_profile prof;
     memset(&prof, 0, sizeof(prof));
 
-    fprintf(stderr, "profiling: %s\n", opts.cmd_str);
-
-    if (run_perf_stat(&opts, &prof.stats) != 0)
-        fprintf(stderr,
-            "warning: perf stat failed, continuing\n");
-
-    run_topdown(&opts, &prof);
-
-    if (run_perf_record(&opts) != 0) {
-        fprintf(stderr, "error: perf record failed\n");
+    if (run_pipeline(&opts, &prof, has_debug) != 0)
         goto fail;
-    }
 
-    parse_perf_report(&opts, &prof);
-    run_perf_annotate(&opts, &prof);
-
-    run_cache_misses(&opts, &prof);
-
-    run_mca(&opts, &prof);
-
-    run_uprof(&opts, &prof);
-
-    /* Phase 3: Skeleton cross-reference */
-    xref_skeleton(&opts, &prof);
-
-    run_pahole(&opts, &prof, has_debug);
-
-    /* Phase 4: Output */
     print_report(&opts, &prof);
 
     free_profile(&prof);

@@ -64,6 +64,11 @@ struct perf_stats {
     double ipc, cache_miss_pct, branch_miss_pct;
 };
 
+struct caller_entry {
+    char *name;
+    double pct;
+};
+
 struct hot_func {
     char *name;
     double overhead_pct;
@@ -73,6 +78,8 @@ struct hot_func {
     uint32_t start_line, end_line;
     char **callees;
     int n_callees;
+    struct caller_entry *callers;
+    int n_callers;
 };
 
 struct hot_insn {
@@ -120,6 +127,14 @@ struct struct_layout {
     char *func_name;          /* hot function that uses this type */
 };
 
+struct remark_entry {
+    char *func_name;
+    char *source_file;
+    uint32_t line;
+    char *category;    /* "optimized" or "missed" */
+    char *message;
+};
+
 struct perf_profile {
     struct perf_stats stats;
     struct hot_func *funcs;
@@ -133,6 +148,7 @@ struct perf_profile {
     struct mca_block *mca_blocks;    int n_mca_blocks;
     struct cache_miss_site *cm_sites; int n_cm_sites;
     struct struct_layout *layouts;    int n_layouts;
+    struct remark_entry *remarks;    int n_remarks;
 };
 
 /* ── Entry point ───────────────────────────────────────────────────── */
