@@ -163,7 +163,7 @@ char *read_file_source(const char *path, long *out_length) {
 }
 
 int should_skip_fts_entry(FTSENT *ent) {
-    if (ent->fts_name[0] == '.') return 1;
+    if (ent->fts_name[0] == '.' && ent->fts_level > FTS_ROOTLEVEL) return 1;
     if (ent->fts_info == FTS_D && ent->fts_level > FTS_ROOTLEVEL &&
        (strcmp(ent->fts_name, "build") == 0 ||
         strcmp(ent->fts_name, "vendor") == 0 ||

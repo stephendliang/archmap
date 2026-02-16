@@ -771,7 +771,7 @@ static int run_cache_misses(struct perf_opts *opts,
             char asm_buf[512];
             int n = sscanf(line, " %lf : %" SCNx64 ": %511[^\n]",
                            &pct, &addr, asm_buf);
-            if (n == 3 && pct >= 0.5) {
+            if (n == 3 && pct >= 0.05) {
                 if (prof->n_cm_sites >= cap) {
                     cap *= 2;
                     prof->cm_sites = realloc(prof->cm_sites,
@@ -870,8 +870,54 @@ static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
                 /* Skip empty lines, labels, directives */
                 if (*insn && *insn != '<' && *insn != '.' &&
                     *insn != '#' && *insn != ';') {
-                    fprintf(fp, "%s\n", insn);
-                    n_insns++;
+                    /* Strip objdump annotations for llvm-mca:
+                       <symbol+offset>, # addr <symbol>,
+                       and bare hex jump targets */
+                    char cleaned[512];
+                    int ci = 0;
+                    for (const char *s = insn;
+                         *s && ci < (int)sizeof(cleaned) - 1; ) {
+                        if (*s == '<') {
+                            while (*s && *s != '>') s++;
+                            if (*s == '>') s++;
+                        } else if (*s == '#') {
+                            break;
+                        } else {
+                            cleaned[ci++] = *s++;
+                        }
+                    }
+                    /* trim trailing spaces */
+                    while (ci > 0 && cleaned[ci-1] == ' ') ci--;
+                    cleaned[ci] = '\0';
+                    /* Replace bare hex jump targets with labels:
+                       "jg     505a" → "jg .Ltmp" */
+                    if (ci > 0 && (cleaned[0] == 'j' ||
+                        (ci > 4 && strncmp(cleaned, "call", 4) == 0))) {
+                        char *sp = cleaned;
+                        while (*sp && *sp != ' ' && *sp != '\t') sp++;
+                        while (*sp == ' ' || *sp == '\t') sp++;
+                        /* Check if operand is a bare hex number */
+                        if (*sp && *sp != '*' && *sp != '%' &&
+                            *sp != '(' && *sp != '.') {
+                            int all_hex = 1;
+                            for (char *h = sp; *h; h++) {
+                                if (!((*h >= '0' && *h <= '9') ||
+                                      (*h >= 'a' && *h <= 'f') ||
+                                      (*h >= 'A' && *h <= 'F'))) {
+                                    all_hex = 0;
+                                    break;
+                                }
+                            }
+                            if (all_hex && sp > cleaned) {
+                                strcpy(sp, ".Ltmp");
+                                ci = (int)(sp - cleaned) + 5;
+                            }
+                        }
+                    }
+                    if (ci > 0) {
+                        fprintf(fp, "%s\n", cleaned);
+                        n_insns++;
+                    }
                 }
             }
 
@@ -970,31 +1016,78 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
     prof->layouts = malloc((size_t)cap * sizeof(*prof->layouts));
     prof->n_layouts = 0;
 
-    /* For each hot function, look for struct pointer types in signature */
+    /* Skip known primitive types when probing pahole */
+    static const char *skip_types[] = {
+        "void", "char", "int", "long", "short", "float", "double",
+        "unsigned", "signed", "const", "restrict", "volatile",
+        "size_t", "ssize_t", "ptrdiff_t", "intptr_t", "uintptr_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "FILE", "bool", "_Bool", NULL,
+    };
+
+    /* For each hot function, extract pointer parameter types */
     for (int f = 0; f < prof->n_funcs; f++) {
         const char *sig = prof->funcs[f].skeleton_sig;
         if (!sig) continue;
 
-        /* Find "struct <name> *" patterns in the signature */
+        /* Find all "TYPE *" patterns (handles both struct X * and
+           typedef'd names like hpack_ctx *) */
         const char *p = sig;
-        while ((p = strstr(p, "struct ")) != NULL) {
-            p += 7; /* skip "struct " */
-            /* Extract type name */
+        while (*p) {
+            /* Skip to an identifier character */
+            while (*p && !(*p >= 'a' && *p <= 'z') &&
+                   !(*p >= 'A' && *p <= 'Z') && *p != '_')
+                p++;
+            if (!*p) break;
+
+            /* Extract identifier */
             char type_name[256];
             int ti = 0;
-            while (*p && *p != ' ' && *p != '*' && *p != ')' &&
-                   *p != ',' && *p != ';' &&
-                   (size_t)ti < sizeof(type_name) - 1)
+            const char *start = p;
+            while (*p && ((*p >= 'a' && *p <= 'z') ||
+                          (*p >= 'A' && *p <= 'Z') ||
+                          (*p >= '0' && *p <= '9') || *p == '_') &&
+                   ti < (int)sizeof(type_name) - 1)
                 type_name[ti++] = *p++;
             type_name[ti] = '\0';
 
-            if (ti == 0) continue;
+            /* Check if followed by " *" (pointer parameter) */
+            const char *q = p;
+            while (*q == ' ') q++;
+            if (*q != '*') { (void)start; continue; }
+
+            /* Skip known primitive types */
+            int skip = 0;
+            for (int s = 0; skip_types[s]; s++) {
+                if (strcmp(type_name, skip_types[s]) == 0) {
+                    skip = 1;
+                    break;
+                }
+            }
+            if (skip) continue;
+
+            /* For "struct X", extract just X */
+            const char *probe_name = type_name;
+            if (strcmp(type_name, "struct") == 0) {
+                while (*p == ' ') p++;
+                ti = 0;
+                while (*p && ((*p >= 'a' && *p <= 'z') ||
+                              (*p >= 'A' && *p <= 'Z') ||
+                              (*p >= '0' && *p <= '9') || *p == '_') &&
+                       ti < (int)sizeof(type_name) - 1)
+                    type_name[ti++] = *p++;
+                type_name[ti] = '\0';
+                probe_name = type_name;
+            }
+
+            if (!*probe_name) continue;
 
             /* Check for duplicates */
             int dup = 0;
             for (int i = 0; i < prof->n_layouts; i++) {
                 if (strcmp(prof->layouts[i].type_name,
-                           type_name) == 0) {
+                           probe_name) == 0) {
                     dup = 1;
                     break;
                 }
@@ -1005,7 +1098,7 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
                 "pahole -C '%s' '%s' 2>/dev/null",
-                type_name, opts->binary_path);
+                probe_name, opts->binary_path);
 
             int status;
             char *out = run_cmd(cmd, &status, opts->verbose);
@@ -1052,7 +1145,7 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
             }
             struct struct_layout *sl =
                 &prof->layouts[prof->n_layouts++];
-            sl->type_name = strdup(type_name);
+            sl->type_name = strdup(probe_name);
             sl->size = size;
             sl->holes = holes;
             sl->padding = padding;
@@ -1509,10 +1602,10 @@ int perf_main(int argc, char *argv[]) {
         goto fail;
     }
 
-    run_cache_misses(&opts, &prof);
-
     parse_perf_report(&opts, &prof);
     run_perf_annotate(&opts, &prof);
+
+    run_cache_misses(&opts, &prof);
 
     run_mca(&opts, &prof);
 
