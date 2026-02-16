@@ -8,6 +8,7 @@
 #include <string.h>
 #include <fts.h>
 #include <getopt.h>
+#include <fnmatch.h>
 #include <libgen.h>
 #include <limits.h>
 #include <tree_sitter/api.h>
@@ -15,6 +16,7 @@
 extern const TSLanguage *tree_sitter_c(void);
 
 #include "hmap_avx512.h"
+#include "perf_analysis.h"
 
 /* Capture index names — must match order in QUERY_SOURCE */
 enum {
@@ -76,35 +78,12 @@ const char *QUERY_SOURCE =
     "(preproc_function_def) @preproc_func "
     "(preproc_include) @include ";
 
-struct symbol {
-    char *text;
-    char **callees;
-    int n_callees;
-    int cap_callees;
-    int is_fwd_decl;
-    char *tag_name;
-    uint32_t cap_idx;
-    uint32_t start_line;
-    uint32_t end_line;
-    int section;
-};
-
-struct file_entry {
-    char *abs_path;
-    char *rel_path;
-    struct symbol *syms;
-    int n_syms;
-    int cap_syms;
-    char **includes;
-    int n_includes;
-};
-
-static struct file_entry *g_files;
-static int g_n_files, g_cap_files;
+struct file_entry *g_files;
+int g_n_files, g_cap_files;
 static saha g_tags;
 
 static int opt_follow_deps;
-static int opt_show_calls;
+int opt_show_calls;
 static char *opt_inc_paths[64];
 static int opt_n_inc_paths;
 static char *opt_defines[64];
@@ -113,12 +92,30 @@ static char *opt_strip_macros[64];
 static int opt_n_strip_macros;
 static size_t opt_strip_macro_lens[64];
 
+struct sidecar_entry {
+    char *glob;
+    char *summary;
+    int collapse;
+};
+
+static struct sidecar_entry *g_sidecar;
+static int g_n_sidecar, g_cap_sidecar;
+
+static char *opt_expand_globs[64];
+static int opt_n_expand;
+static char *opt_collapse_globs[64];
+static int opt_n_collapse;
+
+enum { OPT_EXPAND = 256, OPT_COLLAPSE };
+
 static struct option long_options[] = {
     {"deps",         no_argument,       NULL, 'd'},
     {"define",       required_argument, NULL, 'D'},
     {"include-dir",  required_argument, NULL, 'I'},
     {"calls",        no_argument,       NULL, 'c'},
     {"strip",        required_argument, NULL, 'S'},
+    {"expand",       required_argument, NULL, OPT_EXPAND},
+    {"collapse",     required_argument, NULL, OPT_COLLAPSE},
     {"help",         no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0}
 };
@@ -135,11 +132,13 @@ static void print_usage(const char *prog) {
         "  -I, --include-dir DIR   Add include search path\n"
         "  -c, --calls             Show call graph edges under functions\n"
         "  -S, --strip MACRO       Strip project-specific qualifier macro from output\n"
+        "  --expand GLOB           Force-expand collapsed files\n"
+        "  --collapse GLOB         Collapse files (hide skeleton, show summary only)\n"
         "  -h, --help              Print this help and exit\n",
         name);
 }
 
-static char *read_file_source(const char *path, long *out_length) {
+char *read_file_source(const char *path, long *out_length) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -156,7 +155,7 @@ static char *read_file_source(const char *path, long *out_length) {
     return source;
 }
 
-static int should_skip_fts_entry(FTSENT *ent) {
+int should_skip_fts_entry(FTSENT *ent) {
     if (ent->fts_name[0] == '.') return 1;
     if (ent->fts_info == FTS_D && ent->fts_level > FTS_ROOTLEVEL &&
        (strcmp(ent->fts_name, "build") == 0 ||
@@ -167,7 +166,7 @@ static int should_skip_fts_entry(FTSENT *ent) {
     return 0;
 }
 
-static int is_source_file(const char *filename) {
+int is_source_file(const char *filename) {
     const char *dot = strrchr(filename, '.');
     if (!dot) return 0;
     return (strcmp(dot, ".c") == 0 || strcmp(dot, ".h") == 0 ||
@@ -175,7 +174,7 @@ static int is_source_file(const char *filename) {
             strcmp(dot, ".cc") == 0);
 }
 
-static struct file_entry *add_file(const char *abs_path) {
+struct file_entry *add_file(const char *abs_path) {
     if (g_n_files >= g_cap_files) {
         g_cap_files = g_cap_files ? g_cap_files * 2 : 32;
         g_files = realloc(g_files, (size_t)g_cap_files * sizeof(*g_files));
@@ -186,7 +185,7 @@ static struct file_entry *add_file(const char *abs_path) {
     return fe;
 }
 
-static struct symbol *add_symbol(struct file_entry *fe) {
+struct symbol *add_symbol(struct file_entry *fe) {
     if (fe->n_syms >= fe->cap_syms) {
         fe->cap_syms = fe->cap_syms ? fe->cap_syms * 2 : 16;
         fe->syms = realloc(fe->syms, (size_t)fe->cap_syms * sizeof(*fe->syms));
@@ -518,7 +517,7 @@ static void fprint_compact_enum(FILE *out, TSNode full_node,
     fprintf(out, " }%.*s\n", (int)(node_end - body_end), source + body_end);
 }
 
-static char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
+char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx) {
     char *buf = NULL;
     size_t buf_len = 0;
     FILE *mem = open_memstream(&buf, &buf_len);
@@ -896,8 +895,8 @@ static int is_bare_forward_decl(TSNode node, const char *source,
     return 0;
 }
 
-static void collect_callees(TSNode node, const char *source,
-                            struct symbol *sym) {
+void collect_callees(TSNode node, const char *source,
+                     struct symbol *sym) {
     uint32_t count = ts_node_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(node, i);
@@ -920,9 +919,9 @@ static void collect_callees(TSNode node, const char *source,
     }
 }
 
-static void collect_file(const char *path, TSParser *parser, TSQuery *query,
-                         char **defines, int n_defines,
-                         char **search_paths, int n_search) {
+void collect_file(const char *path, TSParser *parser, TSQuery *query,
+                  char **defines, int n_defines,
+                  char **search_paths, int n_search) {
     long length;
     char *source = read_file_source(path, &length);
     if (!source) return;
@@ -1151,6 +1150,108 @@ static void topo_sort_files(void) {
     free(in_degree);
 }
 
+static void add_sidecar_entry(const char *glob, const char *summary, int collapse) {
+    if (g_n_sidecar >= g_cap_sidecar) {
+        g_cap_sidecar = g_cap_sidecar ? g_cap_sidecar * 2 : 16;
+        g_sidecar = realloc(g_sidecar, (size_t)g_cap_sidecar * sizeof(*g_sidecar));
+    }
+    struct sidecar_entry *e = &g_sidecar[g_n_sidecar++];
+    e->glob = strdup(glob);
+    e->summary = summary ? strdup(summary) : NULL;
+    e->collapse = collapse;
+}
+
+static void load_sidecar(const char *start_dir) {
+    char dir[PATH_MAX];
+    char path[PATH_MAX];
+
+    strncpy(dir, start_dir, PATH_MAX - 1);
+    dir[PATH_MAX - 1] = '\0';
+
+    /* Remove trailing slash */
+    size_t len = strlen(dir);
+    while (len > 1 && dir[len - 1] == '/') dir[--len] = '\0';
+
+    FILE *f = NULL;
+    for (;;) {
+        snprintf(path, sizeof(path), "%s/.archmap", dir);
+        f = fopen(path, "r");
+        if (f) break;
+        char *slash = strrchr(dir, '/');
+        if (!slash || slash == dir) break;
+        *slash = '\0';
+    }
+    if (!f) return;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        size_t ll = strlen(line);
+        if (ll > 0 && line[ll - 1] == '\n') line[--ll] = '\0';
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0') continue;
+
+        if (strncmp(p, "summary ", 8) == 0) {
+            p += 8;
+            while (*p == ' ' || *p == '\t') p++;
+            char *glob_end = p;
+            while (*glob_end && *glob_end != ' ' && *glob_end != '\t') glob_end++;
+            if (!*glob_end) continue;
+            *glob_end = '\0';
+            char *text = glob_end + 1;
+            while (*text == ' ' || *text == '\t') text++;
+            if (*text) add_sidecar_entry(p, text, 0);
+        } else if (strncmp(p, "collapse ", 9) == 0) {
+            p += 9;
+            while (*p == ' ' || *p == '\t') p++;
+            char *end = p + strlen(p);
+            while (end > p && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            *end = '\0';
+            if (*p) add_sidecar_entry(p, NULL, 1);
+        }
+    }
+    fclose(f);
+}
+
+static void write_file_list(const char *prefix_dir) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s.archmap.files", prefix_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (int i = 0; i < g_n_files; i++)
+        fprintf(f, "%s\n", g_files[i].rel_path);
+    fclose(f);
+}
+
+static const char *find_summary(const char *rel_path) {
+    const char *result = NULL;
+    for (int i = 0; i < g_n_sidecar; i++) {
+        if (g_sidecar[i].summary &&
+            fnmatch(g_sidecar[i].glob, rel_path, 0) == 0)
+            result = g_sidecar[i].summary;
+    }
+    return result;
+}
+
+static int is_collapsed(const char *rel_path) {
+    int collapsed = 0;
+    for (int i = 0; i < g_n_sidecar; i++) {
+        if (g_sidecar[i].collapse &&
+            fnmatch(g_sidecar[i].glob, rel_path, 0) == 0)
+            collapsed = 1;
+    }
+    for (int i = 0; i < opt_n_collapse; i++) {
+        if (fnmatch(opt_collapse_globs[i], rel_path, 0) == 0)
+            collapsed = 1;
+    }
+    for (int i = 0; i < opt_n_expand; i++) {
+        if (fnmatch(opt_expand_globs[i], rel_path, 0) == 0)
+            collapsed = 0;
+    }
+    return collapsed;
+}
+
 static int is_suppressed_fwd(struct symbol *s) {
     if (s->is_fwd_decl && s->tag_name) {
         if (saha_contains(&g_tags, s->tag_name, strlen(s->tag_name)))
@@ -1176,8 +1277,14 @@ static void print_tree(void) {
             g_files[i].rel_path = strdup(ap);
     }
 
+    write_file_list(prefix);
+    load_sidecar(prefix);
+
     for (int i = 0; i < g_n_files; i++) {
         struct file_entry *fe = &g_files[i];
+
+        const char *summary = find_summary(fe->rel_path);
+        int collapsed = is_collapsed(fe->rel_path);
 
         /* Check if file has any visible symbols */
         int has_visible = 0;
@@ -1187,9 +1294,14 @@ static void print_tree(void) {
                 break;
             }
         }
-        if (!has_visible) continue;
+        if (!has_visible && !summary && !collapsed) continue;
 
-        printf("--- %s\n", fe->rel_path);
+        if (summary)
+            printf("--- %s  @summary: %s\n", fe->rel_path, summary);
+        else
+            printf("--- %s\n", fe->rel_path);
+
+        if (collapsed || !has_visible) continue;
 
         for (int sec = 0; sec < SEC_COUNT; sec++) {
             /* Check if this section has any visible symbols */
@@ -1272,10 +1384,21 @@ static void cleanup(void) {
     }
     free(g_files);
 
+    for (int i = 0; i < g_n_sidecar; i++) {
+        free(g_sidecar[i].glob);
+        free(g_sidecar[i].summary);
+    }
+    free(g_sidecar);
+
     saha_destroy(&g_tags);
 }
 
 int main(int argc, char *argv[]) {
+    if (argc >= 2 && strcmp(argv[1], "perf") == 0) {
+        argv[1] = argv[0];
+        return perf_main(argc - 1, argv + 1);
+    }
+
     int opt;
     while ((opt = getopt_long(argc, argv, "dD:I:cS:h", long_options, NULL)) != -1) {
         switch (opt) {
@@ -1293,6 +1416,12 @@ int main(int argc, char *argv[]) {
                 opt_strip_macro_lens[opt_n_strip_macros] = strlen(optarg);
                 opt_n_strip_macros++;
             }
+            break;
+        case OPT_EXPAND:
+            if (opt_n_expand < 64) opt_expand_globs[opt_n_expand++] = optarg;
+            break;
+        case OPT_COLLAPSE:
+            if (opt_n_collapse < 64) opt_collapse_globs[opt_n_collapse++] = optarg;
             break;
         case 'h':
             print_usage(argv[0]);
