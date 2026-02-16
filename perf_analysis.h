@@ -87,6 +87,35 @@ struct uprof_func {
     uint64_t dc_misses, ic_misses;
 };
 
+struct topdown_metrics {
+    double retiring, bad_spec, frontend, backend;
+    int level;                /* 1 or 2 depending on kernel support */
+};
+
+struct mca_block {
+    char *func_name;
+    double block_rthroughput; /* cycles per iteration */
+    double ipc;
+    int n_uops;
+    char *bottleneck;         /* e.g. "RetireOOO", "Dispatch" */
+};
+
+struct cache_miss_site {
+    char *func_name;
+    uint32_t source_line;
+    double pct;               /* % of total cache-miss samples */
+    char *asm_text;
+};
+
+struct struct_layout {
+    char *type_name;
+    uint32_t size;
+    uint32_t holes;
+    uint32_t padding;
+    uint32_t cachelines;
+    char *func_name;          /* hot function that uses this type */
+};
+
 struct perf_profile {
     struct perf_stats stats;
     struct hot_func *funcs;
@@ -95,6 +124,11 @@ struct perf_profile {
     int n_insns;
     struct uprof_func *uprof_funcs;
     int n_uprof_funcs;
+    struct topdown_metrics topdown;
+    int has_topdown;
+    struct mca_block *mca_blocks;    int n_mca_blocks;
+    struct cache_miss_site *cm_sites; int n_cm_sites;
+    struct struct_layout *layouts;    int n_layouts;
 };
 
 /* ── Entry point ───────────────────────────────────────────────────── */
