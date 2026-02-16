@@ -38,6 +38,8 @@ extern struct file_entry *g_files;
 extern int g_n_files, g_cap_files;
 extern const char *QUERY_SOURCE;
 extern int opt_show_calls;
+extern char **g_file_tags;
+extern int g_n_file_tags, g_cap_file_tags;
 
 /* ── Functions shared from main.c ──────────────────────────────────── */
 

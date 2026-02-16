@@ -19,6 +19,7 @@
 
 #include <tree_sitter/api.h>
 #include "perf_analysis.h"
+#include "git_cache.h"
 
 /* ── Options ─────────────────────────────────────────────────────────── */
 
@@ -1083,7 +1084,11 @@ static void xref_skeleton(struct perf_opts *opts,
         return;
     }
 
-    /* Walk source directory */
+    /* Walk source directory with cache */
+    char *xref_opts = cache_make_opts_str(1, NULL, 0, NULL, 0, NULL, 0);
+    archmap_cache *xref_cache = cache_open(opts->source_dir, xref_opts);
+    free(xref_opts);
+
     char *src_dup = strdup(opts->source_dir);
     char *paths[] = { src_dup, NULL };
     FTS *ftsp = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
@@ -1096,13 +1101,39 @@ static void xref_skeleton(struct perf_opts *opts,
             }
             if (ent->fts_info == FTS_F &&
                 is_source_file(ent->fts_name)) {
-                collect_file(ent->fts_path, parser, query,
-                             NULL, 0, NULL, 0);
+                int hit = 0;
+                if (xref_cache) {
+                    struct file_entry tmp;
+                    char **tags; int n_tags;
+                    if (cache_lookup(xref_cache, ent->fts_path,
+                                     &tmp, &tags, &n_tags) == 1) {
+                        struct file_entry *fe = add_file(ent->fts_path);
+                        free(fe->abs_path);
+                        *fe = tmp;
+                        for (int t = 0; t < n_tags; t++) free(tags[t]);
+                        free(tags);
+                        hit = 1;
+                    }
+                }
+                if (!hit) {
+                    g_n_file_tags = 0;
+                    collect_file(ent->fts_path, parser, query,
+                                 NULL, 0, NULL, 0);
+                    if (xref_cache && g_n_files > 0)
+                        cache_store(xref_cache, ent->fts_path,
+                                    &g_files[g_n_files - 1],
+                                    g_file_tags, g_n_file_tags);
+                    for (int t = 0; t < g_n_file_tags; t++)
+                        free(g_file_tags[t]);
+                    g_n_file_tags = 0;
+                }
             }
         }
         fts_close(ftsp);
     }
     free(src_dup);
+
+    if (xref_cache) cache_close(xref_cache);
 
     /* Match hot functions → collected symbols */
     for (int f = 0; f < prof->n_funcs; f++) {

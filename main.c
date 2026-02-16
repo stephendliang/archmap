@@ -17,6 +17,7 @@ extern const TSLanguage *tree_sitter_c(void);
 
 #include "hmap_avx512.h"
 #include "perf_analysis.h"
+#include "git_cache.h"
 
 /* Capture index names — must match order in QUERY_SOURCE */
 enum {
@@ -81,6 +82,12 @@ const char *QUERY_SOURCE =
 struct file_entry *g_files;
 int g_n_files, g_cap_files;
 static saha g_tags;
+
+/* Tag accumulator — collects per-file tag names for cache storage */
+char **g_file_tags;
+int g_n_file_tags, g_cap_file_tags;
+
+static archmap_cache *g_cache;
 
 static int opt_follow_deps;
 int opt_show_calls;
@@ -848,7 +855,13 @@ static void register_full_tags(TSNode node, const char *source) {
             char *tag = extract_tag_name_src(node, source);
             if (tag) {
                 saha_insert(&g_tags, tag, strlen(tag));
-                free(tag);
+                /* Record for cache */
+                if (g_n_file_tags >= g_cap_file_tags) {
+                    g_cap_file_tags = g_cap_file_tags ? g_cap_file_tags * 2 : 8;
+                    g_file_tags = realloc(g_file_tags,
+                                          (size_t)g_cap_file_tags * sizeof(char *));
+                }
+                g_file_tags[g_n_file_tags++] = tag;  /* take ownership */
             }
         }
         return;
@@ -1050,6 +1063,38 @@ void collect_file(const char *path, TSParser *parser, TSQuery *query,
     ts_query_cursor_delete(cursor);
     ts_tree_delete(tree);
     free(source);
+}
+
+static void collect_file_cached(const char *path, TSParser *parser,
+                                TSQuery *query, char **defines,
+                                int n_defines, char **search_paths,
+                                int n_search) {
+    if (g_cache) {
+        struct file_entry tmp;
+        char **tags; int n_tags;
+        if (cache_lookup(g_cache, path, &tmp, &tags, &n_tags) == 1) {
+            struct file_entry *fe = add_file(path);
+            free(fe->abs_path);
+            *fe = tmp;  /* transfer deep-copied data */
+            for (int i = 0; i < n_tags; i++) {
+                saha_insert(&g_tags, tags[i], strlen(tags[i]));
+                free(tags[i]);
+            }
+            free(tags);
+            return;  /* skip tree-sitter entirely */
+        }
+    }
+
+    g_n_file_tags = 0;  /* reset tag accumulator */
+    collect_file(path, parser, query, defines, n_defines,
+                 search_paths, n_search);
+
+    if (g_cache && g_n_files > 0) {
+        cache_store(g_cache, path, &g_files[g_n_files - 1],
+                    g_file_tags, g_n_file_tags);
+    }
+    for (int i = 0; i < g_n_file_tags; i++) free(g_file_tags[i]);
+    g_n_file_tags = 0;
 }
 
 static int visited_add(char ***visited, int *count, int *cap, const char *path) {
@@ -1438,6 +1483,12 @@ int main(int argc, char *argv[]) {
 
     saha_init(&g_tags);
 
+    char *opts_str = cache_make_opts_str(opt_show_calls,
+        opt_defines, opt_n_defines, opt_strip_macros, opt_n_strip_macros,
+        opt_inc_paths, opt_n_inc_paths);
+    g_cache = cache_open(".", opts_str);
+    free(opts_str);
+
     TSParser *parser = ts_parser_new();
     ts_parser_set_language(parser, tree_sitter_c());
 
@@ -1484,8 +1535,8 @@ int main(int argc, char *argv[]) {
         /* BFS: collect files and discover new includes */
         while (queue_head < vis_count) {
             const char *file = visited[queue_head++];
-            collect_file(file, parser, query, opt_defines, opt_n_defines,
-                         opt_inc_paths, opt_n_inc_paths);
+            collect_file_cached(file, parser, query, opt_defines, opt_n_defines,
+                                opt_inc_paths, opt_n_inc_paths);
 
             /* Read cached includes from the just-collected file_entry */
             struct file_entry *fe = &g_files[g_n_files - 1];
@@ -1513,14 +1564,16 @@ int main(int argc, char *argv[]) {
             }
 
             if (ent->fts_info == FTS_F && is_source_file(ent->fts_name)) {
-                collect_file(ent->fts_path, parser, query,
-                             opt_defines, opt_n_defines,
-                             opt_inc_paths, opt_n_inc_paths);
+                collect_file_cached(ent->fts_path, parser, query,
+                                    opt_defines, opt_n_defines,
+                                    opt_inc_paths, opt_n_inc_paths);
             }
         }
 
         fts_close(ftsp);
     }
+
+    if (g_cache) { cache_close(g_cache); g_cache = NULL; }
 
     print_tree();
     cleanup();
