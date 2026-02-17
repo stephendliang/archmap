@@ -12,14 +12,14 @@ extern const TSLanguage *tree_sitter_c(void);
 struct symbol {
     char *text;
     char **callees;
+    char *tag_name;
     int n_callees;
     int cap_callees;
-    int is_fwd_decl;
-    char *tag_name;
-    uint32_t cap_idx;
     uint32_t start_line;
     uint32_t end_line;
-    int section;
+    unsigned is_fwd_decl : 1;
+    unsigned section     : 3;  /* SEC_STRUCT..SEC_FUNCTIONS (0..4) */
+    unsigned cap_idx     : 3;  /* CAP_FUNC_DEF..CAP_INCLUDE (0..7) */
 };
 
 struct file_entry {
