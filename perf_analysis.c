@@ -2598,28 +2598,54 @@ static void compute_stats(struct run_stats *rs) {
     rs->stddev = sqrt(ss / (rs->n - 1));
 }
 
-/* Student's t CDF approximation (Abramowitz & Stegun 26.2.17 + beta) */
-static double t_cdf(double t_val, double df) {
-    /* Use the regularized incomplete beta function relationship:
-       I_x(a, b) where x = df/(df + t^2), a = df/2, b = 0.5 */
-    double x = df / (df + t_val * t_val);
-    double a = df / 2.0, b = 0.5;
-
-    /* Compute I_x(a, b) via continued fraction (Lentz's method) */
-    /* First compute Beta(a,b) via lgamma */
-    double lbeta = lgamma(a) + lgamma(b) - lgamma(a + b);
-
-    /* Compute I_x using the series expansion for small x*a/(a+b) */
-    double prefix = exp(a * log(x) + b * log(1.0 - x) - lbeta) / a;
-    double sum = 1.0, term = 1.0;
-    for (int n = 0; n < 200; n++) {
-        term *= x * (double)(n + 1 - b) / (double)(n + 1 + a);
-        sum += term;
-        if (fabs(term) < 1e-12 * fabs(sum)) break;
+/* Continued fraction for regularized incomplete beta (Numerical Recipes). */
+static double betacf(double a, double b, double x) {
+    double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+    double c = 1.0;
+    double d = 1.0 - qab * x / qap;
+    if (fabs(d) < 1e-30) d = 1e-30;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= 200; m++) {
+        int m2 = 2 * m;
+        /* Even step */
+        double aa = (double)m * (b - (double)m) * x /
+                    ((qam + (double)m2) * (a + (double)m2));
+        d = 1.0 + aa * d; if (fabs(d) < 1e-30) d = 1e-30;
+        c = 1.0 + aa / c; if (fabs(c) < 1e-30) c = 1e-30;
+        d = 1.0 / d;
+        h *= d * c;
+        /* Odd step */
+        aa = -((a + (double)m) * (qab + (double)m) * x) /
+              ((a + (double)m2) * (qap + (double)m2));
+        d = 1.0 + aa * d; if (fabs(d) < 1e-30) d = 1e-30;
+        c = 1.0 + aa / c; if (fabs(c) < 1e-30) c = 1e-30;
+        d = 1.0 / d;
+        double del = d * c;
+        h *= del;
+        if (fabs(del - 1.0) < 1e-14) break;
     }
-    double ix = prefix * sum;
+    return h;
+}
 
-    /* CDF = 1 - 0.5 * I_x(df/2, 0.5) for t > 0 */
+/* Regularized incomplete beta function I_x(a, b). */
+static double ibeta(double x, double a, double b) {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    double bt = exp(lgamma(a + b) - lgamma(a) - lgamma(b) +
+                    a * log(x) + b * log(1.0 - x));
+    if (x < (a + 1.0) / (a + b + 2.0))
+        return bt * betacf(a, b, x) / a;
+    else
+        return 1.0 - bt * betacf(b, a, 1.0 - x) / b;
+}
+
+/* Student's t CDF via regularized incomplete beta function.
+   CDF(t, df) = 1 - 0.5 * I_x(df/2, 0.5) where x = df/(df + t^2). */
+static double t_cdf(double t_val, double df) {
+    double x = df / (df + t_val * t_val);
+    double ix = ibeta(x, df / 2.0, 0.5);
+
     if (t_val >= 0)
         return 1.0 - 0.5 * ix;
     else
