@@ -282,16 +282,16 @@ struct perf_profile {
 struct perf_opts {
     int top_n;
     int insns_n;
-    int no_build;
-    int uprof_mode;       /* 1=force, -1=skip, 0=auto */
-    int topdown_mode;     /* 0=auto, 1=force, -1=skip */
-    int mca_mode;
-    int cachemiss_mode;
-    int pahole_mode;
-    int remarks_mode;     /* 0=auto, 1=force, -1=skip */
-    int verbose;
     int n_runs;           /* 0=auto (1 for single, 5 for A/B), >0=explicit */
     int cmd_argc;
+    unsigned no_build : 1;
+    unsigned verbose  : 1;
+    int uprof_mode  : 2;  /* 1=force, -1=skip, 0=auto */
+    int topdown_mode: 2;
+    int mca_mode    : 2;
+    int cachemiss_mode: 2;
+    int pahole_mode : 2;
+    int remarks_mode: 2;  /* 0=auto, 1=force, -1=skip */
     const char *build_cmd;
     const char *source_dir;
     char **cmd_argv;
