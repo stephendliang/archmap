@@ -44,6 +44,236 @@
 #define PERF_FLAG_FD_CLOEXEC (1UL << 3)
 #endif
 
+/* ── Arena bump allocator ────────────────────────────────────────────── */
+
+#define ARENA_DEFAULT_BLOCK (2u << 20)  /* 2 MiB */
+#define ARENA_ALIGN 16
+
+struct arena_block {
+    struct arena_block *next;
+    size_t size;
+    size_t used;
+};
+
+struct arena {
+    struct arena_block *head;
+    size_t default_block;
+};
+
+static void arena_init(struct arena *a, size_t block_size) {
+    a->head = NULL;
+    a->default_block = block_size;
+}
+
+static struct arena_block *arena_new_block(size_t min_size,
+                                            size_t default_size) {
+    size_t size = min_size > default_size ? min_size : default_size;
+    size = (size + (2u << 20) - 1) & ~((size_t)(2u << 20) - 1);
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (p == MAP_FAILED) {
+        p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED) madvise(p, size, MADV_HUGEPAGE);
+    }
+    if (p == MAP_FAILED) return NULL;
+    struct arena_block *b = (struct arena_block *)p;
+    b->next = NULL;
+    b->size = size;
+    b->used = (sizeof(struct arena_block) + ARENA_ALIGN - 1)
+              & ~((size_t)ARENA_ALIGN - 1);
+    return b;
+}
+
+static void *arena_alloc(struct arena *a, size_t n) {
+    n = (n + ARENA_ALIGN - 1) & ~((size_t)ARENA_ALIGN - 1);
+    struct arena_block *b = a->head;
+    if (b && b->used + n <= b->size) {
+        void *p = (char *)b + b->used;
+        b->used += n;
+        return p;
+    }
+    size_t hdr = (sizeof(struct arena_block) + ARENA_ALIGN - 1)
+                 & ~((size_t)ARENA_ALIGN - 1);
+    b = arena_new_block(n + hdr, a->default_block);
+    if (!b) { fprintf(stderr, "arena_alloc: mmap failed\n"); abort(); }
+    b->next = a->head;
+    a->head = b;
+    void *p = (char *)b + b->used;
+    b->used += n;
+    return p;
+}
+
+static char *arena_strdup(struct arena *a, const char *s) {
+    size_t len = strlen(s) + 1;
+    char *p = arena_alloc(a, len);
+    memcpy(p, s, len);
+    return p;
+}
+
+static void arena_destroy(struct arena *a) {
+    struct arena_block *b = a->head;
+    while (b) {
+        struct arena_block *next = b->next;
+        munmap(b, b->size);
+        b = next;
+    }
+    a->head = NULL;
+}
+
+/* ── String intern table ─────────────────────────────────────────────── */
+
+/* wyhash core (copied from hmap_avx512.c) */
+
+static inline uint64_t _pa_wymix(uint64_t a, uint64_t b) {
+    __uint128_t r = (__uint128_t)a * b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+
+static inline uint64_t _pa_wyr8(const void *p) {
+    uint64_t v; memcpy(&v, p, 8); return v;
+}
+
+static inline uint64_t _pa_wyr4(const void *p) {
+    uint32_t v; memcpy(&v, p, 4); return v;
+}
+
+static inline uint64_t _pa_wyr3(const void *p, size_t k) {
+    const uint8_t *b = (const uint8_t *)p;
+    return ((uint64_t)b[0] << 16) | ((uint64_t)b[k >> 1] << 8) | b[k - 1];
+}
+
+static uint64_t intern_hash(const void *key, size_t len) {
+    const uint64_t s0 = 0xa0761d6478bd642fULL;
+    const uint64_t s1 = 0xe7037ed1a0b428dbULL;
+    const uint64_t s2 = 0x8ebc6af09c88c6e3ULL;
+    const uint64_t s3 = 0x589965cc75374cc3ULL;
+    const uint8_t *p = (const uint8_t *)key;
+    uint64_t seed = s0, a, b;
+
+    if (__builtin_expect(len <= 16, 1)) {
+        if (__builtin_expect(len >= 4, 1)) {
+            a = (_pa_wyr4(p) << 32) | _pa_wyr4(p + ((len >> 3) << 2));
+            b = (_pa_wyr4(p + len - 4) << 32) |
+                _pa_wyr4(p + len - 4 - ((len >> 3) << 2));
+        } else if (__builtin_expect(len > 0, 1)) {
+            a = _pa_wyr3(p, len);
+            b = 0;
+        } else {
+            a = b = 0;
+        }
+    } else {
+        size_t i = len;
+        if (i > 48) {
+            uint64_t see1 = seed, see2 = seed;
+            do {
+                seed = _pa_wymix(_pa_wyr8(p)      ^ s1,
+                                 _pa_wyr8(p + 8)  ^ seed);
+                see1 = _pa_wymix(_pa_wyr8(p + 16) ^ s2,
+                                 _pa_wyr8(p + 24) ^ see1);
+                see2 = _pa_wymix(_pa_wyr8(p + 32) ^ s3,
+                                 _pa_wyr8(p + 40) ^ see2);
+                p += 48; i -= 48;
+            } while (i > 48);
+            seed ^= see1 ^ see2;
+        }
+        while (i > 16) {
+            seed = _pa_wymix(_pa_wyr8(p) ^ s1, _pa_wyr8(p + 8) ^ seed);
+            i -= 16; p += 16;
+        }
+        a = _pa_wyr8(p + i - 16);
+        b = _pa_wyr8(p + i - 8);
+    }
+    return _pa_wymix(s1 ^ len, _pa_wymix(a ^ s1, b ^ seed));
+}
+
+struct intern_slot {
+    uint64_t hash;
+    const char *str;
+};
+
+struct intern_table {
+    struct intern_slot *slots;
+    uint32_t cap, count;
+    struct arena arena;
+};
+
+static void intern_init(struct intern_table *t, uint32_t initial_cap) {
+    t->cap = initial_cap;
+    t->count = 0;
+    t->slots = calloc((size_t)initial_cap, sizeof(*t->slots));
+    arena_init(&t->arena, ARENA_DEFAULT_BLOCK);
+}
+
+static void intern_grow(struct intern_table *t) {
+    uint32_t old_cap = t->cap;
+    struct intern_slot *old = t->slots;
+    t->cap *= 2;
+    t->slots = calloc((size_t)t->cap, sizeof(*t->slots));
+    for (uint32_t i = 0; i < old_cap; i++) {
+        if (!old[i].str) continue;
+        uint32_t idx = (uint32_t)(old[i].hash & (t->cap - 1));
+        while (t->slots[idx].str)
+            idx = (idx + 1) & (t->cap - 1);
+        t->slots[idx] = old[i];
+    }
+    free(old);
+}
+
+static const char *intern_str(struct intern_table *t, const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    uint64_t h = intern_hash(s, len);
+    uint32_t idx = (uint32_t)(h & (t->cap - 1));
+    while (t->slots[idx].str) {
+        if (t->slots[idx].hash == h && strcmp(t->slots[idx].str, s) == 0)
+            return t->slots[idx].str;
+        idx = (idx + 1) & (t->cap - 1);
+    }
+    if (t->count * 4 >= t->cap * 3) {  /* 75% load */
+        intern_grow(t);
+        idx = (uint32_t)(h & (t->cap - 1));
+        while (t->slots[idx].str)
+            idx = (idx + 1) & (t->cap - 1);
+    }
+    const char *interned = arena_strdup(&t->arena, s);
+    t->slots[idx].hash = h;
+    t->slots[idx].str = interned;
+    t->count++;
+    return interned;
+}
+
+static void intern_destroy(struct intern_table *t) {
+    free(t->slots);
+    t->slots = NULL;
+    arena_destroy(&t->arena);
+    t->count = t->cap = 0;
+}
+
+/* ── Profile data ────────────────────────────────────────────────────── */
+
+struct perf_profile {
+    struct perf_stats stats;
+    struct hot_func *funcs;
+    int n_funcs;
+    struct hot_insn *insns;
+    int n_insns;
+    struct uprof_func *uprof_funcs;
+    int n_uprof_funcs;
+    struct topdown_metrics topdown;
+    int has_topdown;
+    struct mca_block *mca_blocks;    int n_mca_blocks;
+    struct cache_miss_site *cm_sites; int n_cm_sites;
+    struct mem_hotspot *mem_hotspots; int n_mem_hotspots;
+    struct struct_layout *layouts;    int n_layouts;
+    struct remark_entry *remarks;    int n_remarks;
+    int n_runs;
+    struct run_stats rs_cycles, rs_insns, rs_ipc, rs_wall;
+    struct run_stats rs_cache_miss_pct, rs_branch_miss_pct;
+    struct arena arena;
+    struct intern_table strings;
+};
+
 /* ── Options ─────────────────────────────────────────────────────────── */
 
 struct perf_opts {
@@ -324,7 +554,8 @@ static int is_boring_caller(const char *name) {
     return 0;
 }
 
-static void add_caller_entry(struct hot_func *hf, const char *name, double pct) {
+static void add_caller_entry(struct perf_profile *prof, struct hot_func *hf,
+                              const char *name, double pct) {
     /* Filter: @plt stubs, __x86_ thunks */
     if (strstr(name, "@plt") || strncmp(name, "__x86_", 6) == 0) return;
     /* Filter: self-recursive (compare with stripped LTO suffixes) */
@@ -342,9 +573,10 @@ static void add_caller_entry(struct hot_func *hf, const char *name, double pct) 
         }
     }
     if (hf->n_callers >= 5) return;
-    hf->callers = realloc(hf->callers,
-        (size_t)(hf->n_callers + 1) * sizeof(*hf->callers));
-    hf->callers[hf->n_callers].name = strdup(name);
+    if (!hf->callers)
+        hf->callers = arena_alloc(&prof->arena, 5 * sizeof(*hf->callers));
+    hf->callers[hf->n_callers].name =
+        (char *)intern_str(&prof->strings, name);
     hf->callers[hf->n_callers].pct = pct;
     hf->n_callers++;
 }
@@ -375,13 +607,6 @@ struct raw_sample {
     uint64_t *ips;      /* callchain IPs (NULL if no callchain) */
     int n_ips;
 };
-
-static void free_raw_samples(struct raw_sample *samples, int n) {
-    if (!samples) return;
-    for (int i = 0; i < n; i++)
-        free(samples[i].ips);
-    free(samples);
-}
 
 /* ── Counters — replaces run_perf_stat() ──────────────────────────────
    Each counter is opened independently (no PERF_FORMAT_GROUP) so the
@@ -719,7 +944,8 @@ static int sampling_open(pid_t child, struct sampling_ctx *ctx,
 }
 
 static int sampling_drain(struct sample_ring *ring,
-                           struct raw_sample **out, int *n_out) {
+                           struct raw_sample **out, int *n_out,
+                           struct arena *sa) {
     *out = NULL;
     *n_out = 0;
     if (ring->fd < 0 || ring->mmap_base == MAP_FAILED) return -1;
@@ -733,7 +959,7 @@ static int sampling_drain(struct sample_ring *ring,
     uint64_t data_size = header->data_size;
 
     int cap = 4096;
-    *out = malloc((size_t)cap * sizeof(struct raw_sample));
+    *out = arena_alloc(sa, (size_t)cap * sizeof(struct raw_sample));
 
     while (data_tail < data_head) {
         /* Read header, handling wrap-around */
@@ -764,9 +990,12 @@ static int sampling_drain(struct sample_ring *ring,
                 }
 
                 if (*n_out >= cap) {
-                    cap *= 2;
-                    *out = realloc(*out,
-                                   (size_t)cap * sizeof(struct raw_sample));
+                    int new_cap = cap * 2;
+                    struct raw_sample *nb = arena_alloc(
+                        sa, (size_t)new_cap * sizeof(struct raw_sample));
+                    memcpy(nb, *out, (size_t)cap * sizeof(struct raw_sample));
+                    *out = nb;
+                    cap = new_cap;
                 }
                 struct raw_sample *s = &(*out)[(*n_out)++];
                 memset(s, 0, sizeof(*s));
@@ -793,7 +1022,7 @@ static int sampling_drain(struct sample_ring *ring,
                         if (nr > 0 && nr < 256 &&
                             pos + nr * 8 <= payload) {
                             s->n_ips = (int)nr;
-                            s->ips = malloc(nr * 8);
+                            s->ips = arena_alloc(sa, nr * 8);
                             memcpy(s->ips, record + pos, nr * 8);
                             pos += nr * 8;
                         }
@@ -1022,7 +1251,8 @@ static int profile_child(struct perf_opts *opts,
                           struct topdown_metrics *topdown, int *has_topdown,
                           struct raw_sample **cycle_samples, int *n_cycle,
                           struct raw_sample **cm_samples, int *n_cm,
-                          uint64_t *out_load_base) {
+                          uint64_t *out_load_base,
+                          struct arena *sa) {
     *has_topdown = 0;
     if (cycle_samples) { *cycle_samples = NULL; *n_cycle = 0; }
     if (cm_samples) { *cm_samples = NULL; *n_cm = 0; }
@@ -1135,9 +1365,9 @@ static int profile_child(struct perf_opts *opts,
 
     /* Drain sampling ring buffers */
     if (samp_ok == 0 && cycle_samples)
-        sampling_drain(&sctx.cycles, cycle_samples, n_cycle);
+        sampling_drain(&sctx.cycles, cycle_samples, n_cycle, sa);
     if (cm_samples && samp_ok == 0 && sctx.cache_misses.fd >= 0)
-        sampling_drain(&sctx.cache_misses, cm_samples, n_cm);
+        sampling_drain(&sctx.cache_misses, cm_samples, n_cm, sa);
 
     /* Read topdown */
     if (td_ok == 0 && topdown_read(&tg, topdown) == 0)
@@ -1226,7 +1456,7 @@ static int process_samples(struct sym_resolver *sr,
         if (pct < 0.5) break;
         struct hot_func *hf = &prof->funcs[prof->n_funcs++];
         memset(hf, 0, sizeof(*hf));
-        hf->name = strdup(buckets[i].raw_name);
+        hf->name = (char *)intern_str(&prof->strings, buckets[i].raw_name);
         hf->overhead_pct = pct;
         hf->samples = buckets[i].count;
     }
@@ -1241,11 +1471,15 @@ static int process_samples(struct sym_resolver *sr,
     };
 
     int max_callers_per = 32;
-    struct caller_agg **agg = calloc((size_t)prof->n_funcs, sizeof(*agg));
-    int *n_agg = calloc((size_t)prof->n_funcs, sizeof(int));
-
-    for (int i = 0; i < prof->n_funcs; i++)
-        agg[i] = calloc((size_t)max_callers_per, sizeof(**agg));
+    struct arena scratch;
+    arena_init(&scratch, ARENA_DEFAULT_BLOCK);
+    struct caller_agg *agg_flat = arena_alloc(&scratch,
+        (size_t)prof->n_funcs * max_callers_per * sizeof(struct caller_agg));
+    memset(agg_flat, 0,
+        (size_t)prof->n_funcs * max_callers_per * sizeof(struct caller_agg));
+    int *n_agg = arena_alloc(&scratch,
+        (size_t)prof->n_funcs * sizeof(int));
+    memset(n_agg, 0, (size_t)prof->n_funcs * sizeof(int));
 
     for (int s = 0; s < n_cycle; s++) {
         if (cycle_samples[s].n_ips < 2) continue;
@@ -1289,19 +1523,19 @@ static int process_samples(struct sym_resolver *sr,
 
             /* Found a good caller — aggregate */
             int found = -1;
+            struct caller_agg *fa = &agg_flat[func_idx * max_callers_per];
             for (int k = 0; k < n_agg[func_idx]; k++) {
-                if (strcmp(agg[func_idx][k].name, cname) == 0) {
+                if (strcmp(fa[k].name, cname) == 0) {
                     found = k;
                     break;
                 }
             }
             if (found >= 0) {
-                agg[func_idx][found].count++;
+                fa[found].count++;
             } else if (n_agg[func_idx] < max_callers_per) {
                 int idx = n_agg[func_idx]++;
-                snprintf(agg[func_idx][idx].name,
-                         sizeof(agg[func_idx][idx].name), "%s", cname);
-                agg[func_idx][idx].count = 1;
+                snprintf(fa[idx].name, sizeof(fa[idx].name), "%s", cname);
+                fa[idx].count = 1;
             }
             break; /* take only the first good caller */
         }
@@ -1310,34 +1544,33 @@ static int process_samples(struct sym_resolver *sr,
     /* Convert aggregated callers to hot_func.callers[] */
     for (int f = 0; f < prof->n_funcs; f++) {
         if (n_agg[f] == 0) continue;
+        struct caller_agg *fa = &agg_flat[f * max_callers_per];
 
         /* Sort by count descending */
         for (int i = 0; i < n_agg[f] - 1; i++)
             for (int j = i + 1; j < n_agg[f]; j++)
-                if (agg[f][j].count > agg[f][i].count) {
-                    struct caller_agg tmp = agg[f][i];
-                    agg[f][i] = agg[f][j];
-                    agg[f][j] = tmp;
+                if (fa[j].count > fa[i].count) {
+                    struct caller_agg tmp = fa[i];
+                    fa[i] = fa[j];
+                    fa[j] = tmp;
                 }
 
         /* Compute total samples with callchains for this function */
         int total_cc = 0;
         for (int k = 0; k < n_agg[f]; k++)
-            total_cc += agg[f][k].count;
+            total_cc += fa[k].count;
 
         /* Take top 5 */
         int nc = n_agg[f] < 5 ? n_agg[f] : 5;
         for (int k = 0; k < nc; k++) {
             double pct = total_cc > 0
-                ? 100.0 * agg[f][k].count / total_cc : 0;
+                ? 100.0 * fa[k].count / total_cc : 0;
             if (pct < 0.5) break;
-            add_caller_entry(&prof->funcs[f], agg[f][k].name, pct);
+            add_caller_entry(prof, &prof->funcs[f], fa[k].name, pct);
         }
     }
 
-    for (int i = 0; i < prof->n_funcs; i++) free(agg[i]);
-    free(agg);
-    free(n_agg);
+    arena_destroy(&scratch);
 
     /* ── Pass 3: Hot instruction attribution (replaces run_perf_annotate) */
 
@@ -1436,12 +1669,14 @@ static int process_samples(struct sym_resolver *sr,
                         (size_t)insn_cap * sizeof(*prof->insns));
                 }
                 struct hot_insn *hi = &prof->insns[prof->n_insns++];
-                hi->func_name = strdup(prof->funcs[f].name);
+                hi->func_name = (char *)intern_str(&prof->strings,
+                                                   prof->funcs[f].name);
                 hi->addr = ip;
                 hi->pct = pct;
-                hi->asm_text = strdup(asm_buf);
+                hi->asm_text = arena_strdup(&prof->arena, asm_buf);
                 hi->source_line = src_line;
-                hi->source_file = src_file ? strdup(src_file) : NULL;
+                hi->source_file = src_file ?
+                    (char *)intern_str(&prof->strings, src_file) : NULL;
             }
 
             free(ip_buckets);
@@ -1549,11 +1784,13 @@ static int process_samples(struct sym_resolver *sr,
                 }
                 struct cache_miss_site *cm =
                     &prof->cm_sites[prof->n_cm_sites++];
-                cm->func_name = strdup(prof->funcs[f].name);
+                cm->func_name = (char *)intern_str(&prof->strings,
+                                                   prof->funcs[f].name);
                 cm->source_line = src_line;
                 cm->pct = pct;
-                cm->asm_text = strdup(asm_buf);
-                cm->source_file = src_file ? strdup(src_file) : NULL;
+                cm->asm_text = arena_strdup(&prof->arena, asm_buf);
+                cm->source_file = src_file ?
+                    (char *)intern_str(&prof->strings, src_file) : NULL;
                 cm->data_addr = ip_buckets[k].top_addr;
             }
 
@@ -1677,10 +1914,12 @@ static int process_samples(struct sym_resolver *sr,
 
                 struct mem_hotspot *mh =
                     &prof->mem_hotspots[prof->n_mem_hotspots++];
-                mh->func_name = strdup(mbs[k].func);
+                mh->func_name = (char *)intern_str(&prof->strings,
+                                                   mbs[k].func);
                 mh->source_line = src_line;
-                mh->source_file = src_file ? strdup(src_file) : NULL;
-                mh->asm_text = strdup(asm_buf);
+                mh->source_file = src_file ?
+                    (char *)intern_str(&prof->strings, src_file) : NULL;
+                mh->asm_text = arena_strdup(&prof->arena, asm_buf);
                 mh->cache_line = mbs[k].cache_line;
                 mh->pct = pct;
                 mh->n_samples = mbs[k].count;
@@ -1812,7 +2051,7 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
         }
         struct uprof_func *uf =
             &prof->uprof_funcs[prof->n_uprof_funcs++];
-        uf->name = strdup(func_name);
+        uf->name = (char *)intern_str(&prof->strings, func_name);
         uf->ipc = ipc;
         uf->l1_dc_miss_pct = l1_dc_miss_pct;
         uf->br_misp_pti = br_misp_pti;
@@ -1985,12 +2224,13 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
             }
             struct mca_block *mb =
                 &prof->mca_blocks[prof->n_mca_blocks++];
-            mb->func_name = strdup(prof->funcs[f].name);
+            mb->func_name = (char *)intern_str(&prof->strings,
+                                               prof->funcs[f].name);
             mb->block_rthroughput = rthroughput;
             mb->ipc = ipc;
             mb->n_uops = uops;
             mb->bottleneck = bottleneck[0] ?
-                strdup(bottleneck) : NULL;
+                arena_strdup(&prof->arena, bottleneck) : NULL;
         }
     }
 
@@ -2138,12 +2378,13 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
             }
             struct struct_layout *sl =
                 &prof->layouts[prof->n_layouts++];
-            sl->type_name = strdup(probe_name);
+            sl->type_name = (char *)intern_str(&prof->strings, probe_name);
             sl->size = size;
             sl->holes = holes;
             sl->padding = padding;
             sl->cachelines = cachelines;
-            sl->func_name = strdup(prof->funcs[f].name);
+            sl->func_name = (char *)intern_str(&prof->strings,
+                                               prof->funcs[f].name);
         }
     }
 
@@ -2280,18 +2521,20 @@ static void xref_skeleton(struct perf_opts *opts,
         }
 
         if (best_sym) {
-            hf->skeleton_sig = strdup(best_sym->text);
-            hf->source_file = strdup(best_fe->abs_path);
+            hf->skeleton_sig = arena_strdup(&prof->arena, best_sym->text);
+            hf->source_file = (char *)intern_str(&prof->strings,
+                                                  best_fe->abs_path);
             hf->start_line = best_sym->start_line;
             hf->end_line = best_sym->end_line;
 
             if (best_sym->n_callees > 0) {
                 hf->n_callees = best_sym->n_callees;
-                hf->callees = malloc(
+                hf->callees = arena_alloc(&prof->arena,
                     (size_t)best_sym->n_callees * sizeof(char *));
                 for (int k = 0; k < best_sym->n_callees; k++)
                     hf->callees[k] =
-                        strdup(best_sym->callees[k]);
+                        (char *)intern_str(&prof->strings,
+                                           best_sym->callees[k]);
             }
         }
     }
@@ -2519,11 +2762,14 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                     }
                     struct remark_entry *re =
                         &prof->remarks[prof->n_remarks++];
-                    re->func_name = strdup(hf->name);
-                    re->source_file = strdup(hf->source_file);
+                    re->func_name = (char *)intern_str(&prof->strings,
+                                                       hf->name);
+                    re->source_file = (char *)intern_str(&prof->strings,
+                                                         hf->source_file);
                     re->line = rline;
-                    re->category = strdup(norm_cat);
-                    re->message = strdup(message);
+                    re->category = (char *)intern_str(&prof->strings,
+                                                      norm_cat);
+                    re->message = arena_strdup(&prof->arena, message);
                     break;
                 }
             }
@@ -3108,6 +3354,9 @@ static void print_report(struct perf_opts *opts,
 /* ── Pipeline ────────────────────────────────────────────────────────── */
 
 static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
+    arena_init(&prof->arena, ARENA_DEFAULT_BLOCK);
+    intern_init(&prof->strings, 256);
+
     int n_runs = opts->n_runs > 0 ? opts->n_runs : 1;
     prof->n_runs = n_runs;
 
@@ -3128,6 +3377,8 @@ static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
         struct raw_sample *cyc = NULL, *cm = NULL;
         int n_cyc = 0, n_cm = 0;
         uint64_t load_base = 0;
+        struct arena sample_arena;
+        arena_init(&sample_arena, ARENA_DEFAULT_BLOCK);
 
         /* Collect samples only on run 0 (instruction-level % is stable) */
         int want_samples = (run == 0);
@@ -3138,8 +3389,9 @@ static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
                           want_samples ? &n_cyc : NULL,
                           (want_cm && want_samples) ? &cm : NULL,
                           (want_cm && want_samples) ? &n_cm : NULL,
-                          &load_base) != 0) {
+                          &load_base, &sample_arena) != 0) {
             fprintf(stderr, "error: profiling failed (run %d)\n", run + 1);
+            arena_destroy(&sample_arena);
             return -1;
         }
 
@@ -3181,8 +3433,7 @@ static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
             symres_free(&sr);
         }
 
-        free_raw_samples(cyc, n_cyc);
-        free_raw_samples(cm, n_cm);
+        arena_destroy(&sample_arena);
     }
 
     /* Compute mean/stddev for all metrics */
@@ -3792,70 +4043,22 @@ static void print_comparison(struct perf_opts *opts,
 /* ── Cleanup ─────────────────────────────────────────────────────────── */
 
 static void free_profile(struct perf_profile *prof) {
-    for (int i = 0; i < prof->n_funcs; i++) {
-        free(prof->funcs[i].name);
-        free(prof->funcs[i].skeleton_sig);
-        free(prof->funcs[i].source_file);
-        for (int k = 0; k < prof->funcs[i].n_callees; k++)
-            free(prof->funcs[i].callees[k]);
-        free(prof->funcs[i].callees);
-        for (int k = 0; k < prof->funcs[i].n_callers; k++)
-            free(prof->funcs[i].callers[k].name);
-        free(prof->funcs[i].callers);
-    }
     free(prof->funcs);
-
-    for (int i = 0; i < prof->n_insns; i++) {
-        free(prof->insns[i].func_name);
-        free(prof->insns[i].asm_text);
-        free(prof->insns[i].source_file);
-    }
     free(prof->insns);
-
-    for (int i = 0; i < prof->n_uprof_funcs; i++)
-        free(prof->uprof_funcs[i].name);
     free(prof->uprof_funcs);
-
-    for (int i = 0; i < prof->n_mca_blocks; i++) {
-        free(prof->mca_blocks[i].func_name);
-        free(prof->mca_blocks[i].bottleneck);
-    }
     free(prof->mca_blocks);
-
-    for (int i = 0; i < prof->n_cm_sites; i++) {
-        free(prof->cm_sites[i].func_name);
-        free(prof->cm_sites[i].asm_text);
-        free(prof->cm_sites[i].source_file);
-    }
     free(prof->cm_sites);
-
-    for (int i = 0; i < prof->n_layouts; i++) {
-        free(prof->layouts[i].type_name);
-        free(prof->layouts[i].func_name);
-    }
     free(prof->layouts);
-
-    for (int i = 0; i < prof->n_remarks; i++) {
-        free(prof->remarks[i].func_name);
-        free(prof->remarks[i].source_file);
-        free(prof->remarks[i].category);
-        free(prof->remarks[i].message);
-    }
     free(prof->remarks);
-
-    for (int i = 0; i < prof->n_mem_hotspots; i++) {
-        free(prof->mem_hotspots[i].func_name);
-        free(prof->mem_hotspots[i].source_file);
-        free(prof->mem_hotspots[i].asm_text);
-    }
     free(prof->mem_hotspots);
-
     free(prof->rs_cycles.values);
     free(prof->rs_insns.values);
     free(prof->rs_ipc.values);
     free(prof->rs_wall.values);
     free(prof->rs_cache_miss_pct.values);
     free(prof->rs_branch_miss_pct.values);
+    intern_destroy(&prof->strings);
+    arena_destroy(&prof->arena);
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────── */
@@ -4026,6 +4229,7 @@ int perf_main(int argc, char *argv[]) {
     return 0;
 
 fail:
+    free_profile(&prof);
     free(opts.cmd_str);
     free(opts.binary_path);
     return 1;

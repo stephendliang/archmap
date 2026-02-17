@@ -154,26 +154,6 @@ struct run_stats {
     double *values;         /* raw values from each run */
 };
 
-struct perf_profile {
-    struct perf_stats stats;
-    struct hot_func *funcs;
-    int n_funcs;
-    struct hot_insn *insns;
-    int n_insns;
-    struct uprof_func *uprof_funcs;
-    int n_uprof_funcs;
-    struct topdown_metrics topdown;
-    int has_topdown;
-    struct mca_block *mca_blocks;    int n_mca_blocks;
-    struct cache_miss_site *cm_sites; int n_cm_sites;
-    struct mem_hotspot *mem_hotspots; int n_mem_hotspots;
-    struct struct_layout *layouts;    int n_layouts;
-    struct remark_entry *remarks;    int n_remarks;
-    int n_runs;
-    struct run_stats rs_cycles, rs_insns, rs_ipc, rs_wall;
-    struct run_stats rs_cache_miss_pct, rs_branch_miss_pct;
-};
-
 /* ── Entry point ───────────────────────────────────────────────────── */
 
 int perf_main(int argc, char *argv[]);
