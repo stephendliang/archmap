@@ -2759,64 +2759,90 @@ static void print_report(struct perf_opts *opts,
         printf("\n");
     }
 
-    /* Hot instructions (with source interleaving) */
+    /* Hot instructions (with source interleaving, sorted by address) */
     if (prof->n_insns > 0) {
         printf("--- hot instructions ---\n");
-        const char *cur_func = NULL;
-        char *src_buf = NULL;
-        char **src_lines = NULL;
-        int n_src_lines = 0;
-        int last_printed_line = 0;
-        for (int i = 0; i < prof->n_insns; i++) {
-            struct hot_insn *hi = &prof->insns[i];
-            if (!cur_func ||
-                strcmp(cur_func, hi->func_name) != 0) {
-                cur_func = hi->func_name;
-                free(src_buf); src_buf = NULL;
-                free(src_lines); src_lines = NULL;
-                n_src_lines = 0;
-                last_printed_line = 0;
+        int i = 0;
+        while (i < prof->n_insns) {
+            const char *cur_func = prof->insns[i].func_name;
 
-                /* Load source for this function */
-                const char *disp_src = NULL;
-                const char *load_path = hi->source_file;
-                if (!load_path) {
-                    for (int f = 0; f < prof->n_funcs; f++) {
-                        if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
-                            prof->funcs[f].source_file) {
-                            load_path = prof->funcs[f].source_file;
-                            break;
-                        }
-                    }
+            /* Find extent of this function group */
+            int grp_start = i, grp_end = i + 1;
+            while (grp_end < prof->n_insns &&
+                   strcmp(prof->insns[grp_end].func_name, cur_func) == 0)
+                grp_end++;
+            int grp_n = grp_end - grp_start;
+
+            /* Sort indices by address for coherent source interleaving */
+            int order[grp_n]; /* VLA, N ≤ ~10 */
+            for (int k = 0; k < grp_n; k++) order[k] = k;
+            for (int a = 1; a < grp_n; a++) {
+                int key = order[a];
+                uint64_t ka = prof->insns[grp_start + key].addr;
+                int j = a - 1;
+                while (j >= 0 &&
+                       prof->insns[grp_start + order[j]].addr > ka) {
+                    order[j + 1] = order[j]; j--;
                 }
-                if (load_path) {
-                    disp_src = short_path(load_path, opts->source_dir);
+                order[j + 1] = key;
+            }
+
+            /* Header: use hot_func source for the display path */
+            const char *hdr_src = NULL;
+            for (int f = 0; f < prof->n_funcs; f++) {
+                if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
+                    prof->funcs[f].source_file) {
+                    hdr_src = short_path(prof->funcs[f].source_file,
+                                         opts->source_dir);
+                    break;
+                }
+            }
+            struct hot_insn *first = &prof->insns[grp_start + order[0]];
+            if (hdr_src && first->source_line)
+                printf("[%s]  //%s:%u\n",
+                       cur_func, hdr_src, first->source_line);
+            else
+                printf("[%s]\n", cur_func);
+
+            /* Print instructions in address order.
+               Track current loaded source file; reload when it changes. */
+            char *src_buf = NULL;
+            char **src_lines = NULL;
+            int n_src_lines = 0;
+            const char *loaded_path = NULL;
+            int last_printed_line = 0;
+
+            for (int k = 0; k < grp_n; k++) {
+                struct hot_insn *hi = &prof->insns[grp_start + order[k]];
+                /* Switch source file if instruction maps to a different one */
+                if (hi->source_file &&
+                    (!loaded_path ||
+                     strcmp(loaded_path, hi->source_file) != 0)) {
+                    free(src_buf); src_buf = NULL;
+                    free(src_lines); src_lines = NULL;
+                    n_src_lines = 0;
+                    last_printed_line = 0;
                     long slen;
-                    src_buf = read_file_source(load_path, &slen);
+                    src_buf = read_file_source(hi->source_file, &slen);
                     if (src_buf)
                         src_lines = index_source_lines(src_buf, slen,
                                                        &n_src_lines);
+                    loaded_path = hi->source_file;
                 }
-
-                if (disp_src && hi->source_line)
-                    printf("[%s]  //%s:%u\n",
-                           cur_func, disp_src, hi->source_line);
-                else
-                    printf("[%s]\n", cur_func);
+                if (hi->source_line != 0 &&
+                    (int)hi->source_line != last_printed_line &&
+                    src_lines && (int)hi->source_line <= n_src_lines) {
+                    printf("       :%u  ", hi->source_line);
+                    print_source_line(src_lines[hi->source_line]);
+                    printf("\n");
+                    last_printed_line = (int)hi->source_line;
+                }
+                printf("  %5.1f%%  %s\n", hi->pct, hi->asm_text);
             }
-            /* Interleave source line if it changed */
-            if (hi->source_line != 0 &&
-                (int)hi->source_line != last_printed_line &&
-                src_lines && (int)hi->source_line <= n_src_lines) {
-                printf("       :%u  ", hi->source_line);
-                print_source_line(src_lines[hi->source_line]);
-                printf("\n");
-                last_printed_line = (int)hi->source_line;
-            }
-            printf("  %5.1f%%  %s\n", hi->pct, hi->asm_text);
+            free(src_buf);
+            free(src_lines);
+            i = grp_end;
         }
-        free(src_buf);
-        free(src_lines);
         printf("\n");
     }
 
@@ -2833,106 +2859,168 @@ static void print_report(struct perf_opts *opts,
         printf("\n");
     }
 
-    /* Cache misses (with source interleaving) */
+    /* Cache misses (with source interleaving, sorted by source line) */
     if (prof->n_cm_sites > 0) {
         printf("--- cache misses ---\n");
-        const char *cur_func = NULL;
-        char *src_buf = NULL;
-        char **src_lines = NULL;
-        int n_src_lines = 0;
-        int last_printed_line = 0;
-        for (int i = 0; i < prof->n_cm_sites; i++) {
-            struct cache_miss_site *cm = &prof->cm_sites[i];
-            if (!cur_func ||
-                strcmp(cur_func, cm->func_name) != 0) {
-                cur_func = cm->func_name;
-                free(src_buf); src_buf = NULL;
-                free(src_lines); src_lines = NULL;
-                n_src_lines = 0;
-                last_printed_line = 0;
+        int i = 0;
+        while (i < prof->n_cm_sites) {
+            const char *cur_func = prof->cm_sites[i].func_name;
 
-                const char *disp_src = NULL;
-                const char *load_path = cm->source_file;
-                if (!load_path) {
-                    for (int f = 0; f < prof->n_funcs; f++) {
-                        if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
-                            prof->funcs[f].source_file) {
-                            load_path = prof->funcs[f].source_file;
-                            break;
-                        }
-                    }
+            int grp_start = i, grp_end = i + 1;
+            while (grp_end < prof->n_cm_sites &&
+                   strcmp(prof->cm_sites[grp_end].func_name, cur_func) == 0)
+                grp_end++;
+            int grp_n = grp_end - grp_start;
+
+            /* Sort indices by source_line */
+            int order[grp_n];
+            for (int k = 0; k < grp_n; k++) order[k] = k;
+            for (int a = 1; a < grp_n; a++) {
+                int key = order[a];
+                uint32_t kl = prof->cm_sites[grp_start + key].source_line;
+                if (kl == 0) kl = UINT32_MAX;
+                int j = a - 1;
+                while (j >= 0) {
+                    uint32_t jl = prof->cm_sites[grp_start + order[j]].source_line;
+                    if (jl == 0) jl = UINT32_MAX;
+                    if (jl <= kl) break;
+                    order[j + 1] = order[j]; j--;
                 }
-                if (load_path) {
-                    disp_src = short_path(load_path, opts->source_dir);
+                order[j + 1] = key;
+            }
+
+            /* Header */
+            const char *hdr_src = NULL;
+            for (int f = 0; f < prof->n_funcs; f++) {
+                if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
+                    prof->funcs[f].source_file) {
+                    hdr_src = short_path(prof->funcs[f].source_file,
+                                         opts->source_dir);
+                    break;
+                }
+            }
+            struct cache_miss_site *first_cm =
+                &prof->cm_sites[grp_start + order[0]];
+            if (hdr_src && first_cm->source_line)
+                printf("[%s]  //%s:%u\n",
+                       cur_func, hdr_src, first_cm->source_line);
+            else
+                printf("[%s]\n", cur_func);
+
+            /* Print with per-instruction source file tracking */
+            char *src_buf = NULL;
+            char **src_lines = NULL;
+            int n_src_lines = 0;
+            const char *loaded_path = NULL;
+            int last_printed_line = 0;
+
+            for (int k = 0; k < grp_n; k++) {
+                struct cache_miss_site *cm =
+                    &prof->cm_sites[grp_start + order[k]];
+                if (cm->source_file &&
+                    (!loaded_path ||
+                     strcmp(loaded_path, cm->source_file) != 0)) {
+                    free(src_buf); src_buf = NULL;
+                    free(src_lines); src_lines = NULL;
+                    n_src_lines = 0;
+                    last_printed_line = 0;
                     long slen;
-                    src_buf = read_file_source(load_path, &slen);
+                    src_buf = read_file_source(cm->source_file, &slen);
                     if (src_buf)
                         src_lines = index_source_lines(src_buf, slen,
                                                        &n_src_lines);
+                    loaded_path = cm->source_file;
                 }
-
-                if (disp_src && cm->source_line)
-                    printf("[%s]  //%s:%u\n",
-                           cur_func, disp_src, cm->source_line);
-                else
-                    printf("[%s]\n", cur_func);
+                if (cm->source_line != 0 &&
+                    (int)cm->source_line != last_printed_line &&
+                    src_lines && (int)cm->source_line <= n_src_lines) {
+                    printf("       :%u  ", cm->source_line);
+                    print_source_line(src_lines[cm->source_line]);
+                    printf("\n");
+                    last_printed_line = (int)cm->source_line;
+                }
+                printf("  %5.1f%%  %s\n", cm->pct, cm->asm_text);
             }
-            if (cm->source_line != 0 &&
-                (int)cm->source_line != last_printed_line &&
-                src_lines && (int)cm->source_line <= n_src_lines) {
-                printf("       :%u  ", cm->source_line);
-                print_source_line(src_lines[cm->source_line]);
-                printf("\n");
-                last_printed_line = (int)cm->source_line;
-            }
-            printf("  %5.1f%%  %s\n", cm->pct, cm->asm_text);
+            free(src_buf);
+            free(src_lines);
+            i = grp_end;
         }
-        free(src_buf);
-        free(src_lines);
         printf("\n");
     }
 
-    /* Memory hotspots (cache-line level) */
+    /* Memory hotspots (cache-line level, sorted by source line) */
     if (prof->n_mem_hotspots > 0) {
         printf("--- memory hotspots ---\n");
-        const char *cur_func = NULL;
-        char *src_buf = NULL;
-        char **src_lines = NULL;
-        int n_src_lines = 0;
-        int last_printed_line = 0;
-        for (int i = 0; i < prof->n_mem_hotspots; i++) {
-            struct mem_hotspot *mh = &prof->mem_hotspots[i];
-            if (!cur_func ||
-                strcmp(cur_func, mh->func_name) != 0) {
-                cur_func = mh->func_name;
-                free(src_buf); src_buf = NULL;
-                free(src_lines); src_lines = NULL;
-                n_src_lines = 0;
-                last_printed_line = 0;
-                if (mh->source_file) {
+        int i = 0;
+        while (i < prof->n_mem_hotspots) {
+            const char *cur_func = prof->mem_hotspots[i].func_name;
+
+            int grp_start = i, grp_end = i + 1;
+            while (grp_end < prof->n_mem_hotspots &&
+                   strcmp(prof->mem_hotspots[grp_end].func_name,
+                          cur_func) == 0)
+                grp_end++;
+            int grp_n = grp_end - grp_start;
+
+            int order[grp_n];
+            for (int k = 0; k < grp_n; k++) order[k] = k;
+            for (int a = 1; a < grp_n; a++) {
+                int key = order[a];
+                uint32_t kl = prof->mem_hotspots[grp_start + key].source_line;
+                if (kl == 0) kl = UINT32_MAX;
+                int j = a - 1;
+                while (j >= 0) {
+                    uint32_t jl = prof->mem_hotspots[grp_start + order[j]].source_line;
+                    if (jl == 0) jl = UINT32_MAX;
+                    if (jl <= kl) break;
+                    order[j + 1] = order[j]; j--;
+                }
+                order[j + 1] = key;
+            }
+
+            printf("[%s]\n", cur_func);
+
+            /* Per-instruction source file tracking */
+            char *src_buf = NULL;
+            char **src_lines = NULL;
+            int n_src_lines = 0;
+            const char *loaded_path = NULL;
+            int last_printed_line = 0;
+
+            for (int k = 0; k < grp_n; k++) {
+                struct mem_hotspot *mh =
+                    &prof->mem_hotspots[grp_start + order[k]];
+                if (mh->source_file &&
+                    (!loaded_path ||
+                     strcmp(loaded_path, mh->source_file) != 0)) {
+                    free(src_buf); src_buf = NULL;
+                    free(src_lines); src_lines = NULL;
+                    n_src_lines = 0;
+                    last_printed_line = 0;
                     long slen;
                     src_buf = read_file_source(mh->source_file, &slen);
                     if (src_buf)
                         src_lines = index_source_lines(src_buf, slen,
                                                        &n_src_lines);
+                    loaded_path = mh->source_file;
                 }
-                printf("[%s]\n", cur_func);
+                if (mh->source_line != 0 &&
+                    (int)mh->source_line != last_printed_line &&
+                    src_lines && (int)mh->source_line <= n_src_lines) {
+                    printf("       :%u  ", mh->source_line);
+                    print_source_line(src_lines[mh->source_line]);
+                    printf("\n");
+                    last_printed_line = (int)mh->source_line;
+                }
+                printf("  %5.1f%%  %-40s cacheline 0x%" PRIx64
+                       " (%d samples)\n",
+                       mh->pct, mh->asm_text,
+                       mh->cache_line << 6, mh->n_samples);
             }
-            if (mh->source_line != 0 &&
-                (int)mh->source_line != last_printed_line &&
-                src_lines && (int)mh->source_line <= n_src_lines) {
-                printf("       :%u  ", mh->source_line);
-                print_source_line(src_lines[mh->source_line]);
-                printf("\n");
-                last_printed_line = (int)mh->source_line;
-            }
-            printf("  %5.1f%%  %-40s cacheline 0x%" PRIx64
-                   " (%d samples)\n",
-                   mh->pct, mh->asm_text,
-                   mh->cache_line << 6, mh->n_samples);
+            free(src_buf);
+            free(src_lines);
+            i = grp_end;
         }
-        free(src_buf);
-        free(src_lines);
         printf("\n");
     }
 
@@ -3328,7 +3416,7 @@ static void print_comparison(struct perf_opts *opts,
     }
     printf("\n");
 
-    /* Per-function cache miss hotspots (with source interleaving) */
+    /* Per-function cache miss hotspots (sorted by source line) */
     if (prof_a->n_cm_sites > 0 && prof_b->n_cm_sites > 0) {
         printf("--- cache miss hotspots A -> B ---\n");
         for (int b = 0; b < prof_b->n_funcs; b++) {
@@ -3348,70 +3436,90 @@ static void print_comparison(struct perf_opts *opts,
 
             printf("[%s]\n", prof_b->funcs[b].name);
 
-            /* Load source for interleaving (use B's source file) */
-            char *sb2 = NULL; char **sl2 = NULL; int nsl2 = 0;
-            for (int i = 0; i < prof_b->n_cm_sites; i++) {
-                char cmn[256];
-                snprintf(cmn, sizeof(cmn), "%s", prof_b->cm_sites[i].func_name);
-                strip_compiler_suffix(cmn);
-                if (strcmp(cmn, bclean) == 0 && prof_b->cm_sites[i].source_file) {
-                    long slen;
-                    sb2 = read_file_source(prof_b->cm_sites[i].source_file, &slen);
-                    if (sb2) sl2 = index_source_lines(sb2, slen, &nsl2);
-                    break;
-                }
-            }
-
-            int last_line = 0;
+            /* Collect top 3 for each side, sort by source_line */
+            struct { int idx; char side; } entries[6];
+            int n_entries = 0;
             int count = 0;
             for (int i = 0; i < prof_a->n_cm_sites && count < 3; i++) {
                 char cmn[256];
-                snprintf(cmn, sizeof(cmn), "%s",
-                         prof_a->cm_sites[i].func_name);
+                snprintf(cmn, sizeof(cmn), "%s", prof_a->cm_sites[i].func_name);
                 strip_compiler_suffix(cmn);
-                if (strcmp(cmn, bclean) == 0) {
-                    if (prof_a->cm_sites[i].source_line != 0 &&
-                        (int)prof_a->cm_sites[i].source_line != last_line &&
-                        sl2 && (int)prof_a->cm_sites[i].source_line <= nsl2) {
-                        printf("       :%u  ", prof_a->cm_sites[i].source_line);
-                        print_source_line(sl2[prof_a->cm_sites[i].source_line]);
-                        printf("\n");
-                        last_line = (int)prof_a->cm_sites[i].source_line;
-                    }
-                    printf("  A: %5.1f%%  %s\n",
-                           prof_a->cm_sites[i].pct,
-                           prof_a->cm_sites[i].asm_text);
-                    count++;
-                }
+                if (strcmp(cmn, bclean) == 0)
+                    entries[n_entries++] = (typeof(entries[0])){i, 'A'}, count++;
             }
-            last_line = 0;
             count = 0;
             for (int i = 0; i < prof_b->n_cm_sites && count < 3; i++) {
                 char cmn[256];
-                snprintf(cmn, sizeof(cmn), "%s",
-                         prof_b->cm_sites[i].func_name);
+                snprintf(cmn, sizeof(cmn), "%s", prof_b->cm_sites[i].func_name);
                 strip_compiler_suffix(cmn);
-                if (strcmp(cmn, bclean) == 0) {
-                    if (prof_b->cm_sites[i].source_line != 0 &&
-                        (int)prof_b->cm_sites[i].source_line != last_line &&
-                        sl2 && (int)prof_b->cm_sites[i].source_line <= nsl2) {
-                        printf("       :%u  ", prof_b->cm_sites[i].source_line);
-                        print_source_line(sl2[prof_b->cm_sites[i].source_line]);
-                        printf("\n");
-                        last_line = (int)prof_b->cm_sites[i].source_line;
-                    }
-                    printf("  B: %5.1f%%  %s\n",
-                           prof_b->cm_sites[i].pct,
-                           prof_b->cm_sites[i].asm_text);
-                    count++;
-                }
+                if (strcmp(cmn, bclean) == 0)
+                    entries[n_entries++] = (typeof(entries[0])){i, 'B'}, count++;
             }
-            free(sb2); free(sl2);
+            /* Sort by source_line */
+            for (int a = 1; a < n_entries; a++) {
+                typeof(entries[0]) key = entries[a];
+                uint32_t kl = key.side == 'A'
+                    ? prof_a->cm_sites[key.idx].source_line
+                    : prof_b->cm_sites[key.idx].source_line;
+                if (kl == 0) kl = UINT32_MAX;
+                int j = a - 1;
+                while (j >= 0) {
+                    uint32_t jl = entries[j].side == 'A'
+                        ? prof_a->cm_sites[entries[j].idx].source_line
+                        : prof_b->cm_sites[entries[j].idx].source_line;
+                    if (jl == 0) jl = UINT32_MAX;
+                    if (jl <= kl) break;
+                    entries[j + 1] = entries[j]; j--;
+                }
+                entries[j + 1] = key;
+            }
+
+            /* Per-instruction source file tracking */
+            char *sbuf = NULL; char **slines = NULL; int nslines = 0;
+            const char *loaded_path = NULL;
+            int last_line = 0;
+            for (int k = 0; k < n_entries; k++) {
+                uint32_t sl; const char *sf;
+                if (entries[k].side == 'A') {
+                    sl = prof_a->cm_sites[entries[k].idx].source_line;
+                    sf = prof_a->cm_sites[entries[k].idx].source_file;
+                } else {
+                    sl = prof_b->cm_sites[entries[k].idx].source_line;
+                    sf = prof_b->cm_sites[entries[k].idx].source_file;
+                }
+                if (sf && (!loaded_path ||
+                           strcmp(loaded_path, sf) != 0)) {
+                    free(sbuf); sbuf = NULL;
+                    free(slines); slines = NULL;
+                    nslines = 0; last_line = 0;
+                    long slen;
+                    sbuf = read_file_source(sf, &slen);
+                    if (sbuf)
+                        slines = index_source_lines(sbuf, slen, &nslines);
+                    loaded_path = sf;
+                }
+                if (sl != 0 && (int)sl != last_line &&
+                    slines && (int)sl <= nslines) {
+                    printf("       :%u  ", sl);
+                    print_source_line(slines[sl]);
+                    printf("\n");
+                    last_line = (int)sl;
+                }
+                if (entries[k].side == 'A')
+                    printf("  A: %5.1f%%  %s\n",
+                           prof_a->cm_sites[entries[k].idx].pct,
+                           prof_a->cm_sites[entries[k].idx].asm_text);
+                else
+                    printf("  B: %5.1f%%  %s\n",
+                           prof_b->cm_sites[entries[k].idx].pct,
+                           prof_b->cm_sites[entries[k].idx].asm_text);
+            }
+            free(sbuf); free(slines);
         }
         printf("\n");
     }
 
-    /* Hot instruction summary (with source interleaving) */
+    /* Hot instruction summary (sorted by source line) */
     if (prof_a->n_insns > 0 && prof_b->n_insns > 0) {
         printf("--- hot instructions A -> B ---\n");
         for (int b = 0; b < prof_b->n_funcs; b++) {
@@ -3431,65 +3539,85 @@ static void print_comparison(struct perf_opts *opts,
 
             printf("[%s]\n", prof_b->funcs[b].name);
 
-            /* Load source for interleaving (use B's source file) */
-            char *sb2 = NULL; char **sl2 = NULL; int nsl2 = 0;
-            for (int i = 0; i < prof_b->n_insns; i++) {
-                char iclean[256];
-                snprintf(iclean, sizeof(iclean), "%s", prof_b->insns[i].func_name);
-                strip_compiler_suffix(iclean);
-                if (strcmp(iclean, bclean) == 0 && prof_b->insns[i].source_file) {
-                    long slen;
-                    sb2 = read_file_source(prof_b->insns[i].source_file, &slen);
-                    if (sb2) sl2 = index_source_lines(sb2, slen, &nsl2);
-                    break;
-                }
-            }
-
-            int last_line = 0;
+            /* Collect top 3 for each side, sort by source_line */
+            struct { int idx; char side; } entries[6];
+            int n_entries = 0;
             int count = 0;
             for (int i = 0; i < prof_a->n_insns && count < 3; i++) {
                 char iclean[256];
-                snprintf(iclean, sizeof(iclean), "%s",
-                         prof_a->insns[i].func_name);
+                snprintf(iclean, sizeof(iclean), "%s", prof_a->insns[i].func_name);
                 strip_compiler_suffix(iclean);
-                if (strcmp(iclean, bclean) == 0) {
-                    if (prof_a->insns[i].source_line != 0 &&
-                        (int)prof_a->insns[i].source_line != last_line &&
-                        sl2 && (int)prof_a->insns[i].source_line <= nsl2) {
-                        printf("       :%u  ", prof_a->insns[i].source_line);
-                        print_source_line(sl2[prof_a->insns[i].source_line]);
-                        printf("\n");
-                        last_line = (int)prof_a->insns[i].source_line;
-                    }
-                    printf("  A: %5.1f%%  %s\n",
-                           prof_a->insns[i].pct,
-                           prof_a->insns[i].asm_text);
-                    count++;
-                }
+                if (strcmp(iclean, bclean) == 0)
+                    entries[n_entries++] = (typeof(entries[0])){i, 'A'}, count++;
             }
-            last_line = 0;
             count = 0;
             for (int i = 0; i < prof_b->n_insns && count < 3; i++) {
                 char iclean[256];
-                snprintf(iclean, sizeof(iclean), "%s",
-                         prof_b->insns[i].func_name);
+                snprintf(iclean, sizeof(iclean), "%s", prof_b->insns[i].func_name);
                 strip_compiler_suffix(iclean);
-                if (strcmp(iclean, bclean) == 0) {
-                    if (prof_b->insns[i].source_line != 0 &&
-                        (int)prof_b->insns[i].source_line != last_line &&
-                        sl2 && (int)prof_b->insns[i].source_line <= nsl2) {
-                        printf("       :%u  ", prof_b->insns[i].source_line);
-                        print_source_line(sl2[prof_b->insns[i].source_line]);
-                        printf("\n");
-                        last_line = (int)prof_b->insns[i].source_line;
-                    }
-                    printf("  B: %5.1f%%  %s\n",
-                           prof_b->insns[i].pct,
-                           prof_b->insns[i].asm_text);
-                    count++;
-                }
+                if (strcmp(iclean, bclean) == 0)
+                    entries[n_entries++] = (typeof(entries[0])){i, 'B'}, count++;
             }
-            free(sb2); free(sl2);
+            /* Sort by source_line */
+            for (int a = 1; a < n_entries; a++) {
+                typeof(entries[0]) key = entries[a];
+                uint32_t kl = key.side == 'A'
+                    ? prof_a->insns[key.idx].source_line
+                    : prof_b->insns[key.idx].source_line;
+                if (kl == 0) kl = UINT32_MAX;
+                int j = a - 1;
+                while (j >= 0) {
+                    uint32_t jl = entries[j].side == 'A'
+                        ? prof_a->insns[entries[j].idx].source_line
+                        : prof_b->insns[entries[j].idx].source_line;
+                    if (jl == 0) jl = UINT32_MAX;
+                    if (jl <= kl) break;
+                    entries[j + 1] = entries[j]; j--;
+                }
+                entries[j + 1] = key;
+            }
+
+            /* Per-instruction source file tracking */
+            char *sbuf = NULL; char **slines = NULL; int nslines = 0;
+            const char *loaded_path = NULL;
+            int last_line = 0;
+            for (int k = 0; k < n_entries; k++) {
+                uint32_t sl; const char *sf;
+                if (entries[k].side == 'A') {
+                    sl = prof_a->insns[entries[k].idx].source_line;
+                    sf = prof_a->insns[entries[k].idx].source_file;
+                } else {
+                    sl = prof_b->insns[entries[k].idx].source_line;
+                    sf = prof_b->insns[entries[k].idx].source_file;
+                }
+                if (sf && (!loaded_path ||
+                           strcmp(loaded_path, sf) != 0)) {
+                    free(sbuf); sbuf = NULL;
+                    free(slines); slines = NULL;
+                    nslines = 0; last_line = 0;
+                    long slen;
+                    sbuf = read_file_source(sf, &slen);
+                    if (sbuf)
+                        slines = index_source_lines(sbuf, slen, &nslines);
+                    loaded_path = sf;
+                }
+                if (sl != 0 && (int)sl != last_line &&
+                    slines && (int)sl <= nslines) {
+                    printf("       :%u  ", sl);
+                    print_source_line(slines[sl]);
+                    printf("\n");
+                    last_line = (int)sl;
+                }
+                if (entries[k].side == 'A')
+                    printf("  A: %5.1f%%  %s\n",
+                           prof_a->insns[entries[k].idx].pct,
+                           prof_a->insns[entries[k].idx].asm_text);
+                else
+                    printf("  B: %5.1f%%  %s\n",
+                           prof_b->insns[entries[k].idx].pct,
+                           prof_b->insns[entries[k].idx].asm_text);
+            }
+            free(sbuf); free(slines);
         }
         printf("\n");
     }
