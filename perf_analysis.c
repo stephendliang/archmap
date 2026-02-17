@@ -105,6 +105,7 @@ static void *arena_alloc(struct arena *a, size_t n) {
 }
 
 static char *arena_strdup(struct arena *a, const char *s) {
+    if (!s) return NULL;
     size_t len = strlen(s) + 1;
     char *p = arena_alloc(a, len);
     memcpy(p, s, len);
@@ -202,6 +203,7 @@ static void intern_init(struct intern_table *t, uint32_t initial_cap) {
     t->cap = initial_cap;
     t->count = 0;
     t->slots = calloc((size_t)initial_cap, sizeof(*t->slots));
+    if (!t->slots) { fprintf(stderr, "intern_init: calloc failed\n"); abort(); }
     arena_init(&t->arena, ARENA_DEFAULT_BLOCK);
 }
 
@@ -210,6 +212,7 @@ static void intern_grow(struct intern_table *t) {
     struct intern_slot *old = t->slots;
     t->cap *= 2;
     t->slots = calloc((size_t)t->cap, sizeof(*t->slots));
+    if (!t->slots) { fprintf(stderr, "intern_grow: calloc failed\n"); abort(); }
     for (uint32_t i = 0; i < old_cap; i++) {
         if (!old[i].str) continue;
         uint32_t idx = (uint32_t)(old[i].hash & (t->cap - 1));
@@ -4125,6 +4128,9 @@ int perf_main(int argc, char *argv[]) {
     }
     atexit(cleanup_tmpdir);
 
+    struct perf_profile prof;
+    memset(&prof, 0, sizeof(prof));
+
     /* Phase 1: Build */
     if (phase_build(&opts) != 0) goto fail;
 
@@ -4215,9 +4221,6 @@ int perf_main(int argc, char *argv[]) {
     }
 
     /* ── Normal single-profile path ──────────────────────── */
-    struct perf_profile prof;
-    memset(&prof, 0, sizeof(prof));
-
     if (run_pipeline(&opts, &prof) != 0)
         goto fail;
 
