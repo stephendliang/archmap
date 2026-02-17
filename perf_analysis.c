@@ -112,6 +112,22 @@ static char *arena_strdup(struct arena *a, const char *s) {
     return p;
 }
 
+static void *arena_realloc(struct arena *a, void *old_ptr,
+                           size_t old_size, size_t new_size) {
+    if (!old_ptr) return arena_alloc(a, new_size);
+    size_t old_al = (old_size + ARENA_ALIGN - 1) & ~((size_t)ARENA_ALIGN - 1);
+    size_t new_al = (new_size + ARENA_ALIGN - 1) & ~((size_t)ARENA_ALIGN - 1);
+    struct arena_block *b = a->head;
+    if (b && (char *)old_ptr + old_al == (char *)b + b->used
+          && b->used - old_al + new_al <= b->size) {
+        b->used = b->used - old_al + new_al;
+        return old_ptr;
+    }
+    void *p = arena_alloc(a, new_size);
+    memcpy(p, old_ptr, old_size);
+    return p;
+}
+
 static void arena_destroy(struct arena *a) {
     struct arena_block *b = a->head;
     while (b) {
@@ -1469,7 +1485,7 @@ static int process_samples(struct sym_resolver *sr,
     /* Take top N functions (skip those below 0.5%) */
     int limit = n_buckets < opts->top_n ? n_buckets : opts->top_n;
     int n_total = n_cycle;
-    prof->funcs = xmalloc((size_t)limit * sizeof(*prof->funcs));
+    prof->funcs = arena_alloc(&prof->arena, (size_t)limit * sizeof(*prof->funcs));
     prof->n_funcs = 0;
 
     for (int i = 0; i < limit; i++) {
@@ -1596,7 +1612,7 @@ static int process_samples(struct sym_resolver *sr,
     /* ── Pass 3: Hot instruction attribution (replaces run_perf_annotate) */
 
     int insn_cap = 64;
-    prof->insns = xmalloc((size_t)insn_cap * sizeof(*prof->insns));
+    prof->insns = arena_alloc(&prof->arena, (size_t)insn_cap * sizeof(*prof->insns));
     prof->n_insns = 0;
 
     if (sr->cs_ok) {
@@ -1685,9 +1701,10 @@ static int process_samples(struct sym_resolver *sr,
                     src_line = (uint32_t)sline;
 
                 if (prof->n_insns >= insn_cap) {
+                    size_t old_sz = (size_t)insn_cap * sizeof(*prof->insns);
                     insn_cap *= 2;
-                    prof->insns = xrealloc(prof->insns,
-                        (size_t)insn_cap * sizeof(*prof->insns));
+                    prof->insns = arena_realloc(&prof->arena, prof->insns,
+                        old_sz, (size_t)insn_cap * sizeof(*prof->insns));
                 }
                 struct hot_insn *hi = &prof->insns[prof->n_insns++];
                 hi->func_name = (char *)intern_str(&prof->strings,
@@ -1709,7 +1726,7 @@ static int process_samples(struct sym_resolver *sr,
 
     if (cm_samples && n_cm > 0 && sr->cs_ok) {
         int cm_cap = 64;
-        prof->cm_sites = xmalloc((size_t)cm_cap * sizeof(*prof->cm_sites));
+        prof->cm_sites = arena_alloc(&prof->arena, (size_t)cm_cap * sizeof(*prof->cm_sites));
         prof->n_cm_sites = 0;
 
         for (int f = 0; f < prof->n_funcs; f++) {
@@ -1799,9 +1816,10 @@ static int process_samples(struct sym_resolver *sr,
                     src_line = (uint32_t)sline;
 
                 if (prof->n_cm_sites >= cm_cap) {
+                    size_t old_sz = (size_t)cm_cap * sizeof(*prof->cm_sites);
                     cm_cap *= 2;
-                    prof->cm_sites = xrealloc(prof->cm_sites,
-                        (size_t)cm_cap * sizeof(*prof->cm_sites));
+                    prof->cm_sites = arena_realloc(&prof->arena, prof->cm_sites,
+                        old_sz, (size_t)cm_cap * sizeof(*prof->cm_sites));
                 }
                 struct cache_miss_site *cm =
                     &prof->cm_sites[prof->n_cm_sites++];
@@ -1889,7 +1907,7 @@ static int process_samples(struct sym_resolver *sr,
             /* Take top entries */
             int take = n_mb < opts->top_n * 2 ? n_mb : opts->top_n * 2;
             int mh_cap = take > 0 ? take : 1;
-            prof->mem_hotspots = xmalloc((size_t)mh_cap *
+            prof->mem_hotspots = arena_alloc(&prof->arena, (size_t)mh_cap *
                                         sizeof(*prof->mem_hotspots));
             prof->n_mem_hotspots = 0;
 
@@ -2018,7 +2036,7 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     if (!fp) return 0;
 
     int cap = 16;
-    prof->uprof_funcs = xmalloc((size_t)cap * sizeof(*prof->uprof_funcs));
+    prof->uprof_funcs = arena_alloc(&prof->arena, (size_t)cap * sizeof(*prof->uprof_funcs));
     prof->n_uprof_funcs = 0;
 
     char line[4096];
@@ -2066,9 +2084,10 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
             continue;
 
         if (prof->n_uprof_funcs >= cap) {
+            size_t old_sz = (size_t)cap * sizeof(*prof->uprof_funcs);
             cap *= 2;
-            prof->uprof_funcs = xrealloc(prof->uprof_funcs,
-                (size_t)cap * sizeof(*prof->uprof_funcs));
+            prof->uprof_funcs = arena_realloc(&prof->arena, prof->uprof_funcs,
+                old_sz, (size_t)cap * sizeof(*prof->uprof_funcs));
         }
         struct uprof_func *uf =
             &prof->uprof_funcs[prof->n_uprof_funcs++];
@@ -2098,7 +2117,7 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
     if (!sr->cs_ok) return 0;
 
     int cap = 16;
-    prof->mca_blocks = xmalloc((size_t)cap * sizeof(*prof->mca_blocks));
+    prof->mca_blocks = arena_alloc(&prof->arena, (size_t)cap * sizeof(*prof->mca_blocks));
     prof->n_mca_blocks = 0;
 
     /* Check if -mcpu=native works */
@@ -2243,9 +2262,10 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
 
         if (rthroughput > 0 || uops > 0) {
             if (prof->n_mca_blocks >= cap) {
+                size_t old_sz = (size_t)cap * sizeof(*prof->mca_blocks);
                 cap *= 2;
-                prof->mca_blocks = xrealloc(prof->mca_blocks,
-                    (size_t)cap * sizeof(*prof->mca_blocks));
+                prof->mca_blocks = arena_realloc(&prof->arena, prof->mca_blocks,
+                    old_sz, (size_t)cap * sizeof(*prof->mca_blocks));
             }
             struct mca_block *mb =
                 &prof->mca_blocks[prof->n_mca_blocks++];
@@ -2283,7 +2303,7 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
     }
 
     int cap = 16;
-    prof->layouts = xmalloc((size_t)cap * sizeof(*prof->layouts));
+    prof->layouts = arena_alloc(&prof->arena, (size_t)cap * sizeof(*prof->layouts));
     prof->n_layouts = 0;
 
     /* Skip known primitive types when probing pahole */
@@ -2397,9 +2417,10 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
             if (holes == 0 && cachelines <= 1) continue;
 
             if (prof->n_layouts >= cap) {
+                size_t old_sz = (size_t)cap * sizeof(*prof->layouts);
                 cap *= 2;
-                prof->layouts = xrealloc(prof->layouts,
-                    (size_t)cap * sizeof(*prof->layouts));
+                prof->layouts = arena_realloc(&prof->arena, prof->layouts,
+                    old_sz, (size_t)cap * sizeof(*prof->layouts));
             }
             struct struct_layout *sl =
                 &prof->layouts[prof->n_layouts++];
@@ -2609,7 +2630,7 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     if (n_src == 0) return 0;
 
     int cap = 64;
-    prof->remarks = xmalloc((size_t)cap * sizeof(*prof->remarks));
+    prof->remarks = arena_alloc(&prof->arena, (size_t)cap * sizeof(*prof->remarks));
     prof->n_remarks = 0;
 
     /* Try to read compile_commands.json */
@@ -2781,9 +2802,10 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                     if (func_remarks >= 10) break;
 
                     if (prof->n_remarks >= cap) {
+                        size_t old_sz = (size_t)cap * sizeof(*prof->remarks);
                         cap *= 2;
-                        prof->remarks = xrealloc(prof->remarks,
-                            (size_t)cap * sizeof(*prof->remarks));
+                        prof->remarks = arena_realloc(&prof->arena, prof->remarks,
+                            old_sz, (size_t)cap * sizeof(*prof->remarks));
                     }
                     struct remark_entry *re =
                         &prof->remarks[prof->n_remarks++];
@@ -3386,12 +3408,12 @@ static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
     prof->n_runs = n_runs;
 
     /* Allocate per-run stat arrays */
-    prof->rs_cycles.values         = xmalloc((size_t)n_runs * sizeof(double));
-    prof->rs_insns.values          = xmalloc((size_t)n_runs * sizeof(double));
-    prof->rs_ipc.values            = xmalloc((size_t)n_runs * sizeof(double));
-    prof->rs_wall.values           = xmalloc((size_t)n_runs * sizeof(double));
-    prof->rs_cache_miss_pct.values = xmalloc((size_t)n_runs * sizeof(double));
-    prof->rs_branch_miss_pct.values= xmalloc((size_t)n_runs * sizeof(double));
+    prof->rs_cycles.values         = arena_alloc(&prof->arena, (size_t)n_runs * sizeof(double));
+    prof->rs_insns.values          = arena_alloc(&prof->arena, (size_t)n_runs * sizeof(double));
+    prof->rs_ipc.values            = arena_alloc(&prof->arena, (size_t)n_runs * sizeof(double));
+    prof->rs_wall.values           = arena_alloc(&prof->arena, (size_t)n_runs * sizeof(double));
+    prof->rs_cache_miss_pct.values = arena_alloc(&prof->arena, (size_t)n_runs * sizeof(double));
+    prof->rs_branch_miss_pct.values= arena_alloc(&prof->arena, (size_t)n_runs * sizeof(double));
 
     int want_cm = (opts->cachemiss_mode >= 0);
 
@@ -4068,20 +4090,6 @@ static void print_comparison(struct perf_opts *opts,
 /* ── Cleanup ─────────────────────────────────────────────────────────── */
 
 static void free_profile(struct perf_profile *prof) {
-    free(prof->funcs);
-    free(prof->insns);
-    free(prof->uprof_funcs);
-    free(prof->mca_blocks);
-    free(prof->cm_sites);
-    free(prof->layouts);
-    free(prof->remarks);
-    free(prof->mem_hotspots);
-    free(prof->rs_cycles.values);
-    free(prof->rs_insns.values);
-    free(prof->rs_ipc.values);
-    free(prof->rs_wall.values);
-    free(prof->rs_cache_miss_pct.values);
-    free(prof->rs_branch_miss_pct.values);
     intern_destroy(&prof->strings);
     arena_destroy(&prof->arena);
 }
