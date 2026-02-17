@@ -2035,7 +2035,7 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     FILE *fp = fopen(csv_path, "r");
     if (!fp) return 0;
 
-    int cap = 16;
+    int cap = prof->n_funcs > 0 ? prof->n_funcs : 1;
     prof->uprof_funcs = arena_alloc(&prof->arena, (size_t)cap * sizeof(*prof->uprof_funcs));
     prof->n_uprof_funcs = 0;
 
@@ -2083,12 +2083,6 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
             &misaligned_pti) < 4)
             continue;
 
-        if (prof->n_uprof_funcs >= cap) {
-            size_t old_sz = (size_t)cap * sizeof(*prof->uprof_funcs);
-            cap *= 2;
-            prof->uprof_funcs = arena_realloc(&prof->arena, prof->uprof_funcs,
-                old_sz, (size_t)cap * sizeof(*prof->uprof_funcs));
-        }
         struct uprof_func *uf =
             &prof->uprof_funcs[prof->n_uprof_funcs++];
         uf->name = (char *)intern_str(&prof->strings, func_name);
@@ -2116,8 +2110,6 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
     }
     if (!sr->cs_ok) return 0;
 
-    int cap = 16;
-    prof->mca_blocks = arena_alloc(&prof->arena, (size_t)cap * sizeof(*prof->mca_blocks));
     prof->n_mca_blocks = 0;
 
     /* Check if -mcpu=native works */
@@ -2130,6 +2122,8 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
 
     int limit = prof->n_funcs < opts->top_n ?
                 prof->n_funcs : opts->top_n;
+    int mca_cap = limit > 0 ? limit : 1;
+    prof->mca_blocks = arena_alloc(&prof->arena, (size_t)mca_cap * sizeof(*prof->mca_blocks));
 
     for (int f = 0; f < limit; f++) {
         const char *raw_name = prof->funcs[f].name;
@@ -2261,12 +2255,6 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
         free(mca_out);
 
         if (rthroughput > 0 || uops > 0) {
-            if (prof->n_mca_blocks >= cap) {
-                size_t old_sz = (size_t)cap * sizeof(*prof->mca_blocks);
-                cap *= 2;
-                prof->mca_blocks = arena_realloc(&prof->arena, prof->mca_blocks,
-                    old_sz, (size_t)cap * sizeof(*prof->mca_blocks));
-            }
             struct mca_block *mb =
                 &prof->mca_blocks[prof->n_mca_blocks++];
             mb->func_name = (char *)intern_str(&prof->strings,
@@ -2629,8 +2617,8 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     }
     if (n_src == 0) return 0;
 
-    int cap = 64;
-    prof->remarks = arena_alloc(&prof->arena, (size_t)cap * sizeof(*prof->remarks));
+    int remark_cap = prof->n_funcs * 10;
+    prof->remarks = arena_alloc(&prof->arena, (size_t)remark_cap * sizeof(*prof->remarks));
     prof->n_remarks = 0;
 
     /* Try to read compile_commands.json */
@@ -2801,12 +2789,6 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                     }
                     if (func_remarks >= 10) break;
 
-                    if (prof->n_remarks >= cap) {
-                        size_t old_sz = (size_t)cap * sizeof(*prof->remarks);
-                        cap *= 2;
-                        prof->remarks = arena_realloc(&prof->arena, prof->remarks,
-                            old_sz, (size_t)cap * sizeof(*prof->remarks));
-                    }
                     struct remark_entry *re =
                         &prof->remarks[prof->n_remarks++];
                     re->func_name = (char *)intern_str(&prof->strings,
