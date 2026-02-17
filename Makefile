@@ -65,11 +65,14 @@ bench_512: bench_backend.c simd_map64.h
 bench_avx2: bench_backend.c simd_map64.h
 	$(CC) $(BENCH_CFLAGS) -mno-avx512f -mno-avx512bw -o $@ bench_backend.c -lm
 
-bench_compare: bench_512 bench_avx2
-	@echo "=== AVX-512 ===" && ./bench_512 && echo && echo "=== AVX2 ===" && ./bench_avx2
+bench_scalar: bench_backend.c simd_map64.h
+	$(CC) $(BENCH_CFLAGS) -mno-avx512f -mno-avx512bw -mno-avx2 -mno-sse4.2 -o $@ bench_backend.c -lm
+
+bench_compare: bench_512 bench_avx2 bench_scalar
+	@echo "=== AVX-512 ===" && ./bench_512 && echo && echo "=== AVX2 ===" && ./bench_avx2 && echo && echo "=== Scalar ===" && ./bench_scalar
 
 clean:
-	rm -f $(TARGET) test_hashmap test_hashmap_c.o test_hashmap_cpp.o bench_512 bench_avx2
+	rm -f $(TARGET) test_hashmap test_hashmap_c.o test_hashmap_cpp.o bench_512 bench_avx2 bench_scalar
 
 vendor-clean:
 	rm -rf vendor

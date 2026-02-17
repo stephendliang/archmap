@@ -1,13 +1,16 @@
-/* simd_map64: Zero-metadata direct-key SIMD hash set for uint64_t
+/* simd_map64: Zero-metadata direct-key hash set for uint64_t
 
 Header-only. Keys stored directly in 8-wide groups (one cache line).
-SIMD compares all 8 keys at once — zero false positives, no metadata,
+Compares all 8 keys at once — zero false positives, no metadata,
 no scalar verification. Key=0 reserved as empty sentinel.
 
-Backends: AVX-512 (1 instruction per group) or AVX2 (5 instructions). */
+Backends: AVX-512 (1 instr/group), AVX2 (5 instr), Scalar (portable). */
 #pragma once
 
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
+#endif
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,12 +27,24 @@ struct simd_map64 {
     uint32_t mask;      // (cap >> 3) - 1
 };
 
-// hash: CRC32 integer mixer
-#define sm64_hash(key) ((uint32_t)_mm_crc32_u64(0, (key)))
-
 /* ================================================================
  * Backend selection — only #ifdef in the file
  * ================================================================ */
+
+// hash: CRC32 on SIMD paths (SSE4.2, always present with AVX2+),
+// murmur3 finalizer on scalar path
+#if defined(__AVX512F__) || defined(__AVX2__)
+#define sm64_hash(key) ((uint32_t)_mm_crc32_u64(0, (key)))
+#else
+static inline uint32_t sm64_hash(uint64_t key) {
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
+    return (uint32_t)key;
+}
+#endif
 
 #if defined(__AVX512F__)
 
@@ -40,6 +55,8 @@ struct simd_map64 {
 #define sm64_empty(grp) \
     _mm512_cmpeq_epi64_mask(_mm512_load_si512((const __m512i *)(grp)), \
                             _mm512_setzero_si512())
+
+#define sm64_prefetch_line(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T0)
 
 #elif defined(__AVX2__)
 
@@ -61,8 +78,26 @@ static inline uint8_t sm64_empty(const uint64_t *grp) {
     return (uint8_t)(mlo | (mhi << 4));
 }
 
-#else
-#error "simd_map64 requires AVX2 or AVX-512"
+#define sm64_prefetch_line(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T0)
+
+#else /* Scalar backend — portable, no ISA requirements beyond C11 */
+
+static inline uint8_t sm64_match(const uint64_t *grp, uint64_t key) {
+    uint8_t m = 0;
+    for (int i = 0; i < 8; i++)
+        m |= (uint8_t)((grp[i] == key) << i);
+    return m;
+}
+
+static inline uint8_t sm64_empty(const uint64_t *grp) {
+    uint8_t m = 0;
+    for (int i = 0; i < 8; i++)
+        m |= (uint8_t)((grp[i] == 0) << i);
+    return m;
+}
+
+#define sm64_prefetch_line(ptr) __builtin_prefetch((const void *)(ptr), 0, 3)
+
 #endif
 
 /* ================================================================
@@ -72,15 +107,15 @@ static inline uint8_t sm64_empty(const uint64_t *grp) {
 // prefetch home group
 #define simd_map64_prefetch(m, key) do { \
     uint32_t gi_ = sm64_hash(key) & (m)->mask; \
-    _mm_prefetch((const char *)((m)->keys + (gi_ << 3)), _MM_HINT_T0); \
+    sm64_prefetch_line((m)->keys + (gi_ << 3)); \
 } while (0)
 
 // prefetch home + overflow group
 static inline void simd_map64_prefetch2(struct simd_map64 *m, uint64_t key) {
     uint32_t gi = sm64_hash(key) & m->mask;
-    _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
+    sm64_prefetch_line(m->keys + (gi << 3));
     gi = (gi + 1) & m->mask;
-    _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
+    sm64_prefetch_line(m->keys + (gi << 3));
 }
 
 // round byte size up to 2MB
@@ -171,7 +206,7 @@ static inline void sm64_backshift_at(struct simd_map64 *m, uint32_t gi, int slot
 
     for (;;) {
         uint32_t pf_gi = (scan_gi + 2) & mask;
-        _mm_prefetch((const char *)(m->keys + (pf_gi << 3)), _MM_HINT_T0);
+        sm64_prefetch_line(m->keys + (pf_gi << 3));
 
         uint64_t *scan_grp = m->keys + (scan_gi << 3);
         uint8_t scan_empty = sm64_empty(scan_grp);

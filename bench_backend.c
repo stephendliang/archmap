@@ -27,8 +27,10 @@
 
 #if defined(__AVX512F__)
 #define BACKEND_NAME "AVX-512"
-#else
+#elif defined(__AVX2__)
 #define BACKEND_NAME "AVX2"
+#else
+#define BACKEND_NAME "Scalar"
 #endif
 
 /* ================================================================
