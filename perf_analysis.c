@@ -258,19 +258,19 @@ static void intern_destroy(struct intern_table *t) {
 struct perf_profile {
     struct perf_stats stats;
     struct hot_func *funcs;
-    int n_funcs;
     struct hot_insn *insns;
-    int n_insns;
     struct uprof_func *uprof_funcs;
-    int n_uprof_funcs;
+    struct mca_block *mca_blocks;
+    struct cache_miss_site *cm_sites;
+    struct mem_hotspot *mem_hotspots;
+    struct struct_layout *layouts;
+    struct remark_entry *remarks;
+    int n_funcs, n_insns;
+    int n_uprof_funcs, n_mca_blocks;
+    int n_cm_sites, n_mem_hotspots;
+    int n_layouts, n_remarks;
+    int has_topdown, n_runs;
     struct topdown_metrics topdown;
-    int has_topdown;
-    struct mca_block *mca_blocks;    int n_mca_blocks;
-    struct cache_miss_site *cm_sites; int n_cm_sites;
-    struct mem_hotspot *mem_hotspots; int n_mem_hotspots;
-    struct struct_layout *layouts;    int n_layouts;
-    struct remark_entry *remarks;    int n_remarks;
-    int n_runs;
     struct run_stats rs_cycles, rs_insns, rs_ipc, rs_wall;
     struct run_stats rs_cache_miss_pct, rs_branch_miss_pct;
     struct arena arena;
@@ -282,7 +282,6 @@ struct perf_profile {
 struct perf_opts {
     int top_n;
     int insns_n;
-    const char *build_cmd;
     int no_build;
     int uprof_mode;       /* 1=force, -1=skip, 0=auto */
     int topdown_mode;     /* 0=auto, 1=force, -1=skip */
@@ -290,11 +289,12 @@ struct perf_opts {
     int cachemiss_mode;
     int pahole_mode;
     int remarks_mode;     /* 0=auto, 1=force, -1=skip */
-    const char *source_dir;
     int verbose;
     int n_runs;           /* 0=auto (1 for single, 5 for A/B), >0=explicit */
-    char **cmd_argv;
     int cmd_argc;
+    const char *build_cmd;
+    const char *source_dir;
+    char **cmd_argv;
     char *binary_path;
     char *cmd_str;
     const char *vs_binary;

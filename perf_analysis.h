@@ -75,10 +75,10 @@ struct hot_func {
     uint64_t samples;
     char *skeleton_sig;
     char *source_file;
-    uint32_t start_line, end_line;
     char **callees;
-    int n_callees;
     struct caller_entry *callers;
+    uint32_t start_line, end_line;
+    int n_callees;
     int n_callers;
 };
 
@@ -87,8 +87,8 @@ struct hot_insn {
     uint64_t addr;
     double pct;
     char *asm_text;
-    uint32_t source_line;
     char *source_file;
+    uint32_t source_line;
 };
 
 struct uprof_func {
@@ -108,17 +108,17 @@ struct mca_block {
     char *func_name;
     double block_rthroughput; /* cycles per iteration */
     double ipc;
-    int n_uops;
     char *bottleneck;         /* e.g. "RetireOOO", "Dispatch" */
+    int n_uops;
 };
 
 struct cache_miss_site {
     char *func_name;
-    uint32_t source_line;
     double pct;               /* % of total cache-miss samples */
     char *asm_text;
     char *source_file;
     uint64_t data_addr;       /* data virtual address (0 if unavailable) */
+    uint32_t source_line;
 };
 
 struct struct_layout {
@@ -133,25 +133,25 @@ struct struct_layout {
 struct remark_entry {
     char *func_name;
     char *source_file;
-    uint32_t line;
     char *category;    /* "optimized" or "missed" */
     char *message;
+    uint32_t line;
 };
 
 struct mem_hotspot {
     char *func_name;
-    uint32_t source_line;
     char *source_file;
     char *asm_text;
     uint64_t cache_line;    /* data_addr >> 6 */
     double pct;             /* % of total cache-miss samples with ADDR */
+    uint32_t source_line;
     int n_samples;          /* raw sample count */
 };
 
 struct run_stats {
     double mean, stddev;
-    int n;
     double *values;         /* raw values from each run */
+    int n;
 };
 
 /* ── Entry point ───────────────────────────────────────────────────── */
