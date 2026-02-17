@@ -1,7 +1,10 @@
 /* perf_analysis.c — Performance analysis pipeline for archmap
  *
- * Pipeline: build → profile (perf stat/record/annotate, AMDuProf) →
+ * Pipeline: build → profile (direct perf_event_open + libdwfl + capstone) →
  *           skeleton cross-reference → compact report
+ *
+ * Single execution per profile: counters, sampling, and topdown all run
+ * simultaneously on the same fork+exec child via perf_event_open().
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -17,17 +20,34 @@
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/personality.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <time.h>
+
+#include <linux/perf_event.h>
+#include <perfmon/pfmlib_perf_event.h>
+#include <elfutils/libdwfl.h>
+#include <libelf.h>
+#include <gelf.h>
+#include <capstone/capstone.h>
 
 #include <tree_sitter/api.h>
 #include "perf_analysis.h"
 #include "git_cache.h"
+
+#ifndef PERF_FLAG_FD_CLOEXEC
+#define PERF_FLAG_FD_CLOEXEC (1UL << 3)
+#endif
 
 /* ── Options ─────────────────────────────────────────────────────────── */
 
 struct perf_opts {
     int top_n;
     int insns_n;
-    int runs;
     const char *build_cmd;
     int no_build;
     int uprof_mode;       /* 1=force, -1=skip, 0=auto */
@@ -65,7 +85,6 @@ enum {
 static struct option perf_long_options[] = {
     {"top",       required_argument, NULL, 'n'},
     {"insns",     required_argument, NULL, 'i'},
-    {"runs",      required_argument, NULL, 'r'},
     {"build-cmd", required_argument, NULL, 'b'},
     {"no-build",  no_argument,       NULL, PERF_OPT_NO_BUILD},
     {"uprof",          no_argument,       NULL, PERF_OPT_UPROF},
@@ -93,7 +112,6 @@ static void perf_usage(const char *prog) {
         "Options:\n"
         "  -n, --top N          Top N hot functions (default 10)\n"
         "  -i, --insns N        Hot instructions per function (default 10)\n"
-        "  -r, --runs N         perf stat repetitions (default 3)\n"
         "  -b, --build-cmd CMD  Build command (default \"make\")\n"
         "  --no-build           Skip build\n"
         "  --uprof              Force AMDuProf\n"
@@ -203,21 +221,31 @@ static void strip_compiler_suffix(char *name) {
 }
 
 static char *resolve_binary(const char *name) {
+    /* Absolute or relative path */
     if (name[0] == '/' || name[0] == '.') {
         char *real = realpath(name, NULL);
         if (real) return real;
     }
-    char cmd[PATH_MAX + 32];
-    snprintf(cmd, sizeof(cmd), "which '%s' 2>/dev/null", name);
-    int status;
-    char *out = run_cmd(cmd, &status, 0);
-    if (status == 0 && out && out[0]) {
-        size_t len = strlen(out);
-        while (len > 0 && (out[len-1] == '\n' || out[len-1] == '\r'))
-            out[--len] = '\0';
-        return out;
+    /* Search PATH */
+    const char *path_env = getenv("PATH");
+    if (path_env) {
+        char buf[PATH_MAX];
+        const char *p = path_env;
+        while (*p) {
+            const char *end = strchr(p, ':');
+            size_t dlen = end ? (size_t)(end - p) : strlen(p);
+            if (dlen > 0 && dlen + 1 + strlen(name) < PATH_MAX) {
+                memcpy(buf, p, dlen);
+                buf[dlen] = '/';
+                strcpy(buf + dlen + 1, name);
+                if (access(buf, X_OK) == 0) {
+                    char *real = realpath(buf, NULL);
+                    return real ? real : strdup(buf);
+                }
+            }
+            if (end) p = end + 1; else break;
+        }
     }
-    free(out);
     return strdup(name);
 }
 
@@ -234,17 +262,6 @@ static int check_perf_access(void) {
         return -1;
     }
     return 0;
-}
-
-static int check_debug_symbols(const char *binary) {
-    char cmd[PATH_MAX + 64];
-    snprintf(cmd, sizeof(cmd),
-        "readelf -S '%s' 2>/dev/null", binary);
-    int status;
-    char *out = run_cmd(cmd, &status, 0);
-    int has_debug = (out && strstr(out, ".debug_info") != NULL);
-    free(out);
-    return has_debug;
 }
 
 static int has_tool(const char *name) {
@@ -289,163 +306,6 @@ static const char *find_tool(const char *name) {
     return NULL;
 }
 
-/* ── Phase 1: Build ──────────────────────────────────────────────────── */
-
-static int phase_build(struct perf_opts *opts) {
-    if (opts->no_build) return 0;
-    fprintf(stderr, "building: %s\n", opts->build_cmd);
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "%s 2>&1", opts->build_cmd);
-    int status;
-    char *out = run_cmd(cmd, &status, opts->verbose);
-    if (status != 0) {
-        fprintf(stderr, "build failed (exit %d):\n%s\n", status, out ? out : "");
-        free(out);
-        return -1;
-    }
-    free(out);
-    return 0;
-}
-
-/* ── Phase 2a: perf stat ─────────────────────────────────────────────── */
-
-static int run_perf_stat(struct perf_opts *opts, struct perf_stats *stats) {
-    memset(stats, 0, sizeof(*stats));
-
-    char cmd[4096];
-    /* 2>&1 1>/dev/null: capture perf's stderr (CSV data) via pipe,
-       suppress profiled command's stdout */
-    snprintf(cmd, sizeof(cmd),
-        "perf stat -e duration_time,cycles,instructions,"
-        "cache-references,cache-misses,branches,branch-misses "
-        "-x ',' -r %d -- %s 2>&1 1>/dev/null",
-        opts->runs, opts->cmd_str);
-
-    int status;
-    char *out = run_cmd(cmd, &status, opts->verbose);
-    if (!out) { fprintf(stderr, "perf stat failed to launch\n"); return -1; }
-
-    /* Parse CSV lines: value,,event_name,time_running,pct,, */
-    char *line = out;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        uint64_t val;
-        char event[128];
-        if (sscanf(line, "%" SCNu64 ",,%127[^,]", &val, event) >= 2) {
-            if (strstr(event, "duration_time"))
-                stats->wall_seconds = val / 1e9;
-            else if (strstr(event, "branch-misses"))
-                stats->branch_misses = val;
-            else if (strstr(event, "cache-misses"))
-                stats->cache_misses = val;
-            else if (strstr(event, "cache-references"))
-                stats->cache_refs = val;
-            else if (strstr(event, "instructions"))
-                stats->instructions = val;
-            else if (strstr(event, "cycles") &&
-                     !strstr(event, "stalled"))
-                stats->cycles = val;
-            else if (strstr(event, "branches") &&
-                     !strstr(event, "branch-misses"))
-                stats->branches = val;
-        }
-
-        line = nl ? nl + 1 : NULL;
-    }
-    free(out);
-
-    if (stats->cycles > 0)
-        stats->ipc = (double)stats->instructions / stats->cycles;
-    if (stats->cache_refs > 0)
-        stats->cache_miss_pct =
-            100.0 * stats->cache_misses / stats->cache_refs;
-    if (stats->branches > 0)
-        stats->branch_miss_pct =
-            100.0 * stats->branch_misses / stats->branches;
-
-    return 0;
-}
-
-/* ── Phase 2b: perf record + report ──────────────────────────────────── */
-
-static int run_perf_record(struct perf_opts *opts) {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "perf record -g --call-graph dwarf "
-        "-o '%s/perf.data' -- %s 2>&1 1>/dev/null",
-        g_tmpdir, opts->cmd_str);
-
-    int status;
-    char *out = run_cmd(cmd, &status, opts->verbose);
-    free(out);
-
-    /* perf record passes through the profiled command's exit code.
-       Check if perf.data was actually created instead. */
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/perf.data", g_tmpdir);
-    if (access(path, F_OK) != 0) {
-        fprintf(stderr, "perf record failed — no perf.data created\n");
-        return -1;
-    }
-    return 0;
-}
-
-static int parse_perf_report(struct perf_opts *opts, struct perf_profile *prof) {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "perf report --stdio --no-children --percent-limit 0.5 "
-        "-i '%s/perf.data' 2>/dev/null",
-        g_tmpdir);
-
-    int status;
-    char *out = run_cmd(cmd, &status, opts->verbose);
-    if (!out) return -1;
-
-    int cap = 32;
-    prof->funcs = malloc((size_t)cap * sizeof(*prof->funcs));
-    prof->n_funcs = 0;
-
-    char *line = out;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        /* Match: " 45.23%  cmd  obj  [.] func_name" */
-        char *bracket = strstr(line, "[.] ");
-        if (bracket) {
-            double pct;
-            if (sscanf(line, " %lf%%", &pct) == 1) {
-                char *name = bracket + 4;
-                size_t nlen = strlen(name);
-                while (nlen > 0 &&
-                       (name[nlen-1] == ' ' || name[nlen-1] == '\n'))
-                    nlen--;
-
-                if (nlen > 0 && prof->n_funcs < opts->top_n) {
-                    if (prof->n_funcs >= cap) {
-                        cap *= 2;
-                        prof->funcs = realloc(prof->funcs,
-                            (size_t)cap * sizeof(*prof->funcs));
-                    }
-                    struct hot_func *hf =
-                        &prof->funcs[prof->n_funcs++];
-                    memset(hf, 0, sizeof(*hf));
-                    hf->name = strndup(name, nlen);
-                    hf->overhead_pct = pct;
-                }
-            }
-        }
-
-        line = nl ? nl + 1 : NULL;
-    }
-    free(out);
-    return 0;
-}
-
-/* ── Phase 2b2: caller context ───────────────────────────────────────── */
-
 /* Names that are too generic to be useful as "caller" */
 static int is_boring_caller(const char *name) {
     if (name[0] == '0' && name[1] == 'x') return 1; /* hex address */
@@ -457,23 +317,6 @@ static int is_boring_caller(const char *name) {
     for (const char **b = boring; *b; b++)
         if (strcmp(name, *b) == 0) return 1;
     return 0;
-}
-
-/* Extract a clean function name from a tree line.
-   Returns pointer into 'buf' or NULL.  Strips " (inlined)" suffix. */
-static char *extract_tree_name(const char *raw, char *buf, size_t bufsz) {
-    const char *p = raw;
-    while (*p == ' ' || *p == '\t' || *p == '|') p++;
-    if (!*p || *p == '#' || *p == '\n') return NULL;
-    size_t len = strlen(p);
-    while (len > 0 && (p[len-1] == ' ' || p[len-1] == '\n')) len--;
-    /* Strip " (inlined)" suffix */
-    if (len > 10 && strncmp(p + len - 10, " (inlined)", 10) == 0)
-        len -= 10;
-    if (len == 0 || len >= bufsz) return NULL;
-    memcpy(buf, p, len);
-    buf[len] = '\0';
-    return buf;
 }
 
 static void add_caller_entry(struct hot_func *hf, const char *name, double pct) {
@@ -501,274 +344,1166 @@ static void add_caller_entry(struct hot_func *hf, const char *name, double pct) 
     hf->n_callers++;
 }
 
-static int parse_callers(struct perf_opts *opts, struct perf_profile *prof) {
-    if (prof->n_funcs == 0) return 0;
+/* ── Phase 1: Build ──────────────────────────────────────────────────── */
 
+static int phase_build(struct perf_opts *opts) {
+    if (opts->no_build) return 0;
+    fprintf(stderr, "building: %s\n", opts->build_cmd);
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "perf report --stdio -g caller --no-children "
-        "--percent-limit 0.5 -i '%s/perf.data' 2>/dev/null",
-        g_tmpdir);
-
+    snprintf(cmd, sizeof(cmd), "%s 2>&1", opts->build_cmd);
     int status;
     char *out = run_cmd(cmd, &status, opts->verbose);
-    if (!out) return -1;
+    if (status != 0) {
+        fprintf(stderr, "build failed (exit %d):\n%s\n", status, out ? out : "");
+        free(out);
+        return -1;
+    }
+    free(out);
+    return 0;
+}
 
-    /*
-     * perf report -g caller output formats:
-     *
-     * Multi-caller (branching at depth-1):
-     *   XX.XX%  cmd  obj  [.] FUNC
-     *           |--10.22%--bench_full_response
-     *           |          hpack_decode (inlined)
-     *           |          ...
-     *            --8.57%--bench_decode
-     *                      hpack_decode (inlined)
-     *
-     * Single-chain (100% from one path):
-     *   XX.XX%  cmd  obj  [.] FUNC
-     *           ---_start
-     *              __libc_start_main
-     *              main
-     *              bench_huffman_pair
-     *              hpack_huff_decode (inlined)
-     *
-     * Strategy:
-     * 1. Match function header [.] FUNC_NAME
-     * 2. Look for depth-1 entries:
-     *    a. |--XX%--NAME or --XX%--NAME → caller with percentage
-     *    b. ---NAME → single chain (100%)
-     * 3. For boring depth-1 names, follow chain to find better name.
-     *    "Better" = last non-boring name before self or a sub-branch.
-     * 4. Record column of first depth-1 to distinguish sub-branches.
-     */
-    int cur_func = -1;
-    int depth1_col = -1;     /* column of '--' for depth-1 entries */
-    int in_chain = 0;        /* inside a chain after depth-1 entry */
-    double chain_pct = 0;    /* pct for current chain */
-    char chain_best[256];    /* best (non-boring) name seen in chain */
-    char nbuf[256];
+/* ── Raw sample structure ────────────────────────────────────────────── */
 
-    char *line = out;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
+struct raw_sample {
+    uint64_t ip;
+    uint64_t *ips;      /* callchain IPs (NULL if no callchain) */
+    int n_ips;
+};
 
-        /* Function header: " XX.XX%  cmd  obj  [.] func_name" */
-        char *bracket = strstr(line, "[.] ");
-        if (bracket) {
-            /* Flush any pending chain */
-            if (in_chain && cur_func >= 0 && chain_best[0])
-                add_caller_entry(&prof->funcs[cur_func],
-                                 chain_best, chain_pct);
-            cur_func = -1;
-            depth1_col = -1;
-            in_chain = 0;
-            char *name = bracket + 4;
-            size_t nlen = strlen(name);
-            while (nlen > 0 &&
-                   (name[nlen-1] == ' ' || name[nlen-1] == '\n'))
-                nlen--;
-            for (int f = 0; f < prof->n_funcs; f++) {
-                if (strlen(prof->funcs[f].name) == nlen &&
-                    strncmp(prof->funcs[f].name, name, nlen) == 0) {
-                    cur_func = f;
-                    break;
+static void free_raw_samples(struct raw_sample *samples, int n) {
+    if (!samples) return;
+    for (int i = 0; i < n; i++)
+        free(samples[i].ips);
+    free(samples);
+}
+
+/* ── Counters — replaces run_perf_stat() ──────────────────────────────
+   Each counter is opened independently (no PERF_FORMAT_GROUP) so the
+   kernel can multiplex them individually alongside sampling events.
+   A 6-event group would monopolise all 6 GP PMU counters on AMD Zen,
+   leaving no room for sampling events and causing the instruction
+   counter to return bogus values under heavy multiplexing. */
+
+#define N_COUNTERS 6
+
+struct counter_group { int fds[N_COUNTERS]; };
+
+struct counter_single_read {
+    uint64_t value;
+    uint64_t time_enabled;
+    uint64_t time_running;
+};
+
+static int counters_open(pid_t child, struct counter_group *cg) {
+    static const uint64_t events[N_COUNTERS] = {
+        PERF_COUNT_HW_CPU_CYCLES,
+        PERF_COUNT_HW_INSTRUCTIONS,
+        PERF_COUNT_HW_CACHE_REFERENCES,
+        PERF_COUNT_HW_CACHE_MISSES,
+        PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
+        PERF_COUNT_HW_BRANCH_MISSES,
+    };
+
+    for (int i = 0; i < N_COUNTERS; i++) cg->fds[i] = -1;
+
+    for (int i = 0; i < N_COUNTERS; i++) {
+        struct perf_event_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.type = PERF_TYPE_HARDWARE;
+        attr.size = sizeof(attr);
+        attr.config = events[i];
+        attr.exclude_kernel = 1;
+        attr.exclude_hv = 1;
+        attr.disabled = 1;
+        attr.enable_on_exec = 1;
+        attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+                           PERF_FORMAT_TOTAL_TIME_RUNNING;
+
+        cg->fds[i] = (int)syscall(SYS_perf_event_open, &attr, child,
+                                   -1, -1, PERF_FLAG_FD_CLOEXEC);
+        if (cg->fds[i] < 0) {
+            fprintf(stderr, "warning: perf_event_open counter %d: %s\n",
+                    i, strerror(errno));
+            /* Non-fatal: leave fd as -1, read will skip it */
+        }
+    }
+    /* At minimum we need cycles (fd[0]) */
+    return (cg->fds[0] >= 0) ? 0 : -1;
+}
+
+static uint64_t read_one_counter(int fd) {
+    if (fd < 0) return 0;
+    struct counter_single_read d;
+    if (read(fd, &d, sizeof(d)) < (ssize_t)sizeof(d)) return 0;
+    if (d.time_running == 0) return 0;
+    /* If the counter ran less than 5% of the time, the scaled value is
+       unreliable (small noise × large scale = garbage).  Report 0. */
+    if (d.time_running * 20 < d.time_enabled) return 0;
+    return (uint64_t)((double)d.value *
+                      (double)d.time_enabled / (double)d.time_running);
+}
+
+static int counters_read(struct counter_group *cg, struct perf_stats *stats) {
+    memset(stats, 0, sizeof(*stats));
+    if (cg->fds[0] < 0) return -1;
+
+    stats->cycles       = read_one_counter(cg->fds[0]);
+    stats->instructions = read_one_counter(cg->fds[1]);
+    stats->cache_refs   = read_one_counter(cg->fds[2]);
+    stats->cache_misses = read_one_counter(cg->fds[3]);
+    stats->branches     = read_one_counter(cg->fds[4]);
+    stats->branch_misses = read_one_counter(cg->fds[5]);
+
+    if (stats->cycles > 0)
+        stats->ipc = (double)stats->instructions / stats->cycles;
+    if (stats->cache_refs > 0)
+        stats->cache_miss_pct =
+            100.0 * stats->cache_misses / stats->cache_refs;
+    if (stats->branches > 0)
+        stats->branch_miss_pct =
+            100.0 * stats->branch_misses / stats->branches;
+
+    return 0;
+}
+
+static void counters_close(struct counter_group *cg) {
+    for (int i = 0; i < N_COUNTERS; i++) {
+        if (cg->fds[i] >= 0) close(cg->fds[i]);
+        cg->fds[i] = -1;
+    }
+}
+
+/* ── Topdown group — replaces run_topdown_intel/amd() ────────────────── */
+
+#define MAX_TOPDOWN 4
+
+struct topdown_group {
+    int fds[MAX_TOPDOWN];
+    int n_events;
+    int is_intel;
+};
+
+static int topdown_try_events(pid_t child, struct topdown_group *tg,
+                               const char **event_names, int n_events,
+                               int is_intel) {
+    for (int i = 0; i < MAX_TOPDOWN; i++) tg->fds[i] = -1;
+    tg->n_events = 0;
+    tg->is_intel = is_intel;
+
+    for (int i = 0; i < n_events && i < MAX_TOPDOWN; i++) {
+        struct perf_event_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.size = sizeof(attr);
+
+        pfm_perf_encode_arg_t arg;
+        memset(&arg, 0, sizeof(arg));
+        arg.attr = &attr;
+        arg.size = sizeof(arg);
+
+        int ret = pfm_get_os_event_encoding(event_names[i],
+                      PFM_PLM3, PFM_OS_PERF_EVENT, &arg);
+        if (ret != PFM_SUCCESS) {
+            for (int j = 0; j < i; j++) { close(tg->fds[j]); tg->fds[j] = -1; }
+            tg->n_events = 0;
+            return -1;
+        }
+
+        attr.exclude_kernel = 1;
+        attr.exclude_hv = 1;
+        if (i == 0) {
+            attr.disabled = 1;
+            attr.enable_on_exec = 1;
+            attr.read_format = PERF_FORMAT_GROUP;
+        }
+
+        int group_fd = (i == 0) ? -1 : tg->fds[0];
+        tg->fds[i] = (int)syscall(SYS_perf_event_open, &attr, child,
+                                   -1, group_fd, PERF_FLAG_FD_CLOEXEC);
+        if (tg->fds[i] < 0) {
+            for (int j = 0; j < i; j++) { close(tg->fds[j]); tg->fds[j] = -1; }
+            tg->n_events = 0;
+            return -1;
+        }
+        tg->n_events++;
+    }
+    return 0;
+}
+
+static int topdown_open(pid_t child, struct topdown_group *tg, int mode) {
+    memset(tg, 0, sizeof(*tg));
+    for (int i = 0; i < MAX_TOPDOWN; i++) tg->fds[i] = -1;
+    if (mode < 0) return -1;
+
+    pfm_initialize();
+
+    /* Try Intel topdown events */
+    static const char *intel_events[] = {
+        "TOPDOWN_RETIRING:u",
+        "TOPDOWN_BAD_SPEC:u",
+        "TOPDOWN_FE_BOUND:u",
+        "TOPDOWN_BE_BOUND:u",
+    };
+    if (topdown_try_events(child, tg, intel_events, 4, 1) == 0)
+        return 0;
+
+    /* Try AMD Zen dispatch events */
+    static const char *amd_events[] = {
+        "de_src_op_disp.all:u",
+        "de_no_dispatch_per_slot.backend_stalls:u",
+        "de_no_dispatch_per_slot.no_ops_from_frontend:u",
+        "de_no_dispatch_per_slot.smt_contention:u",
+    };
+    if (topdown_try_events(child, tg, amd_events, 4, 0) == 0)
+        return 0;
+
+    if (mode > 0)
+        fprintf(stderr,
+            "error: --topdown specified but no topdown events "
+            "available (need Intel Icelake+ or AMD Zen)\n");
+    return -1;
+}
+
+static int topdown_read(struct topdown_group *tg, struct topdown_metrics *td) {
+    memset(td, 0, sizeof(*td));
+    if (tg->fds[0] < 0 || tg->n_events == 0) return -1;
+
+    struct {
+        uint64_t nr;
+        uint64_t values[MAX_TOPDOWN];
+    } data;
+
+    size_t expect = sizeof(uint64_t) * (1 + (unsigned)tg->n_events);
+    ssize_t n = read(tg->fds[0], &data, expect);
+    if (n < (ssize_t)expect) return -1;
+
+    td->level = 1;
+
+    if (tg->is_intel) {
+        uint64_t total = 0;
+        for (int i = 0; i < tg->n_events; i++)
+            total += data.values[i];
+        if (total == 0) return -1;
+        td->retiring = 100.0 * data.values[0] / total;
+        td->bad_spec = 100.0 * data.values[1] / total;
+        td->frontend = 100.0 * data.values[2] / total;
+        td->backend  = 100.0 * data.values[3] / total;
+    } else {
+        /* AMD: dispatched + backend + frontend + smt = total slots */
+        uint64_t dispatched = data.values[0];
+        uint64_t be = data.values[1];
+        uint64_t fe = data.values[2];
+        uint64_t smt = data.values[3];
+        uint64_t total = dispatched + be + fe + smt;
+        if (total == 0) return -1;
+        td->retiring = 100.0 * dispatched / total;
+        td->backend  = 100.0 * be / total;
+        td->frontend = 100.0 * (fe + smt) / total;
+        td->bad_spec = 0;
+    }
+    return 0;
+}
+
+static void topdown_close(struct topdown_group *tg) {
+    for (int i = 0; i < tg->n_events; i++) {
+        if (tg->fds[i] >= 0) close(tg->fds[i]);
+        tg->fds[i] = -1;
+    }
+    tg->n_events = 0;
+}
+
+/* ── Sampling ring buffers — replaces run_perf_record + cache-miss ───── */
+
+#define RING_PAGES 512  /* (1 + 512) pages ≈ 2 MB per ring */
+
+struct sample_ring {
+    int fd;
+    void *mmap_base;
+    size_t mmap_size;
+};
+
+struct sampling_ctx {
+    struct sample_ring cycles;
+    struct sample_ring cache_misses;
+};
+
+static int ring_open(pid_t child, struct sample_ring *ring,
+                     uint64_t event_config, uint64_t sample_period,
+                     uint64_t sample_type) {
+    ring->fd = -1;
+    ring->mmap_base = MAP_FAILED;
+    ring->mmap_size = 0;
+
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_HARDWARE;
+    attr.size = sizeof(attr);
+    attr.config = event_config;
+    attr.sample_period = sample_period;
+    attr.sample_type = sample_type;
+    attr.disabled = 1;
+    attr.enable_on_exec = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    if (sample_type & PERF_SAMPLE_CALLCHAIN)
+        attr.exclude_callchain_kernel = 1;
+
+    ring->fd = (int)syscall(SYS_perf_event_open, &attr, child,
+                            -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (ring->fd < 0) return -1;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    ring->mmap_size = (size_t)(1 + RING_PAGES) * (size_t)page_size;
+    ring->mmap_base = mmap(NULL, ring->mmap_size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, ring->fd, 0);
+    if (ring->mmap_base == MAP_FAILED) {
+        close(ring->fd);
+        ring->fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static int sampling_open(pid_t child, struct sampling_ctx *ctx,
+                          int want_cache_misses) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cycles.fd = -1;
+    ctx->cycles.mmap_base = MAP_FAILED;
+    ctx->cache_misses.fd = -1;
+    ctx->cache_misses.mmap_base = MAP_FAILED;
+
+    int ret = ring_open(child, &ctx->cycles,
+                        PERF_COUNT_HW_CPU_CYCLES, 100003,
+                        PERF_SAMPLE_IP | PERF_SAMPLE_CALLCHAIN);
+    if (ret < 0) return -1;
+
+    if (want_cache_misses)
+        ring_open(child, &ctx->cache_misses,
+                  PERF_COUNT_HW_CACHE_MISSES, 1000,
+                  PERF_SAMPLE_IP);
+    /* cache-miss ring failure is non-fatal */
+    return 0;
+}
+
+static int sampling_drain(struct sample_ring *ring,
+                           struct raw_sample **out, int *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    if (ring->fd < 0 || ring->mmap_base == MAP_FAILED) return -1;
+
+    struct perf_event_mmap_page *header =
+        (struct perf_event_mmap_page *)ring->mmap_base;
+    uint64_t data_head = __atomic_load_n(&header->data_head,
+                                          __ATOMIC_ACQUIRE);
+    uint64_t data_tail = header->data_tail;
+    char *data = (char *)ring->mmap_base + (size_t)header->data_offset;
+    uint64_t data_size = header->data_size;
+
+    int cap = 4096;
+    *out = malloc((size_t)cap * sizeof(struct raw_sample));
+
+    while (data_tail < data_head) {
+        /* Read header, handling wrap-around */
+        struct perf_event_header hdr;
+        uint64_t off = data_tail % data_size;
+        if (off + sizeof(hdr) > data_size) {
+            size_t first = (size_t)(data_size - off);
+            memcpy(&hdr, data + off, first);
+            memcpy((char *)&hdr + first, data, sizeof(hdr) - first);
+        } else {
+            memcpy(&hdr, data + off, sizeof(hdr));
+        }
+
+        if (hdr.size == 0) break; /* corrupted */
+
+        if (hdr.type == PERF_RECORD_SAMPLE) {
+            /* Copy payload handling wrap */
+            size_t payload = hdr.size - sizeof(hdr);
+            if (payload > 0 && payload < 8192) {
+                char record[8192];
+                uint64_t rec_off = (data_tail + sizeof(hdr)) % data_size;
+                if (rec_off + payload > data_size) {
+                    size_t first = (size_t)(data_size - rec_off);
+                    memcpy(record, data + rec_off, first);
+                    memcpy(record + first, data, payload - first);
+                } else {
+                    memcpy(record, data + rec_off, payload);
                 }
-            }
-            goto next_line;
-        }
 
-        if (cur_func < 0) goto next_line;
+                if (*n_out >= cap) {
+                    cap *= 2;
+                    *out = realloc(*out,
+                                   (size_t)cap * sizeof(struct raw_sample));
+                }
+                struct raw_sample *s = &(*out)[(*n_out)++];
+                memset(s, 0, sizeof(*s));
 
-        /* Blank line → end of this function's tree */
-        {
-            const char *t = line;
-            while (*t == ' ' || *t == '\t') t++;
-            if (*t == '\0' || *t == '\n') {
-                if (in_chain && chain_best[0])
-                    add_caller_entry(&prof->funcs[cur_func],
-                                     chain_best, chain_pct);
-                in_chain = 0;
-                cur_func = -1;
-                goto next_line;
-            }
-        }
+                /* PERF_SAMPLE_IP is first */
+                if (payload >= sizeof(uint64_t))
+                    memcpy(&s->ip, record, sizeof(uint64_t));
 
-        /* Check for percentage branch: |--XX.XX%--NAME or --XX.XX%--NAME */
-        char *pctdash = strstr(line, "%--");
-        if (pctdash) {
-            /* Find the '--' before the percentage */
-            char *dd = pctdash;
-            while (dd > line && !(dd[-1] == '-' && dd[0] == '-')) dd--;
-            if (dd > line) dd--;
-            int col = (int)(dd - line);
-
-            /* Parse percentage */
-            double pct = 0;
-            char *numstart = dd + 2; /* skip '--' */
-            sscanf(numstart, "%lf", &pct);
-
-            /* Only accept depth-1 entries (matching first column seen) */
-            if (depth1_col < 0)
-                depth1_col = col;
-
-            if (col == depth1_col) {
-                /* Flush previous chain */
-                if (in_chain && chain_best[0])
-                    add_caller_entry(&prof->funcs[cur_func],
-                                     chain_best, chain_pct);
-                /* Extract caller name after "%--" */
-                char *cname = pctdash + 3;
-                char *n = extract_tree_name(cname, nbuf, sizeof(nbuf));
-                if (n) {
-                    chain_pct = pct;
-                    if (is_boring_caller(n)) {
-                        chain_best[0] = '\0'; /* hope to find better below */
-                        in_chain = 1;
-                    } else {
-                        snprintf(chain_best, sizeof(chain_best), "%s", n);
-                        in_chain = 1;
+                /* PERF_SAMPLE_CALLCHAIN follows if present */
+                if (payload > sizeof(uint64_t)) {
+                    uint64_t nr;
+                    size_t chain_off = sizeof(uint64_t);
+                    if (chain_off + sizeof(uint64_t) <= payload) {
+                        memcpy(&nr, record + chain_off, sizeof(uint64_t));
+                        chain_off += sizeof(uint64_t);
+                        if (nr > 0 && nr < 256 &&
+                            chain_off + nr * sizeof(uint64_t) <= payload) {
+                            s->n_ips = (int)nr;
+                            s->ips = malloc(nr * sizeof(uint64_t));
+                            memcpy(s->ips, record + chain_off,
+                                   nr * sizeof(uint64_t));
+                        }
                     }
                 }
             }
-            /* Sub-branches (col != depth1_col) are ignored */
-            goto next_line;
         }
 
-        /* Check for single-chain start: ---NAME (no percentage) */
-        char *triple = strstr(line, "---");
-        if (triple && !strstr(line, "%--")) {
-            /* Flush previous chain */
-            if (in_chain && chain_best[0])
-                add_caller_entry(&prof->funcs[cur_func],
-                                 chain_best, chain_pct);
-            int col = (int)(triple - line);
-            if (depth1_col < 0)
-                depth1_col = col;
-            char *n = extract_tree_name(triple + 3, nbuf, sizeof(nbuf));
-            chain_pct = 100.0;
-            chain_best[0] = '\0';
-            if (n && !is_boring_caller(n))
-                snprintf(chain_best, sizeof(chain_best), "%s", n);
-            in_chain = 1;
-            goto next_line;
-        }
-
-        /* Chain continuation line — just a function name.
-           Update chain_best to the last non-boring, non-self name
-           (closest to the hot function in the call chain). */
-        if (in_chain) {
-            char *n = extract_tree_name(line, nbuf, sizeof(nbuf));
-            if (n && !is_boring_caller(n)) {
-                /* Skip if this is the hot function itself
-                   (match after stripping LTO suffixes) */
-                char cn[256], cf[256];
-                snprintf(cn, sizeof(cn), "%s", n);
-                strip_compiler_suffix(cn);
-                snprintf(cf, sizeof(cf), "%s",
-                         prof->funcs[cur_func].name);
-                strip_compiler_suffix(cf);
-                if (strcmp(cn, cf) != 0)
-                    snprintf(chain_best, sizeof(chain_best), "%s", n);
-            }
-        }
-
-    next_line:
-        line = nl ? nl + 1 : NULL;
+        data_tail += hdr.size;
     }
 
-    /* Flush final chain */
-    if (in_chain && cur_func >= 0 && chain_best[0])
-        add_caller_entry(&prof->funcs[cur_func], chain_best, chain_pct);
+    __atomic_store_n(&header->data_tail, data_head, __ATOMIC_RELEASE);
+    return 0;
+}
 
-    free(out);
+static void ring_close(struct sample_ring *ring) {
+    if (ring->mmap_base != MAP_FAILED && ring->mmap_size > 0) {
+        munmap(ring->mmap_base, ring->mmap_size);
+        ring->mmap_base = MAP_FAILED;
+    }
+    if (ring->fd >= 0) {
+        close(ring->fd);
+        ring->fd = -1;
+    }
+}
 
-    /* Sort callers by descending pct */
-    for (int f = 0; f < prof->n_funcs; f++) {
-        struct hot_func *hf = &prof->funcs[f];
-        for (int i = 0; i < hf->n_callers - 1; i++)
-            for (int j = i + 1; j < hf->n_callers; j++)
-                if (hf->callers[j].pct > hf->callers[i].pct) {
-                    struct caller_entry tmp = hf->callers[i];
-                    hf->callers[i] = hf->callers[j];
-                    hf->callers[j] = tmp;
-                }
+static void sampling_close(struct sampling_ctx *ctx) {
+    ring_close(&ctx->cycles);
+    ring_close(&ctx->cache_misses);
+}
+
+/* ── Symbol resolver — replaces perf report/annotate lookups ─────────── */
+
+struct sym_resolver {
+    Dwfl *dwfl;
+    Dwfl_Module *mod;
+    csh cs_handle;
+    int cs_ok;
+    Elf *elf;
+    int elf_fd;
+    uint64_t addr_bias;  /* subtract from runtime IP → dwfl address */
+};
+
+static const Dwfl_Callbacks offline_callbacks = {
+    .find_elf = dwfl_build_id_find_elf,
+    .find_debuginfo = dwfl_standard_find_debuginfo,
+    .section_address = dwfl_offline_section_address,
+};
+
+/* Read /proc/pid/maps to find the load base of the binary.
+   Returns 0 on failure (child already exited or binary not found). */
+static uint64_t read_load_base(pid_t pid, const char *binary_path) {
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    FILE *fp = fopen(maps_path, "r");
+    if (!fp) return 0;
+
+    char *real_bin = realpath(binary_path, NULL);
+
+    uint64_t load_base = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        uint64_t start;
+        uint64_t offset;
+        char pathname[512] = {0};
+
+        if (sscanf(line, "%" SCNx64 "-%*x %*s %" SCNx64 " %*s %*s %511[^\n]",
+                   &start, &offset, pathname) >= 2) {
+            char *p = pathname;
+            while (*p == ' ') p++;
+            /* Strip " (deleted)" suffix */
+            char *del = strstr(p, " (deleted)");
+            if (del) *del = '\0';
+
+            if (*p && ((real_bin && strcmp(p, real_bin) == 0) ||
+                       strcmp(p, binary_path) == 0)) {
+                load_base = start - offset;
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    free(real_bin);
+    return load_base;
+}
+
+static int symres_init(struct sym_resolver *sr, const char *binary_path,
+                        uint64_t load_base) {
+    memset(sr, 0, sizeof(*sr));
+    sr->elf_fd = -1;
+
+    elf_version(EV_CURRENT);
+
+    sr->dwfl = dwfl_begin(&offline_callbacks);
+    if (!sr->dwfl) return -1;
+
+    sr->mod = dwfl_report_offline(sr->dwfl, "", binary_path, -1);
+    dwfl_report_end(sr->dwfl, NULL, NULL);
+    if (!sr->mod) {
+        dwfl_end(sr->dwfl);
+        sr->dwfl = NULL;
+        return -1;
+    }
+
+    /* Open ELF directly for raw section data */
+    sr->elf_fd = open(binary_path, O_RDONLY);
+    if (sr->elf_fd >= 0)
+        sr->elf = elf_begin(sr->elf_fd, ELF_C_READ, NULL);
+
+    /* Compute address bias for PIE binaries */
+    if (sr->elf && load_base > 0) {
+        GElf_Ehdr ehdr;
+        if (gelf_getehdr(sr->elf, &ehdr) && ehdr.e_type == ET_DYN) {
+            Dwarf_Addr mod_low;
+            dwfl_module_info(sr->mod, NULL, &mod_low, NULL,
+                             NULL, NULL, NULL, NULL);
+            sr->addr_bias = load_base - mod_low;
+        }
+    }
+
+    /* Init capstone */
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &sr->cs_handle) == CS_ERR_OK) {
+        cs_option(sr->cs_handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
+        sr->cs_ok = 1;
     }
 
     return 0;
 }
 
-/* ── Phase 2c: perf annotate ─────────────────────────────────────────── */
+static const char *symres_func_name(struct sym_resolver *sr, uint64_t addr) {
+    if (!sr->dwfl) return NULL;
+    uint64_t dwfl_addr = addr - sr->addr_bias;
+    Dwfl_Module *mod = dwfl_addrmodule(sr->dwfl, dwfl_addr);
+    if (!mod) return NULL;
+    GElf_Off offset;
+    GElf_Sym sym;
+    return dwfl_module_addrinfo(mod, dwfl_addr, &offset, &sym,
+                                NULL, NULL, NULL);
+}
 
-static int run_perf_annotate(struct perf_opts *opts,
-                             struct perf_profile *prof) {
+static int symres_srcline(struct sym_resolver *sr, uint64_t addr,
+                           const char **file, int *line) {
+    if (!sr->dwfl) return -1;
+    uint64_t dwfl_addr = addr - sr->addr_bias;
+    Dwfl_Module *mod = dwfl_addrmodule(sr->dwfl, dwfl_addr);
+    if (!mod) return -1;
+    Dwfl_Line *ln = dwfl_module_getsrc(mod, dwfl_addr);
+    if (!ln) return -1;
+    *file = dwfl_lineinfo(ln, NULL, line, NULL, NULL, NULL);
+    return *file ? 0 : -1;
+}
+
+/* Returns runtime start address, raw bytes (caller must free), and length.
+   Uses the raw symbol name (including .constprop.N etc). */
+static int symres_func_range(struct sym_resolver *sr, const char *name,
+                              uint64_t *start, uint8_t **bytes, size_t *len) {
+    if (!sr->mod || !sr->elf) return -1;
+
+    /* Find symbol via dwfl (for the runtime-adjusted address) */
+    int nsyms = dwfl_module_getsymtab(sr->mod);
+    GElf_Sym best_sym;
+    GElf_Addr best_addr = 0;
+    int found = 0;
+
+    for (int i = 0; i < nsyms; i++) {
+        GElf_Sym sym;
+        GElf_Addr addr;
+        const char *sname = dwfl_module_getsym_info(
+            sr->mod, i, &sym, &addr, NULL, NULL, NULL);
+        if (!sname || GELF_ST_TYPE(sym.st_info) != STT_FUNC) continue;
+        if (strcmp(sname, name) == 0 && sym.st_size > 0) {
+            best_sym = sym;
+            best_addr = addr;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return -1;
+
+    *start = best_addr + sr->addr_bias;  /* convert to runtime address */
+    *len = best_sym.st_size;
+
+    /* Extract raw bytes from ELF using the original (non-biased) address */
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(sr->elf, scn)) != NULL) {
+        GElf_Shdr shdr;
+        gelf_getshdr(scn, &shdr);
+        if (shdr.sh_type != SHT_PROGBITS) continue;
+        if (!(shdr.sh_flags & SHF_EXECINSTR)) continue;
+
+        if (best_sym.st_value >= shdr.sh_addr &&
+            best_sym.st_value + best_sym.st_size <=
+                shdr.sh_addr + shdr.sh_size) {
+            Elf_Data *d = elf_getdata(scn, NULL);
+            if (!d) return -1;
+            uint64_t offset = best_sym.st_value - shdr.sh_addr;
+            if (offset + best_sym.st_size > d->d_size) return -1;
+            *bytes = malloc(best_sym.st_size);
+            memcpy(*bytes, (uint8_t *)d->d_buf + offset, best_sym.st_size);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int symres_has_debug(struct sym_resolver *sr) {
+    if (!sr->dwfl || !sr->mod) return 0;
+    Dwarf_Addr bias;
+    Dwarf *dbg = dwfl_module_getdwarf(sr->mod, &bias);
+    return dbg != NULL;
+}
+
+static void symres_free(struct sym_resolver *sr) {
+    if (sr->cs_ok) cs_close(&sr->cs_handle);
+    if (sr->elf) elf_end(sr->elf);
+    if (sr->elf_fd >= 0) close(sr->elf_fd);
+    if (sr->dwfl) dwfl_end(sr->dwfl);
+    memset(sr, 0, sizeof(*sr));
+    sr->elf_fd = -1;
+}
+
+/* ── profile_child — fork+exec with instrumentation ──────────────────── */
+
+static int profile_child(struct perf_opts *opts,
+                          struct perf_stats *stats,
+                          struct topdown_metrics *topdown, int *has_topdown,
+                          struct raw_sample **cycle_samples, int *n_cycle,
+                          struct raw_sample **cm_samples, int *n_cm,
+                          uint64_t *out_load_base) {
+    *has_topdown = 0;
+    *cycle_samples = NULL;
+    *n_cycle = 0;
+    if (cm_samples) { *cm_samples = NULL; *n_cm = 0; }
+    *out_load_base = 0;
+
+    /* Pipe for synchronization: child blocks until parent is ready */
+    int go_pipe[2];
+    if (pipe(go_pipe) < 0) { perror("pipe"); return -1; }
+
+    /* CLOEXEC pipe to detect when child has exec'd */
+    int exec_pipe[2];
+    if (pipe(exec_pipe) < 0) {
+        close(go_pipe[0]); close(go_pipe[1]);
+        perror("pipe");
+        return -1;
+    }
+    fcntl(exec_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    pid_t child = fork();
+    if (child < 0) {
+        perror("fork");
+        close(go_pipe[0]); close(go_pipe[1]);
+        close(exec_pipe[0]); close(exec_pipe[1]);
+        return -1;
+    }
+
+    if (child == 0) {
+        /* ── Child ── */
+        close(go_pipe[1]);
+        close(exec_pipe[0]);
+
+        /* Disable ASLR for deterministic addresses */
+        personality(ADDR_NO_RANDOMIZE);
+
+        /* Block until parent signals */
+        char dummy;
+        if (read(go_pipe[0], &dummy, 1) < 0) _exit(126);
+        close(go_pipe[0]);
+
+        execvp(opts->cmd_argv[0], opts->cmd_argv);
+        /* If exec fails, write error byte (exec_pipe[1] still open) */
+        (void)!write(exec_pipe[1], "E", 1);
+        _exit(127);
+    }
+
+    /* ── Parent ── */
+    close(go_pipe[0]);
+    close(exec_pipe[1]);
+
+    /* Open all perf events targeting child, with enable_on_exec */
+    struct counter_group cg;
+    int cg_ok = counters_open(child, &cg);
+
+    struct topdown_group tg;
+    int td_ok = topdown_open(child, &tg, opts->topdown_mode);
+
+    struct sampling_ctx sctx;
+    int samp_ok = sampling_open(child, &sctx, cm_samples != NULL);
+
+    /* Unblock child → exec triggers enable_on_exec atomically */
+    if (write(go_pipe[1], "x", 1) < 0) { /* ignore */ }
+    close(go_pipe[1]);
+
+    /* Wait for exec to happen (exec_pipe[1] closed by CLOEXEC) */
+    char exec_status;
+    ssize_t exec_n = read(exec_pipe[0], &exec_status, 1);
+    close(exec_pipe[0]);
+
+    if (exec_n > 0) {
+        /* exec failed */
+        fprintf(stderr, "error: exec failed for %s\n", opts->cmd_argv[0]);
+        waitpid(child, NULL, 0);
+        counters_close(&cg);
+        topdown_close(&tg);
+        sampling_close(&sctx);
+        return -1;
+    }
+
+    /* Child has exec'd — read load base from /proc/pid/maps */
+    *out_load_base = read_load_base(child, opts->binary_path);
+
+    /* Wait for child to finish */
+    int wstatus;
+    waitpid(child, &wstatus, 0);
+
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* Read counters */
+    if (cg_ok == 0) {
+        counters_read(&cg, stats);
+        stats->wall_seconds = (t1.tv_sec - t0.tv_sec) +
+                              (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    }
+
+    /* Drain sampling ring buffers */
+    if (samp_ok == 0)
+        sampling_drain(&sctx.cycles, cycle_samples, n_cycle);
+    if (cm_samples && sctx.cache_misses.fd >= 0)
+        sampling_drain(&sctx.cache_misses, cm_samples, n_cm);
+
+    /* Read topdown */
+    if (td_ok == 0 && topdown_read(&tg, topdown) == 0)
+        *has_topdown = 1;
+
+    counters_close(&cg);
+    topdown_close(&tg);
+    sampling_close(&sctx);
+
+    return 0;
+}
+
+/* ── Sample processing — replaces perf report/annotate parsing ───────── */
+
+/* Context markers in callchain arrays */
+static int is_context_marker(uint64_t ip) {
+    return ip >= (uint64_t)-4096;
+}
+
+static int process_samples(struct sym_resolver *sr,
+                            struct raw_sample *cycle_samples, int n_cycle,
+                            struct raw_sample *cm_samples, int n_cm,
+                            struct perf_opts *opts,
+                            struct perf_profile *prof) {
+    if (!sr->dwfl || n_cycle == 0) return 0;
+
+    /* ── Pass 1: IP→function aggregation (replaces parse_perf_report) ── */
+    struct func_bucket {
+        char clean_name[256];
+        char raw_name[256];
+        uint64_t count;
+    };
+
+    int n_buckets = 0, cap_buckets = 256;
+    struct func_bucket *buckets = calloc((size_t)cap_buckets,
+                                          sizeof(*buckets));
+
+    for (int i = 0; i < n_cycle; i++) {
+        const char *fname = symres_func_name(sr, cycle_samples[i].ip);
+        if (!fname) continue;
+
+        char clean[256];
+        snprintf(clean, sizeof(clean), "%s", fname);
+        strip_compiler_suffix(clean);
+
+        int found = -1;
+        for (int j = 0; j < n_buckets; j++) {
+            if (strcmp(buckets[j].clean_name, clean) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (found >= 0) {
+            buckets[found].count++;
+        } else {
+            if (n_buckets >= cap_buckets) {
+                cap_buckets *= 2;
+                buckets = realloc(buckets,
+                    (size_t)cap_buckets * sizeof(*buckets));
+            }
+            struct func_bucket *b = &buckets[n_buckets++];
+            memset(b, 0, sizeof(*b));
+            snprintf(b->clean_name, sizeof(b->clean_name), "%s", clean);
+            snprintf(b->raw_name, sizeof(b->raw_name), "%s", fname);
+            b->count = 1;
+        }
+    }
+
+    /* Sort by count descending */
+    for (int i = 0; i < n_buckets - 1; i++)
+        for (int j = i + 1; j < n_buckets; j++)
+            if (buckets[j].count > buckets[i].count) {
+                struct func_bucket tmp = buckets[i];
+                buckets[i] = buckets[j];
+                buckets[j] = tmp;
+            }
+
+    /* Take top N functions (skip those below 0.5%) */
+    int limit = n_buckets < opts->top_n ? n_buckets : opts->top_n;
+    int n_total = n_cycle;
+    prof->funcs = malloc((size_t)limit * sizeof(*prof->funcs));
+    prof->n_funcs = 0;
+
+    for (int i = 0; i < limit; i++) {
+        double pct = 100.0 * buckets[i].count / n_total;
+        if (pct < 0.5) break;
+        struct hot_func *hf = &prof->funcs[prof->n_funcs++];
+        memset(hf, 0, sizeof(*hf));
+        hf->name = strdup(buckets[i].raw_name);
+        hf->overhead_pct = pct;
+        hf->samples = buckets[i].count;
+    }
+    free(buckets);
+
+    /* ── Pass 2: Caller extraction (replaces parse_callers) ──────────── */
+
+    /* Per hot-function caller accumulator */
+    struct caller_agg {
+        char name[256];
+        int count;
+    };
+
+    int max_callers_per = 32;
+    struct caller_agg **agg = calloc((size_t)prof->n_funcs, sizeof(*agg));
+    int *n_agg = calloc((size_t)prof->n_funcs, sizeof(int));
+
+    for (int i = 0; i < prof->n_funcs; i++)
+        agg[i] = calloc((size_t)max_callers_per, sizeof(**agg));
+
+    for (int s = 0; s < n_cycle; s++) {
+        if (cycle_samples[s].n_ips < 2) continue;
+
+        const char *self_name = symres_func_name(sr, cycle_samples[s].ip);
+        if (!self_name) continue;
+        char self_clean[256];
+        snprintf(self_clean, sizeof(self_clean), "%s", self_name);
+        strip_compiler_suffix(self_clean);
+
+        /* Find which hot function this sample belongs to */
+        int func_idx = -1;
+        for (int f = 0; f < prof->n_funcs; f++) {
+            char fn_clean[256];
+            snprintf(fn_clean, sizeof(fn_clean), "%s", prof->funcs[f].name);
+            strip_compiler_suffix(fn_clean);
+            if (strcmp(self_clean, fn_clean) == 0) {
+                func_idx = f;
+                break;
+            }
+        }
+        if (func_idx < 0) continue;
+
+        /* Walk callchain: ips[0]=sampled IP, ips[1]=caller, ips[2]=... */
+        for (int c = 0; c < cycle_samples[s].n_ips; c++) {
+            uint64_t ip = cycle_samples[s].ips[c];
+            if (is_context_marker(ip)) continue;
+
+            const char *cname = symres_func_name(sr, ip);
+            if (!cname) continue;
+
+            char cclean[256];
+            snprintf(cclean, sizeof(cclean), "%s", cname);
+            strip_compiler_suffix(cclean);
+
+            /* Skip self and boring callers */
+            if (strcmp(cclean, self_clean) == 0) continue;
+            if (is_boring_caller(cclean)) continue;
+            if (strstr(cname, "@plt")) continue;
+            if (strncmp(cname, "__x86_", 6) == 0) continue;
+
+            /* Found a good caller — aggregate */
+            int found = -1;
+            for (int k = 0; k < n_agg[func_idx]; k++) {
+                if (strcmp(agg[func_idx][k].name, cname) == 0) {
+                    found = k;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                agg[func_idx][found].count++;
+            } else if (n_agg[func_idx] < max_callers_per) {
+                int idx = n_agg[func_idx]++;
+                snprintf(agg[func_idx][idx].name,
+                         sizeof(agg[func_idx][idx].name), "%s", cname);
+                agg[func_idx][idx].count = 1;
+            }
+            break; /* take only the first good caller */
+        }
+    }
+
+    /* Convert aggregated callers to hot_func.callers[] */
+    for (int f = 0; f < prof->n_funcs; f++) {
+        if (n_agg[f] == 0) continue;
+
+        /* Sort by count descending */
+        for (int i = 0; i < n_agg[f] - 1; i++)
+            for (int j = i + 1; j < n_agg[f]; j++)
+                if (agg[f][j].count > agg[f][i].count) {
+                    struct caller_agg tmp = agg[f][i];
+                    agg[f][i] = agg[f][j];
+                    agg[f][j] = tmp;
+                }
+
+        /* Compute total samples with callchains for this function */
+        int total_cc = 0;
+        for (int k = 0; k < n_agg[f]; k++)
+            total_cc += agg[f][k].count;
+
+        /* Take top 5 */
+        int nc = n_agg[f] < 5 ? n_agg[f] : 5;
+        for (int k = 0; k < nc; k++) {
+            double pct = total_cc > 0
+                ? 100.0 * agg[f][k].count / total_cc : 0;
+            if (pct < 0.5) break;
+            add_caller_entry(&prof->funcs[f], agg[f][k].name, pct);
+        }
+    }
+
+    for (int i = 0; i < prof->n_funcs; i++) free(agg[i]);
+    free(agg);
+    free(n_agg);
+
+    /* ── Pass 3: Hot instruction attribution (replaces run_perf_annotate) */
+
     int insn_cap = 64;
     prof->insns = malloc((size_t)insn_cap * sizeof(*prof->insns));
     prof->n_insns = 0;
 
-    for (int f = 0; f < prof->n_funcs; f++) {
-        const char *raw_name = prof->funcs[f].name;
+    if (sr->cs_ok) {
+        for (int f = 0; f < prof->n_funcs; f++) {
+            uint64_t func_start;
+            uint8_t *func_bytes;
+            size_t func_len;
 
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd),
-            "perf annotate --stdio --symbol='%s' "
-            "-i '%s/perf.data' 2>/dev/null",
-            raw_name, g_tmpdir);
+            if (symres_func_range(sr, prof->funcs[f].name,
+                                  &func_start, &func_bytes,
+                                  &func_len) != 0)
+                continue;
 
-        int status;
-        char *out = run_cmd(cmd, &status, opts->verbose);
-        if (!out) continue;
+            /* Bucket cycle samples by IP within this function */
+            struct { uint64_t ip; int count; } *ip_buckets = NULL;
+            int n_ip = 0, cap_ip = 64;
+            ip_buckets = calloc((size_t)cap_ip, sizeof(*ip_buckets));
+            int func_total = 0;
 
-        int func_insns = 0;
-        uint32_t cur_source_line = 0;
+            for (int s = 0; s < n_cycle; s++) {
+                uint64_t ip = cycle_samples[s].ip;
+                if (ip >= func_start && ip < func_start + func_len) {
+                    func_total++;
+                    int found = -1;
+                    for (int k = 0; k < n_ip; k++) {
+                        if (ip_buckets[k].ip == ip) {
+                            found = k;
+                            break;
+                        }
+                    }
+                    if (found >= 0) {
+                        ip_buckets[found].count++;
+                    } else {
+                        if (n_ip >= cap_ip) {
+                            cap_ip *= 2;
+                            ip_buckets = realloc(ip_buckets,
+                                (size_t)cap_ip * sizeof(*ip_buckets));
+                        }
+                        ip_buckets[n_ip].ip = ip;
+                        ip_buckets[n_ip].count = 1;
+                        n_ip++;
+                    }
+                }
+            }
 
-        char *line = out;
-        while (line && *line && func_insns < opts->insns_n) {
-            char *nl = strchr(line, '\n');
-            if (nl) *nl = '\0';
+            /* Sort by count descending */
+            for (int i = 0; i < n_ip - 1; i++)
+                for (int j = i + 1; j < n_ip; j++)
+                    if (ip_buckets[j].count > ip_buckets[i].count) {
+                        uint64_t ti = ip_buckets[i].ip;
+                        int tc = ip_buckets[i].count;
+                        ip_buckets[i].ip = ip_buckets[j].ip;
+                        ip_buckets[i].count = ip_buckets[j].count;
+                        ip_buckets[j].ip = ti;
+                        ip_buckets[j].count = tc;
+                    }
 
-            /* Try instruction line: " 12.34 :  401234:  insn..." */
-            double pct;
-            uint64_t addr;
-            char asm_buf[512];
-            int n = sscanf(line, " %lf : %" SCNx64 ": %511[^\n]",
-                           &pct, &addr, asm_buf);
-            if (n == 3 && pct >= 0.5) {
+            /* Take top insns_n */
+            int take = n_ip < opts->insns_n ? n_ip : opts->insns_n;
+            for (int k = 0; k < take; k++) {
+                double pct = func_total > 0
+                    ? 100.0 * ip_buckets[k].count / func_total : 0;
+                if (pct < 0.5) break;
+
+                uint64_t ip = ip_buckets[k].ip;
+                uint64_t offset = ip - func_start;
+
+                /* Disassemble the instruction at this IP */
+                cs_insn *insn;
+                size_t cnt = cs_disasm(sr->cs_handle,
+                                       func_bytes + offset,
+                                       func_len - (size_t)offset,
+                                       ip, 1, &insn);
+                if (cnt == 0) continue;
+
+                char asm_buf[256];
+                snprintf(asm_buf, sizeof(asm_buf), "%s %s",
+                         insn[0].mnemonic, insn[0].op_str);
+                cs_free(insn, cnt);
+
+                /* Get source line */
+                uint32_t src_line = 0;
+                const char *src_file;
+                int sline;
+                if (symres_srcline(sr, ip, &src_file, &sline) == 0)
+                    src_line = (uint32_t)sline;
+
                 if (prof->n_insns >= insn_cap) {
                     insn_cap *= 2;
                     prof->insns = realloc(prof->insns,
                         (size_t)insn_cap * sizeof(*prof->insns));
                 }
-                struct hot_insn *hi =
-                    &prof->insns[prof->n_insns++];
+                struct hot_insn *hi = &prof->insns[prof->n_insns++];
                 hi->func_name = strdup(prof->funcs[f].name);
-                hi->addr = addr;
+                hi->addr = ip;
                 hi->pct = pct;
-                char *a = asm_buf;
-                while (*a == ' ' || *a == '\t') a++;
-                hi->asm_text = strdup(a);
-                hi->source_line = cur_source_line;
-                func_insns++;
+                hi->asm_text = strdup(asm_buf);
+                hi->source_line = src_line;
             }
 
-            /* Track source annotations: "  : /path/file.c:42" */
-            char *colon;
-            if ((colon = strstr(line, ".c:")) != NULL ||
-                (colon = strstr(line, ".h:")) != NULL) {
-                uint32_t sl;
-                if (sscanf(colon + 3, "%u", &sl) == 1)
-                    cur_source_line = sl;
-            }
-
-            line = nl ? nl + 1 : NULL;
+            free(ip_buckets);
+            free(func_bytes);
         }
-        free(out);
     }
+
+    /* ── Pass 4: Cache-miss attribution (replaces run_cache_misses) ──── */
+
+    if (cm_samples && n_cm > 0 && sr->cs_ok) {
+        int cm_cap = 64;
+        prof->cm_sites = malloc((size_t)cm_cap * sizeof(*prof->cm_sites));
+        prof->n_cm_sites = 0;
+
+        for (int f = 0; f < prof->n_funcs; f++) {
+            uint64_t func_start;
+            uint8_t *func_bytes;
+            size_t func_len;
+
+            if (symres_func_range(sr, prof->funcs[f].name,
+                                  &func_start, &func_bytes,
+                                  &func_len) != 0)
+                continue;
+
+            /* Bucket cache-miss samples by IP */
+            struct { uint64_t ip; int count; } *ip_buckets = NULL;
+            int n_ip = 0, cap_ip = 64;
+            ip_buckets = calloc((size_t)cap_ip, sizeof(*ip_buckets));
+
+            for (int s = 0; s < n_cm; s++) {
+                uint64_t ip = cm_samples[s].ip;
+                if (ip >= func_start && ip < func_start + func_len) {
+                    int found = -1;
+                    for (int k = 0; k < n_ip; k++) {
+                        if (ip_buckets[k].ip == ip) {
+                            found = k;
+                            break;
+                        }
+                    }
+                    if (found >= 0) {
+                        ip_buckets[found].count++;
+                    } else {
+                        if (n_ip >= cap_ip) {
+                            cap_ip *= 2;
+                            ip_buckets = realloc(ip_buckets,
+                                (size_t)cap_ip * sizeof(*ip_buckets));
+                        }
+                        ip_buckets[n_ip].ip = ip;
+                        ip_buckets[n_ip].count = 1;
+                        n_ip++;
+                    }
+                }
+            }
+
+            /* Sort by count descending */
+            for (int i = 0; i < n_ip - 1; i++)
+                for (int j = i + 1; j < n_ip; j++)
+                    if (ip_buckets[j].count > ip_buckets[i].count) {
+                        uint64_t ti = ip_buckets[i].ip;
+                        int tc = ip_buckets[i].count;
+                        ip_buckets[i].ip = ip_buckets[j].ip;
+                        ip_buckets[i].count = ip_buckets[j].count;
+                        ip_buckets[j].ip = ti;
+                        ip_buckets[j].count = tc;
+                    }
+
+            int take = n_ip < opts->insns_n ? n_ip : opts->insns_n;
+            for (int k = 0; k < take; k++) {
+                double pct = n_cm > 0
+                    ? 100.0 * ip_buckets[k].count / n_cm : 0;
+                if (pct < 0.05) break;
+
+                uint64_t ip = ip_buckets[k].ip;
+                uint64_t offset = ip - func_start;
+
+                cs_insn *insn;
+                size_t cnt = cs_disasm(sr->cs_handle,
+                                       func_bytes + offset,
+                                       func_len - (size_t)offset,
+                                       ip, 1, &insn);
+                if (cnt == 0) continue;
+
+                char asm_buf[256];
+                snprintf(asm_buf, sizeof(asm_buf), "%s %s",
+                         insn[0].mnemonic, insn[0].op_str);
+                cs_free(insn, cnt);
+
+                uint32_t src_line = 0;
+                const char *src_file;
+                int sline;
+                if (symres_srcline(sr, ip, &src_file, &sline) == 0)
+                    src_line = (uint32_t)sline;
+
+                if (prof->n_cm_sites >= cm_cap) {
+                    cm_cap *= 2;
+                    prof->cm_sites = realloc(prof->cm_sites,
+                        (size_t)cm_cap * sizeof(*prof->cm_sites));
+                }
+                struct cache_miss_site *cm =
+                    &prof->cm_sites[prof->n_cm_sites++];
+                cm->func_name = strdup(prof->funcs[f].name);
+                cm->source_line = src_line;
+                cm->pct = pct;
+                cm->asm_text = strdup(asm_buf);
+            }
+
+            free(ip_buckets);
+            free(func_bytes);
+        }
+    }
+
     return 0;
 }
 
-/* ── Phase 2d: AMDuProf ──────────────────────────────────────────────── */
+/* ── AMDuProf (unchanged — vendor subprocess) ────────────────────────── */
 
 static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     if (opts->uprof_mode < 0) return 0;
@@ -785,7 +1520,7 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     char uprof_dir[PATH_MAX];
     snprintf(uprof_dir, sizeof(uprof_dir), "%s/uprof", g_tmpdir);
 
-    /* Phase 1: collect with assess config (IPC + L1d + branches + misaligned) */
+    /* Phase 1: collect with assess config */
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
         "'%s' collect --config assess -o '%s' %s 2>&1",
@@ -794,8 +1529,6 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     int status;
     char *out = run_cmd(cmd, &status, opts->verbose);
 
-    /* Extract data directory from collect output:
-       "Generated data files path: /path/to/AMDuProf-xxx" */
     char data_dir[PATH_MAX] = {0};
     if (out) {
         const char *tag = "Generated data files path: ";
@@ -838,35 +1571,25 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     prof->uprof_funcs = malloc((size_t)cap * sizeof(*prof->uprof_funcs));
     prof->n_uprof_funcs = 0;
 
-    /* Find the "HOTTEST FUNCTIONS" section header line, then parse rows.
-       CSV columns (assess config):
-       FUNCTION, CYCLES, RETIRED_INST, IPC, CPI,
-       BR_MISP(PTI), %BR_MISP, L1_DC_ACC(PTI), L1_DC_MISS(PTI),
-       %L1_DC_MISS, L1_REFILL_LOCAL(PTI), L1_REFILL_REMOTE(PTI),
-       MISALIGNED(PTI), Module */
     char line[4096];
     int in_funcs = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, "HOTTEST FUNCTIONS")) {
-            /* Next line is the column header — skip it */
             fgets(line, sizeof(line), fp);
             in_funcs = 1;
             continue;
         }
         if (!in_funcs) continue;
 
-        /* Empty line ends the function table */
         if (line[0] == '\n' || line[0] == '\r' || line[0] == '\0')
             break;
 
-        /* Extract quoted function name */
         if (line[0] != '"') break;
         char *name_end = strchr(line + 1, '"');
         if (!name_end) continue;
         *name_end = '\0';
         const char *func_name = line + 1;
 
-        /* Match against known hot functions */
         int matched = 0;
         for (int f = 0; f < prof->n_funcs; f++) {
             if (strcmp(func_name, prof->funcs[f].name) == 0) {
@@ -876,10 +1599,6 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
         }
         if (!matched) continue;
 
-        /* Parse CSV fields after the function name:
-           ,CYCLES,RETIRED_INST,IPC,CPI,BR_MISP_PTI,%BR_MISP,
-           L1_DC_ACC_PTI,L1_DC_MISS_PTI,%L1_DC_MISS,
-           L1_REFILL_LOCAL_PTI,L1_REFILL_REMOTE_PTI,MISALIGNED_PTI,Module */
         char *p = name_end + 1;
         double cycles_val, inst_val, ipc, cpi_unused;
         double br_misp_pti = 0, br_misp_pct = 0;
@@ -913,250 +1632,10 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     return 0;
 }
 
-/* ── Phase 2e: Top-down analysis ─────────────────────────────────────── */
+/* ── llvm-mca throughput — capstone replaces objdump ─────────────────── */
 
-/* Intel: perf stat --topdown → retiring/bad_spec/fe_bound/be_bound
-   AMD Zen: per-slot dispatch stall events → dispatched/backend/frontend */
-
-static int run_topdown_intel(struct perf_opts *opts,
-                             struct perf_profile *prof) {
-    char cmd[4096];
-    int status;
-    snprintf(cmd, sizeof(cmd),
-        "perf stat --topdown -x ',' -- %s 2>&1 1>/dev/null",
-        opts->cmd_str);
-
-    char *out = run_cmd(cmd, &status, opts->verbose);
-    if (!out) return 0;
-
-    struct topdown_metrics *td = &prof->topdown;
-    memset(td, 0, sizeof(*td));
-    td->level = 1;
-
-    char *line = out;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        double val;
-        char metric[128];
-        if (sscanf(line, " %lf,,%127[^,]", &val, metric) >= 2 ||
-            sscanf(line, "%lf,,%127[^,]", &val, metric) >= 2) {
-            for (char *p = metric; *p; p++)
-                *p = (*p >= 'A' && *p <= 'Z') ? *p + 32 : *p;
-
-            if (strstr(metric, "retiring"))
-                td->retiring = val;
-            else if (strstr(metric, "bad") &&
-                     strstr(metric, "spec"))
-                td->bad_spec = val;
-            else if (strstr(metric, "frontend") ||
-                     strstr(metric, "fe_bound") ||
-                     strstr(metric, "fe bound"))
-                td->frontend = val;
-            else if (strstr(metric, "backend") ||
-                     strstr(metric, "be_bound") ||
-                     strstr(metric, "be bound"))
-                td->backend = val;
-        }
-
-        line = nl ? nl + 1 : NULL;
-    }
-    free(out);
-
-    if (td->retiring > 0 || td->bad_spec > 0 ||
-        td->frontend > 0 || td->backend > 0)
-        prof->has_topdown = 1;
-
-    return 0;
-}
-
-static int run_topdown_amd(struct perf_opts *opts,
-                           struct perf_profile *prof) {
-    char cmd[4096];
-    int status;
-
-    /* AMD Zen topdown: per-slot dispatch stall events.
-       total_slots = dispatched + backend + frontend + smt_contention
-       Percentages computed from slot fractions. */
-    snprintf(cmd, sizeof(cmd),
-        "perf stat -e "
-        "de_src_op_disp.all:u,"
-        "de_no_dispatch_per_slot.backend_stalls:u,"
-        "de_no_dispatch_per_slot.no_ops_from_frontend:u,"
-        "de_no_dispatch_per_slot.smt_contention:u "
-        "-x ',' -- %s 2>&1 1>/dev/null",
-        opts->cmd_str);
-
-    char *out = run_cmd(cmd, &status, opts->verbose);
-    if (!out) return 0;
-
-    uint64_t dispatched = 0, backend = 0, frontend = 0, smt = 0;
-
-    char *line = out;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        uint64_t val;
-        char event[128];
-        if (sscanf(line, "%" SCNu64 ",,%127[^,]", &val, event) >= 2) {
-            if (strstr(event, "de_src_op_disp"))
-                dispatched = val;
-            else if (strstr(event, "backend"))
-                backend = val;
-            else if (strstr(event, "frontend") ||
-                     strstr(event, "no_ops_from"))
-                frontend = val;
-            else if (strstr(event, "smt"))
-                smt = val;
-        }
-
-        line = nl ? nl + 1 : NULL;
-    }
-    free(out);
-
-    uint64_t total = dispatched + backend + frontend + smt;
-    if (total == 0) return 0;
-
-    struct topdown_metrics *td = &prof->topdown;
-    memset(td, 0, sizeof(*td));
-    td->level = 1;
-    td->retiring = 100.0 * dispatched / total;
-    td->backend  = 100.0 * backend / total;
-    td->frontend = 100.0 * (frontend + smt) / total;
-    /* bad_spec not cleanly separable on AMD (would need
-       retired vs dispatched ops); report 0 */
-    td->bad_spec = 0;
-    prof->has_topdown = 1;
-
-    return 0;
-}
-
-static int run_topdown(struct perf_opts *opts, struct perf_profile *prof) {
-    if (opts->topdown_mode < 0) return 0;
-
-    /* Try Intel --topdown first */
-    int status;
-    char *probe = run_cmd(
-        "perf stat --topdown -- true 2>&1", &status, 0);
-    int intel_ok = (probe && strstr(probe, "retiring") != NULL);
-    free(probe);
-
-    if (intel_ok)
-        return run_topdown_intel(opts, prof);
-
-    /* Try AMD Zen per-slot dispatch stall events */
-    probe = run_cmd(
-        "perf stat -e de_no_dispatch_per_slot.backend_stalls:u "
-        "-- true 2>&1", &status, 0);
-    int amd_ok = (status == 0 && probe &&
-                  !strstr(probe, "not supported") &&
-                  !strstr(probe, "<not counted>"));
-    free(probe);
-
-    if (amd_ok)
-        return run_topdown_amd(opts, prof);
-
-    if (opts->topdown_mode > 0) {
-        fprintf(stderr,
-            "error: --topdown specified but no topdown events "
-            "available (need Intel Icelake+ or AMD Zen)\n");
-        return -1;
-    }
-    return 0;
-}
-
-/* ── Phase 2f: Cache-miss attribution ────────────────────────────────── */
-
-static int run_cache_misses(struct perf_opts *opts,
-                            struct perf_profile *prof) {
-    if (opts->cachemiss_mode < 0) return 0;
-
-    /* perf is already confirmed available; just record cache-misses */
-    char cm_data[PATH_MAX];
-    snprintf(cm_data, sizeof(cm_data), "%s/cachemiss.data", g_tmpdir);
-
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "perf record -e cache-misses -c 1000 "
-        "-o '%s' -- %s 2>&1 1>/dev/null",
-        cm_data, opts->cmd_str);
-
-    int status;
-    char *out = run_cmd(cmd, &status, opts->verbose);
-    free(out);
-
-    if (access(cm_data, F_OK) != 0) {
-        if (opts->cachemiss_mode > 0)
-            fprintf(stderr, "error: cache-miss recording failed\n");
-        return opts->cachemiss_mode > 0 ? -1 : 0;
-    }
-
-    int cap = 64;
-    prof->cm_sites = malloc((size_t)cap * sizeof(*prof->cm_sites));
-    prof->n_cm_sites = 0;
-
-    int limit = prof->n_funcs < opts->top_n ?
-                prof->n_funcs : opts->top_n;
-    for (int f = 0; f < limit; f++) {
-        const char *raw_name = prof->funcs[f].name;
-
-        snprintf(cmd, sizeof(cmd),
-            "perf annotate --stdio --symbol='%s' "
-            "-i '%s' 2>/dev/null",
-            raw_name, cm_data);
-
-        out = run_cmd(cmd, &status, opts->verbose);
-        if (!out) continue;
-
-        uint32_t cur_source_line = 0;
-        char *line = out;
-        while (line && *line) {
-            char *nl = strchr(line, '\n');
-            if (nl) *nl = '\0';
-
-            double pct;
-            uint64_t addr;
-            char asm_buf[512];
-            int n = sscanf(line, " %lf : %" SCNx64 ": %511[^\n]",
-                           &pct, &addr, asm_buf);
-            if (n == 3 && pct >= 0.05) {
-                if (prof->n_cm_sites >= cap) {
-                    cap *= 2;
-                    prof->cm_sites = realloc(prof->cm_sites,
-                        (size_t)cap * sizeof(*prof->cm_sites));
-                }
-                struct cache_miss_site *cm =
-                    &prof->cm_sites[prof->n_cm_sites++];
-                cm->func_name = strdup(prof->funcs[f].name);
-                cm->source_line = cur_source_line;
-                cm->pct = pct;
-                char *a = asm_buf;
-                while (*a == ' ' || *a == '\t') a++;
-                cm->asm_text = strdup(a);
-            }
-
-            /* Track source line annotations */
-            char *colon;
-            if ((colon = strstr(line, ".c:")) != NULL ||
-                (colon = strstr(line, ".h:")) != NULL) {
-                uint32_t sl;
-                if (sscanf(colon + 3, "%u", &sl) == 1)
-                    cur_source_line = sl;
-            }
-
-            line = nl ? nl + 1 : NULL;
-        }
-        free(out);
-    }
-
-    return 0;
-}
-
-/* ── Phase 2g: llvm-mca throughput analysis ──────────────────────────── */
-
-static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
+static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
+                    struct perf_profile *prof) {
     if (opts->mca_mode < 0) return 0;
     if (!has_tool("llvm-mca")) {
         if (opts->mca_mode > 0) {
@@ -1166,6 +1645,7 @@ static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
         }
         return 0;
     }
+    if (!sr->cs_ok) return 0;
 
     int cap = 16;
     prof->mca_blocks = malloc((size_t)cap * sizeof(*prof->mca_blocks));
@@ -1177,106 +1657,94 @@ static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
         "echo 'nop' | llvm-mca -mcpu=native 2>&1", &status, 0);
     int has_native = (status == 0);
     free(probe);
-
     const char *mcpu_flag = has_native ? "-mcpu=native" : "";
 
     int limit = prof->n_funcs < opts->top_n ?
                 prof->n_funcs : opts->top_n;
+
     for (int f = 0; f < limit; f++) {
         const char *raw_name = prof->funcs[f].name;
 
-        /* Extract disassembly for this function — use raw name
-           (may include .constprop.N/.isra.N from LTO) */
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd),
-            "objdump -d --no-show-raw-insn '%s' 2>/dev/null | "
-            "awk '/^[0-9a-f]+ <%s>:$/,/^$/' ",
-            opts->binary_path, raw_name);
+        /* Get function bytes via sym_resolver */
+        uint64_t func_start;
+        uint8_t *func_bytes;
+        size_t func_len;
+        if (symres_func_range(sr, raw_name,
+                              &func_start, &func_bytes, &func_len) != 0)
+            continue;
 
-        char *disas = run_cmd(cmd, &status, opts->verbose);
-        if (!disas || !*disas) { free(disas); continue; }
+        /* Disassemble with capstone */
+        cs_insn *insns;
+        size_t count = cs_disasm(sr->cs_handle, func_bytes, func_len,
+                                  func_start, 0, &insns);
+        free(func_bytes);
+        if (count == 0) continue;
 
-        /* Write cleaned instructions to temp file:
-           strip addresses and labels, keep only mnemonics */
+        /* Write cleaned instructions to temp file */
         char tmpasm[PATH_MAX];
         snprintf(tmpasm, sizeof(tmpasm), "%s/mca_block.s", g_tmpdir);
         FILE *fp = fopen(tmpasm, "w");
-        if (!fp) { free(disas); continue; }
+        if (!fp) { cs_free(insns, count); continue; }
 
-        int n_insns = 0;
-        char *line = disas;
-        while (line && *line) {
-            char *nl = strchr(line, '\n');
-            if (nl) *nl = '\0';
+        int n_written = 0;
+        for (size_t i = 0; i < count; i++) {
+            /* Skip endbr, nops */
+            if (strcmp(insns[i].mnemonic, "endbr64") == 0 ||
+                strcmp(insns[i].mnemonic, "endbr32") == 0)
+                continue;
 
-            /* Instruction lines look like: "  401234:  mov ..." or
-               "  401234:\tmov ..." — have a colon followed by insn */
-            char *colon = strchr(line, ':');
-            if (colon && colon != line) {
-                char *insn = colon + 1;
-                while (*insn == ' ' || *insn == '\t') insn++;
-                /* Skip empty lines, labels, directives */
-                if (*insn && *insn != '<' && *insn != '.' &&
-                    *insn != '#' && *insn != ';') {
-                    /* Strip objdump annotations for llvm-mca:
-                       <symbol+offset>, # addr <symbol>,
-                       and bare hex jump targets */
-                    char cleaned[512];
-                    int ci = 0;
-                    for (const char *s = insn;
-                         *s && ci < (int)sizeof(cleaned) - 1; ) {
-                        if (*s == '<') {
-                            while (*s && *s != '>') s++;
-                            if (*s == '>') s++;
-                        } else if (*s == '#') {
-                            break;
-                        } else {
-                            cleaned[ci++] = *s++;
-                        }
+            /* For branches/calls, replace hex targets with labels */
+            if (insns[i].mnemonic[0] == 'j' ||
+                strncmp(insns[i].mnemonic, "call", 4) == 0) {
+                const char *op = insns[i].op_str;
+                /* Check if operand is a bare hex address (0x...) */
+                if (op[0] == '0' && op[1] == 'x') {
+                    fprintf(fp, "%s .Ltmp\n", insns[i].mnemonic);
+                    n_written++;
+                    continue;
+                }
+                /* Check if operand is a bare hex number (no prefix) */
+                int all_hex = (*op != '\0');
+                for (const char *c = op; *c; c++) {
+                    if (!((*c >= '0' && *c <= '9') ||
+                          (*c >= 'a' && *c <= 'f') ||
+                          (*c >= 'A' && *c <= 'F'))) {
+                        all_hex = 0;
+                        break;
                     }
-                    /* trim trailing spaces */
-                    while (ci > 0 && cleaned[ci-1] == ' ') ci--;
-                    cleaned[ci] = '\0';
-                    /* Replace bare hex jump targets with labels:
-                       "jg     505a" → "jg .Ltmp" */
-                    if (ci > 0 && (cleaned[0] == 'j' ||
-                        (ci > 4 && strncmp(cleaned, "call", 4) == 0))) {
-                        char *sp = cleaned;
-                        while (*sp && *sp != ' ' && *sp != '\t') sp++;
-                        while (*sp == ' ' || *sp == '\t') sp++;
-                        /* Check if operand is a bare hex number */
-                        if (*sp && *sp != '*' && *sp != '%' &&
-                            *sp != '(' && *sp != '.') {
-                            int all_hex = 1;
-                            for (char *h = sp; *h; h++) {
-                                if (!((*h >= '0' && *h <= '9') ||
-                                      (*h >= 'a' && *h <= 'f') ||
-                                      (*h >= 'A' && *h <= 'F'))) {
-                                    all_hex = 0;
-                                    break;
-                                }
-                            }
-                            if (all_hex && sp > cleaned) {
-                                strcpy(sp, ".Ltmp");
-                                ci = (int)(sp - cleaned) + 5;
-                            }
-                        }
-                    }
-                    if (ci > 0) {
-                        fprintf(fp, "%s\n", cleaned);
-                        n_insns++;
-                    }
+                }
+                if (all_hex && *op) {
+                    fprintf(fp, "%s .Ltmp\n", insns[i].mnemonic);
+                    n_written++;
+                    continue;
                 }
             }
 
-            line = nl ? nl + 1 : NULL;
-        }
-        fclose(fp);
-        free(disas);
+            /* Strip comments after # */
+            char cleaned[512];
+            snprintf(cleaned, sizeof(cleaned), "%s %s",
+                     insns[i].mnemonic, insns[i].op_str);
+            char *hash = strchr(cleaned, '#');
+            if (hash) {
+                *hash = '\0';
+                /* trim trailing spaces */
+                size_t cl = strlen(cleaned);
+                while (cl > 0 && cleaned[cl-1] == ' ')
+                    cleaned[--cl] = '\0';
+            }
 
-        if (n_insns == 0) continue;
+            if (cleaned[0]) {
+                fprintf(fp, "%s\n", cleaned);
+                n_written++;
+            }
+        }
+        cs_free(insns, count);
+        fclose(fp);
+
+        if (n_written == 0) continue;
 
         /* Run llvm-mca */
+        char cmd[4096];
         snprintf(cmd, sizeof(cmd),
             "llvm-mca %s -iterations=100 --timeline=0 "
             "--all-stats < '%s' 2>&1",
@@ -1290,7 +1758,7 @@ static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
         int uops = 0;
         char bottleneck[128] = "";
 
-        line = mca_out;
+        char *line = mca_out;
         while (line && *line) {
             char *nl = strchr(line, '\n');
             if (nl) *nl = '\0';
@@ -1307,7 +1775,6 @@ static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
                     p++;
                     while (*p == ' ') p++;
                     snprintf(bottleneck, sizeof(bottleneck), "%s", p);
-                    /* Trim trailing whitespace */
                     size_t blen = strlen(bottleneck);
                     while (blen > 0 &&
                            (bottleneck[blen-1] == ' ' ||
@@ -1340,7 +1807,7 @@ static int run_mca(struct perf_opts *opts, struct perf_profile *prof) {
     return 0;
 }
 
-/* ── Phase 3b: pahole struct layout analysis ─────────────────────────── */
+/* ── pahole struct layout (unchanged — external tool) ────────────────── */
 
 static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
                       int has_debug) {
@@ -1379,20 +1846,15 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
         const char *sig = prof->funcs[f].skeleton_sig;
         if (!sig) continue;
 
-        /* Find all "TYPE *" patterns (handles both struct X * and
-           typedef'd names like hpack_ctx *) */
         const char *p = sig;
         while (*p) {
-            /* Skip to an identifier character */
             while (*p && !(*p >= 'a' && *p <= 'z') &&
                    !(*p >= 'A' && *p <= 'Z') && *p != '_')
                 p++;
             if (!*p) break;
 
-            /* Extract identifier */
             char type_name[256];
             int ti = 0;
-            const char *start = p;
             while (*p && ((*p >= 'a' && *p <= 'z') ||
                           (*p >= 'A' && *p <= 'Z') ||
                           (*p >= '0' && *p <= '9') || *p == '_') &&
@@ -1400,12 +1862,10 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
                 type_name[ti++] = *p++;
             type_name[ti] = '\0';
 
-            /* Check if followed by " *" (pointer parameter) */
             const char *q = p;
             while (*q == ' ') q++;
-            if (*q != '*') { (void)start; continue; }
+            if (*q != '*') continue;
 
-            /* Skip known primitive types */
             int skip = 0;
             for (int s = 0; skip_types[s]; s++) {
                 if (strcmp(type_name, skip_types[s]) == 0) {
@@ -1415,7 +1875,6 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
             }
             if (skip) continue;
 
-            /* For "struct X", extract just X */
             const char *probe_name = type_name;
             if (strcmp(type_name, "struct") == 0) {
                 while (*p == ' ') p++;
@@ -1431,7 +1890,6 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
 
             if (!*probe_name) continue;
 
-            /* Check for duplicates */
             int dup = 0;
             for (int i = 0; i < prof->n_layouts; i++) {
                 if (strcmp(prof->layouts[i].type_name,
@@ -1442,7 +1900,6 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
             }
             if (dup) continue;
 
-            /* Run pahole */
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
                 "pahole -C '%s' '%s' 2>/dev/null",
@@ -1455,7 +1912,6 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
                 continue;
             }
 
-            /* Parse: "size: N, cachelines: N ..." */
             uint32_t size = 0, cachelines = 0;
             uint32_t holes = 0, padding = 0;
 
@@ -1483,7 +1939,6 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
             }
             free(out);
 
-            /* Only include interesting types */
             if (holes == 0 && cachelines <= 1) continue;
 
             if (prof->n_layouts >= cap) {
@@ -1505,7 +1960,7 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
     return 0;
 }
 
-/* ── Phase 3: Skeleton cross-reference ───────────────────────────────── */
+/* ── Skeleton cross-reference (unchanged) ────────────────────────────── */
 
 static void xref_skeleton(struct perf_opts *opts,
                           struct perf_profile *prof) {
@@ -1576,9 +2031,7 @@ static void xref_skeleton(struct perf_opts *opts,
 
     if (xref_cache) cache_close(xref_cache);
 
-    /* Match hot functions → collected symbols.
-       When multiple files define the same symbol (e.g. main), prefer
-       the file whose basename is a substring of the binary name. */
+    /* Match hot functions → collected symbols */
     const char *bin_base = opts->binary_path ?
         strrchr(opts->binary_path, '/') : NULL;
     bin_base = bin_base ? bin_base + 1 :
@@ -1616,7 +2069,6 @@ static void xref_skeleton(struct perf_opts *opts,
                     after != ';' && after != '\0')
                     continue;
 
-                /* Score: prefer source file related to binary name */
                 int score = 0;
                 if (*bin_base) {
                     const char *src_base = strrchr(fe->abs_path, '/');
@@ -1658,7 +2110,7 @@ static void xref_skeleton(struct perf_opts *opts,
     ts_parser_delete(parser);
 }
 
-/* ── Phase 3c: Compiler optimization remarks ─────────────────────────── */
+/* ── Compiler optimization remarks (unchanged — subprocess) ──────────── */
 
 static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     if (opts->remarks_mode < 0) return 0;
@@ -1668,7 +2120,6 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     char *cc_out = run_cmd("cc --version 2>&1", &status, 0);
     int is_gcc = 0, is_clang = 0;
     if (cc_out) {
-        /* Lowercase scan */
         for (char *p = cc_out; *p; p++)
             *p = (*p >= 'A' && *p <= 'Z') ? *p + 32 : *p;
         if (strstr(cc_out, "gcc") || strstr(cc_out, "g++"))
@@ -1724,23 +2175,18 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     }
 
     for (int s = 0; s < n_src; s++) {
-        /* Build compile command for this source file */
         char cmd[8192];
         int found_cmd = 0;
 
-        /* Try compile_commands.json first */
         if (ccjson) {
             const char *basename = strrchr(src_files[s], '/');
             basename = basename ? basename + 1 : src_files[s];
 
-            /* Find "file":"...basename" entry */
             char needle[PATH_MAX];
             snprintf(needle, sizeof(needle), "\"file\":\"%s\"", basename);
-            /* Also try with path components */
             char *entry = strstr(ccjson, needle);
             if (!entry) {
                 snprintf(needle, sizeof(needle), "\"%s\"", basename);
-                /* Search for file field containing our basename */
                 char *p = ccjson;
                 while ((p = strstr(p, "\"file\"")) != NULL) {
                     char *colon = strchr(p + 6, ':');
@@ -1751,7 +2197,6 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                         q++;
                         char *end = strchr(q, '"');
                         if (end) {
-                            /* Check if this file entry matches */
                             const char *fn = end;
                             while (fn > q && fn[-1] != '/') fn--;
                             if ((size_t)(end - fn) == strlen(basename) &&
@@ -1765,9 +2210,7 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                 }
             }
             if (entry) {
-                /* Find "command" in same object (search backwards/forwards) */
                 char *cmd_field = NULL;
-                /* Search forward within ~2KB */
                 char *search = entry;
                 for (int tries = 0; tries < 2000 && *search; tries++, search++) {
                     if (strncmp(search, "\"command\"", 9) == 0) {
@@ -1775,7 +2218,6 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                         break;
                     }
                 }
-                /* Also search backward */
                 if (!cmd_field) {
                     search = entry;
                     for (int tries = 0; tries < 2000 && search > ccjson;
@@ -1801,8 +2243,6 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                                 orig_cmd[ci++] = *q++;
                             }
                             orig_cmd[ci] = '\0';
-                            /* Modify: replace -o ... with -S -o /dev/null,
-                               append remark flags */
                             const char *rflags = is_gcc ?
                                 "-fopt-info-optimized-missed" :
                                 "-Rpass=.* -Rpass-missed=.*";
@@ -1816,7 +2256,6 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
             }
         }
 
-        /* Fallback: standalone compilation */
         if (!found_cmd) {
             const char *rflags = is_gcc ?
                 "-fopt-info-optimized-missed" :
@@ -1829,14 +2268,11 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
         char *out = run_cmd(cmd, &status, opts->verbose);
         if (!out) continue;
 
-        /* Parse remark lines: file:line:col: category: message */
         char *line = out;
         while (line && *line) {
             char *nl = strchr(line, '\n');
             if (nl) *nl = '\0';
 
-            /* Match: "file:line:col: note/optimized/remark: ..." for both
-               GCC and Clang formats */
             char rfile[PATH_MAX];
             uint32_t rline;
             uint32_t rcol;
@@ -1844,17 +2280,13 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
             char message[512];
 
             int matched = 0;
-            /* GCC: file:line:col: optimized: message
-               Clang: file:line:col: remark: message */
             if (sscanf(line, "%[^:]:%u:%u: %63[^:]: %511[^\n]",
                        rfile, &rline, &rcol, category, message) == 5)
                 matched = 1;
 
             if (matched) {
-                /* Normalize category */
                 char *cat = category;
                 while (*cat == ' ') cat++;
-                /* Trim trailing spaces */
                 size_t catlen = strlen(cat);
                 while (catlen > 0 && cat[catlen-1] == ' ')
                     cat[--catlen] = '\0';
@@ -1869,23 +2301,19 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
                     continue;
                 }
 
-                /* Check if this line belongs to any hot function */
                 for (int f = 0; f < prof->n_funcs; f++) {
                     struct hot_func *hf = &prof->funcs[f];
                     if (!hf->source_file) continue;
 
-                    /* Match source file */
                     const char *hf_base = strrchr(hf->source_file, '/');
                     hf_base = hf_base ? hf_base + 1 : hf->source_file;
                     const char *rf_base = strrchr(rfile, '/');
                     rf_base = rf_base ? rf_base + 1 : rfile;
                     if (strcmp(hf_base, rf_base) != 0) continue;
 
-                    /* Check line range */
                     if (rline < hf->start_line || rline > hf->end_line)
                         continue;
 
-                    /* Count existing remarks for this function */
                     int func_remarks = 0;
                     for (int r = 0; r < prof->n_remarks; r++) {
                         if (strcmp(prof->remarks[r].func_name,
@@ -1933,7 +2361,7 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     return 0;
 }
 
-/* ── Phase 4: Output ─────────────────────────────────────────────────── */
+/* ── Output ──────────────────────────────────────────────────────────── */
 
 static const char *short_path(const char *path,
                               const char *source_dir) {
@@ -2109,7 +2537,6 @@ static void print_report(struct perf_opts *opts,
             struct remark_entry *re = &prof->remarks[i];
             if (!cur_func || strcmp(cur_func, re->func_name) != 0) {
                 cur_func = re->func_name;
-                /* Find source info */
                 for (int f = 0; f < prof->n_funcs; f++) {
                     if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
                         prof->funcs[f].source_file) {
@@ -2145,29 +2572,52 @@ static void print_report(struct perf_opts *opts,
 
 /* ── Pipeline ────────────────────────────────────────────────────────── */
 
-static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof,
-                        int has_debug) {
+static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
     fprintf(stderr, "profiling: %s\n", opts->cmd_str);
 
-    if (run_perf_stat(opts, &prof->stats) != 0)
-        fprintf(stderr, "warning: perf stat failed, continuing\n");
+    /* Phase 1: single-execution profiling */
+    struct raw_sample *cyc = NULL, *cm = NULL;
+    int n_cyc = 0, n_cm = 0;
+    uint64_t load_base = 0;
+    int want_cm = (opts->cachemiss_mode >= 0);
 
-    run_topdown(opts, prof);
-
-    if (run_perf_record(opts) != 0) {
-        fprintf(stderr, "error: perf record failed\n");
+    if (profile_child(opts, &prof->stats,
+                      &prof->topdown, &prof->has_topdown,
+                      &cyc, &n_cyc,
+                      want_cm ? &cm : NULL,
+                      want_cm ? &n_cm : NULL,
+                      &load_base) != 0) {
+        fprintf(stderr, "error: profiling failed\n");
         return -1;
     }
 
-    parse_perf_report(opts, prof);
-    parse_callers(opts, prof);
-    run_perf_annotate(opts, prof);
-    run_cache_misses(opts, prof);
-    run_mca(opts, prof);
-    run_uprof(opts, prof);
+    /* Phase 2: in-process analysis */
+    struct sym_resolver sr;
+    if (symres_init(&sr, opts->binary_path, load_base) != 0) {
+        fprintf(stderr, "warning: symbol resolution unavailable for %s\n",
+                opts->binary_path);
+        /* Continue with degraded output — counters still valid */
+    }
+
+    int has_debug = symres_has_debug(&sr);
+    if (!has_debug)
+        fprintf(stderr,
+            "warning: no debug symbols in %s "
+            "(build with -g for source annotations)\n",
+            opts->binary_path);
+
+    process_samples(&sr, cyc, n_cyc, cm, n_cm, opts, prof);
+
+    /* Phase 3: external tools (unchanged) */
     xref_skeleton(opts, prof);
+    run_mca(&sr, opts, prof);
+    run_uprof(opts, prof);
     run_remarks(opts, prof);
     run_pahole(opts, prof, has_debug);
+
+    symres_free(&sr);
+    free_raw_samples(cyc, n_cyc);
+    free_raw_samples(cm, n_cm);
 
     return 0;
 }
@@ -2231,11 +2681,10 @@ static void print_comparison(struct perf_opts *opts,
                                   / sa->branch_miss_pct : 0);
     printf("\n");
 
-    /* Hot function delta — merge by name, with caller info */
+    /* Hot function delta */
     printf("--- hot functions (A -> B) ---\n");
     printf("  A%%    B%%   delta  function\n");
 
-    /* Print functions in B, matching against A */
     for (int b = 0; b < prof_b->n_funcs; b++) {
         char bclean[256];
         snprintf(bclean, sizeof(bclean), "%s", prof_b->funcs[b].name);
@@ -2346,7 +2795,7 @@ static void print_comparison(struct perf_opts *opts,
     }
     printf("\n");
 
-    /* Per-function cache miss hotspots — top 3 per matched function */
+    /* Per-function cache miss hotspots */
     if (prof_a->n_cm_sites > 0 && prof_b->n_cm_sites > 0) {
         printf("--- cache miss hotspots A -> B ---\n");
         for (int b = 0; b < prof_b->n_funcs; b++) {
@@ -2395,7 +2844,7 @@ static void print_comparison(struct perf_opts *opts,
         printf("\n");
     }
 
-    /* Hot instruction summary — top 3 per matched function */
+    /* Hot instruction summary */
     if (prof_a->n_insns > 0 && prof_b->n_insns > 0) {
         printf("--- hot instructions A -> B ---\n");
         for (int b = 0; b < prof_b->n_funcs; b++) {
@@ -2500,7 +2949,6 @@ static void print_comparison(struct perf_opts *opts,
         int any_diff = 0;
         const char *cur_func = NULL;
 
-        /* A-only remarks (lost or changed in B) */
         for (int i = 0; i < prof_a->n_remarks; i++) {
             struct remark_entry *ra = &prof_a->remarks[i];
             int found = 0;
@@ -2524,7 +2972,6 @@ static void print_comparison(struct perf_opts *opts,
                 any_diff = 1;
             }
         }
-        /* B-only remarks (new in B) */
         cur_func = NULL;
         for (int j = 0; j < prof_b->n_remarks; j++) {
             if (b_matched[j]) continue;
@@ -2603,7 +3050,6 @@ int perf_main(int argc, char *argv[]) {
     struct perf_opts opts = {
         .top_n      = 10,
         .insns_n    = 10,
-        .runs       = 3,
         .build_cmd  = "make",
         .no_build   = 0,
         .uprof_mode = 0,
@@ -2613,12 +3059,11 @@ int perf_main(int argc, char *argv[]) {
 
     optind = 1;
     int opt;
-    while ((opt = getopt_long(argc, argv, "n:i:r:b:s:vh",
+    while ((opt = getopt_long(argc, argv, "n:i:b:s:vh",
                               perf_long_options, NULL)) != -1) {
         switch (opt) {
         case 'n': opts.top_n    = atoi(optarg); break;
         case 'i': opts.insns_n  = atoi(optarg); break;
-        case 'r': opts.runs     = atoi(optarg); break;
         case 'b': opts.build_cmd = optarg;      break;
         case PERF_OPT_NO_BUILD: opts.no_build   = 1;  break;
         case PERF_OPT_UPROF:       opts.uprof_mode    =  1; break;
@@ -2652,7 +3097,7 @@ int perf_main(int argc, char *argv[]) {
     opts.cmd_str = join_argv(opts.cmd_argv, opts.cmd_argc);
     opts.binary_path = resolve_binary(opts.cmd_argv[0]);
 
-    /* Temp directory for perf data */
+    /* Temp directory for llvm-mca and uprof temp files */
     snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/archmap-XXXXXX");
     if (!mkdtemp(g_tmpdir)) {
         perror("mkdtemp");
@@ -2668,11 +3113,6 @@ int perf_main(int argc, char *argv[]) {
     /* Check prerequisites */
     if (check_perf_access() != 0) goto fail;
 
-    if (!has_tool("perf")) {
-        fprintf(stderr, "error: 'perf' not found in PATH\n");
-        goto fail;
-    }
-
     if (opts.vs_binary) {
         /* ── A/B comparison mode ─────────────────────────────── */
         char top_tmpdir[PATH_MAX];
@@ -2687,16 +3127,15 @@ int perf_main(int argc, char *argv[]) {
             goto fail;
         }
 
-        /* Build A command: a_binary + B's trailing args */
         char **a_argv = malloc((size_t)opts.cmd_argc * sizeof(char *));
         a_argv[0] = a_binary;
         for (int i = 1; i < opts.cmd_argc; i++)
             a_argv[i] = opts.cmd_argv[i];
         char *a_cmd_str = join_argv(a_argv, opts.cmd_argc);
 
-        /* Save B's state */
         char *b_cmd_str = opts.cmd_str;
         char *b_binary = opts.binary_path;
+        char **b_argv = opts.cmd_argv;
 
         /* Run A pipeline */
         char a_dir[PATH_MAX];
@@ -2706,15 +3145,15 @@ int perf_main(int argc, char *argv[]) {
 
         opts.cmd_str = a_cmd_str;
         opts.binary_path = a_binary;
+        opts.cmd_argv = a_argv;
         int saved_no_build = opts.no_build;
-        opts.no_build = 1;  /* A is pre-built */
+        opts.no_build = 1;
 
-        int has_debug_a = check_debug_symbols(a_binary);
         struct perf_profile prof_a;
         memset(&prof_a, 0, sizeof(prof_a));
 
         fprintf(stderr, "=== A (baseline): %s ===\n", a_cmd_str);
-        int a_ok = run_pipeline(&opts, &prof_a, has_debug_a);
+        int a_ok = run_pipeline(&opts, &prof_a);
 
         /* Run B pipeline */
         char b_dir[PATH_MAX];
@@ -2724,14 +3163,14 @@ int perf_main(int argc, char *argv[]) {
 
         opts.cmd_str = b_cmd_str;
         opts.binary_path = b_binary;
+        opts.cmd_argv = b_argv;
         opts.no_build = saved_no_build;
 
-        int has_debug_b = check_debug_symbols(b_binary);
         struct perf_profile prof_b;
         memset(&prof_b, 0, sizeof(prof_b));
 
         fprintf(stderr, "=== B (new): %s ===\n", b_cmd_str);
-        int b_ok = run_pipeline(&opts, &prof_b, has_debug_b);
+        int b_ok = run_pipeline(&opts, &prof_b);
 
         /* Restore g_tmpdir for cleanup */
         strcpy(g_tmpdir, top_tmpdir);
@@ -2755,17 +3194,10 @@ int perf_main(int argc, char *argv[]) {
     }
 
     /* ── Normal single-profile path ──────────────────────── */
-    int has_debug = check_debug_symbols(opts.binary_path);
-    if (!has_debug)
-        fprintf(stderr,
-            "warning: no debug symbols in %s "
-            "(build with -g for source annotations)\n",
-            opts.binary_path);
-
     struct perf_profile prof;
     memset(&prof, 0, sizeof(prof));
 
-    if (run_pipeline(&opts, &prof, has_debug) != 0)
+    if (run_pipeline(&opts, &prof) != 0)
         goto fail;
 
     print_report(&opts, &prof);

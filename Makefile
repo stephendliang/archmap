@@ -8,7 +8,7 @@ OPTFLAGS = -O3 -march=native -flto \
            -mavx512f -mavx512bw
 
 CFLAGS  ?= $(OPTFLAGS) -Wall -Wextra -std=gnu11
-LDFLAGS ?= -lgit2
+LDFLAGS ?= -lgit2 -ldw -lelf -lcapstone -lpfm
 
 # Vendor paths
 TS_DIR  = vendor/tree-sitter
