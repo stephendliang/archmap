@@ -473,22 +473,29 @@ static void counters_close(struct counter_group *cg) {
     }
 }
 
-/* ── Topdown group — replaces run_topdown_intel/amd() ────────────────── */
+/* ── Topdown — replaces run_topdown_intel/amd() ──────────────────────
+   Each event opened independently (same as counters) so each gets its
+   own multiplexing scale factor.  This matches what `perf stat -M`
+   does and avoids group-scheduling skew where the 4-event group only
+   runs during non-representative workload phases. */
 
 #define MAX_TOPDOWN 4
+
+enum topdown_model { TOPDOWN_INTEL, TOPDOWN_AMD };
 
 struct topdown_group {
     int fds[MAX_TOPDOWN];
     int n_events;
-    int is_intel;
+    enum topdown_model model;
+    int dispatch_width;     /* AMD only: 8 for Zen5+, 6 for Zen2-4 */
 };
 
 static int topdown_try_events(pid_t child, struct topdown_group *tg,
                                const char **event_names, int n_events,
-                               int is_intel) {
+                               enum topdown_model model) {
     for (int i = 0; i < MAX_TOPDOWN; i++) tg->fds[i] = -1;
     tg->n_events = 0;
-    tg->is_intel = is_intel;
+    tg->model = model;
 
     for (int i = 0; i < n_events && i < MAX_TOPDOWN; i++) {
         struct perf_event_attr attr;
@@ -510,15 +517,13 @@ static int topdown_try_events(pid_t child, struct topdown_group *tg,
 
         attr.exclude_kernel = 1;
         attr.exclude_hv = 1;
-        if (i == 0) {
-            attr.disabled = 1;
-            attr.enable_on_exec = 1;
-            attr.read_format = PERF_FORMAT_GROUP;
-        }
+        attr.disabled = 1;
+        attr.enable_on_exec = 1;
+        attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+                           PERF_FORMAT_TOTAL_TIME_RUNNING;
 
-        int group_fd = (i == 0) ? -1 : tg->fds[0];
         tg->fds[i] = (int)syscall(SYS_perf_event_open, &attr, child,
-                                   -1, group_fd, PERF_FLAG_FD_CLOEXEC);
+                                   -1, -1, PERF_FLAG_FD_CLOEXEC);
         if (tg->fds[i] < 0) {
             for (int j = 0; j < i; j++) { close(tg->fds[j]); tg->fds[j] = -1; }
             tg->n_events = 0;
@@ -527,6 +532,20 @@ static int topdown_try_events(pid_t child, struct topdown_group *tg,
         tg->n_events++;
     }
     return 0;
+}
+
+/* Detect AMD dispatch width from CPUID family:
+   Zen5 (family 0x1A+) = 8 wide, Zen2/3/4 (family 0x17-0x19) = 6 wide */
+static int amd_dispatch_width(void) {
+    FILE *fp = fopen("/proc/cpuinfo", "r");
+    if (!fp) return 6;
+    char line[256];
+    int family = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "cpu family : %d", &family) == 1) break;
+    }
+    fclose(fp);
+    return (family >= 0x1A) ? 8 : 6;
 }
 
 static int topdown_open(pid_t child, struct topdown_group *tg, int mode) {
@@ -543,18 +562,21 @@ static int topdown_open(pid_t child, struct topdown_group *tg, int mode) {
         "TOPDOWN_FE_BOUND:u",
         "TOPDOWN_BE_BOUND:u",
     };
-    if (topdown_try_events(child, tg, intel_events, 4, 1) == 0)
+    if (topdown_try_events(child, tg, intel_events, 4, TOPDOWN_INTEL) == 0)
         return 0;
 
-    /* Try AMD Zen dispatch events */
+    /* AMD Zen: retired_ops, backend_stalls, frontend_stalls, cycles
+       Topdown L1 = each / (dispatch_width × cycles) */
     static const char *amd_events[] = {
-        "de_src_op_disp.all:u",
-        "de_no_dispatch_per_slot.backend_stalls:u",
-        "de_no_dispatch_per_slot.no_ops_from_frontend:u",
-        "de_no_dispatch_per_slot.smt_contention:u",
+        "RETIRED_OPS:u",
+        "DISPATCH_STALLS_1:BE_STALLS:u",
+        "DISPATCH_STALLS_1:FE_NO_OPS:u",
+        "CYCLES_NOT_IN_HALT:u",
     };
-    if (topdown_try_events(child, tg, amd_events, 4, 0) == 0)
+    if (topdown_try_events(child, tg, amd_events, 4, TOPDOWN_AMD) == 0) {
+        tg->dispatch_width = amd_dispatch_width();
         return 0;
+    }
 
     if (mode > 0)
         fprintf(stderr,
@@ -567,38 +589,36 @@ static int topdown_read(struct topdown_group *tg, struct topdown_metrics *td) {
     memset(td, 0, sizeof(*td));
     if (tg->fds[0] < 0 || tg->n_events == 0) return -1;
 
-    struct {
-        uint64_t nr;
-        uint64_t values[MAX_TOPDOWN];
-    } data;
-
-    size_t expect = sizeof(uint64_t) * (1 + (unsigned)tg->n_events);
-    ssize_t n = read(tg->fds[0], &data, expect);
-    if (n < (ssize_t)expect) return -1;
+    /* Read each event individually with its own multiplexing scale */
+    uint64_t vals[MAX_TOPDOWN];
+    for (int i = 0; i < tg->n_events; i++)
+        vals[i] = read_one_counter(tg->fds[i]);
 
     td->level = 1;
 
-    if (tg->is_intel) {
+    if (tg->model == TOPDOWN_INTEL) {
         uint64_t total = 0;
         for (int i = 0; i < tg->n_events; i++)
-            total += data.values[i];
+            total += vals[i];
         if (total == 0) return -1;
-        td->retiring = 100.0 * data.values[0] / total;
-        td->bad_spec = 100.0 * data.values[1] / total;
-        td->frontend = 100.0 * data.values[2] / total;
-        td->backend  = 100.0 * data.values[3] / total;
+        td->retiring = 100.0 * vals[0] / total;
+        td->bad_spec = 100.0 * vals[1] / total;
+        td->frontend = 100.0 * vals[2] / total;
+        td->backend  = 100.0 * vals[3] / total;
     } else {
-        /* AMD: dispatched + backend + frontend + smt = total slots */
-        uint64_t dispatched = data.values[0];
-        uint64_t be = data.values[1];
-        uint64_t fe = data.values[2];
-        uint64_t smt = data.values[3];
-        uint64_t total = dispatched + be + fe + smt;
+        /* AMD: total_slots = dispatch_width × unhalted_cycles
+           [0]=retired_ops  [1]=be_stalls  [2]=fe_stalls  [3]=cycles */
+        uint64_t retired = vals[0];
+        uint64_t be      = vals[1];
+        uint64_t fe      = vals[2];
+        uint64_t cycles  = vals[3];
+        uint64_t total   = (uint64_t)tg->dispatch_width * cycles;
         if (total == 0) return -1;
-        td->retiring = 100.0 * dispatched / total;
+        td->retiring = 100.0 * retired / total;
         td->backend  = 100.0 * be / total;
-        td->frontend = 100.0 * (fe + smt) / total;
-        td->bad_spec = 0;
+        td->frontend = 100.0 * fe / total;
+        td->bad_spec = 100.0 - td->retiring - td->backend - td->frontend;
+        if (td->bad_spec < 0) td->bad_spec = 0;
     }
     return 0;
 }
