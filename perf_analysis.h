@@ -88,6 +88,7 @@ struct hot_insn {
     double pct;
     char *asm_text;
     uint32_t source_line;
+    char *source_file;
 };
 
 struct uprof_func {
@@ -116,6 +117,8 @@ struct cache_miss_site {
     uint32_t source_line;
     double pct;               /* % of total cache-miss samples */
     char *asm_text;
+    char *source_file;
+    uint64_t data_addr;       /* data virtual address (0 if unavailable) */
 };
 
 struct struct_layout {
@@ -135,6 +138,22 @@ struct remark_entry {
     char *message;
 };
 
+struct mem_hotspot {
+    char *func_name;
+    uint32_t source_line;
+    char *source_file;
+    char *asm_text;
+    uint64_t cache_line;    /* data_addr >> 6 */
+    double pct;             /* % of total cache-miss samples with ADDR */
+    int n_samples;          /* raw sample count */
+};
+
+struct run_stats {
+    double mean, stddev;
+    int n;
+    double *values;         /* raw values from each run */
+};
+
 struct perf_profile {
     struct perf_stats stats;
     struct hot_func *funcs;
@@ -147,8 +166,12 @@ struct perf_profile {
     int has_topdown;
     struct mca_block *mca_blocks;    int n_mca_blocks;
     struct cache_miss_site *cm_sites; int n_cm_sites;
+    struct mem_hotspot *mem_hotspots; int n_mem_hotspots;
     struct struct_layout *layouts;    int n_layouts;
     struct remark_entry *remarks;    int n_remarks;
+    int n_runs;
+    struct run_stats rs_cycles, rs_insns, rs_ipc, rs_wall;
+    struct run_stats rs_cache_miss_pct, rs_branch_miss_pct;
 };
 
 /* ── Entry point ───────────────────────────────────────────────────── */

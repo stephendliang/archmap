@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <math.h>
 
 #include <linux/perf_event.h>
 #include <perfmon/pfmlib_perf_event.h>
@@ -58,6 +59,7 @@ struct perf_opts {
     int remarks_mode;     /* 0=auto, 1=force, -1=skip */
     const char *source_dir;
     int verbose;
+    int n_runs;           /* 0=auto (1 for single, 5 for A/B), >0=explicit */
     char **cmd_argv;
     int cmd_argc;
     char *binary_path;
@@ -80,6 +82,7 @@ enum {
     PERF_OPT_VS,
     PERF_OPT_REMARKS,
     PERF_OPT_NO_REMARKS,
+    PERF_OPT_RUNS,
 };
 
 static struct option perf_long_options[] = {
@@ -100,6 +103,7 @@ static struct option perf_long_options[] = {
     {"vs",             required_argument, NULL, PERF_OPT_VS},
     {"remarks",        no_argument,       NULL, PERF_OPT_REMARKS},
     {"no-remarks",     no_argument,       NULL, PERF_OPT_NO_REMARKS},
+    {"runs",           required_argument, NULL, PERF_OPT_RUNS},
     {"source",         required_argument, NULL, 's'},
     {"verbose",   no_argument,       NULL, 'v'},
     {"help",      no_argument,       NULL, 'h'},
@@ -122,6 +126,7 @@ static void perf_usage(const char *prog) {
         "  --pahole / --no-pahole       Force/skip struct layout analysis\n"
         "  --remarks / --no-remarks     Force/skip compiler optimization remarks\n"
         "  --vs BINARY                  A/B comparison: baseline binary (A)\n"
+        "  --runs N                     Number of profiling runs (default: 1, A/B: 5)\n"
         "  -s, --source DIR     Source dir for skeleton xref (default \".\")\n"
         "  -v, --verbose        Print tool commands\n",
         prog);
@@ -366,6 +371,7 @@ static int phase_build(struct perf_opts *opts) {
 
 struct raw_sample {
     uint64_t ip;
+    uint64_t addr;      /* data virtual address (0 if not sampled) */
     uint64_t *ips;      /* callchain IPs (NULL if no callchain) */
     int n_ips;
 };
@@ -639,6 +645,7 @@ struct sample_ring {
     int fd;
     void *mmap_base;
     size_t mmap_size;
+    uint64_t sample_type;   /* stored for type-driven drain parsing */
 };
 
 struct sampling_ctx {
@@ -652,6 +659,7 @@ static int ring_open(pid_t child, struct sample_ring *ring,
     ring->fd = -1;
     ring->mmap_base = MAP_FAILED;
     ring->mmap_size = 0;
+    ring->sample_type = sample_type;
 
     struct perf_event_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -696,10 +704,16 @@ static int sampling_open(pid_t child, struct sampling_ctx *ctx,
                         PERF_SAMPLE_IP | PERF_SAMPLE_CALLCHAIN);
     if (ret < 0) return -1;
 
-    if (want_cache_misses)
-        ring_open(child, &ctx->cache_misses,
-                  PERF_COUNT_HW_CACHE_MISSES, 1000,
-                  PERF_SAMPLE_IP);
+    if (want_cache_misses) {
+        /* Try with PERF_SAMPLE_ADDR for memory attribution, fall back to IP-only */
+        int cm_ret = ring_open(child, &ctx->cache_misses,
+                               PERF_COUNT_HW_CACHE_MISSES, 1000,
+                               PERF_SAMPLE_IP | PERF_SAMPLE_ADDR);
+        if (cm_ret < 0)
+            ring_open(child, &ctx->cache_misses,
+                      PERF_COUNT_HW_CACHE_MISSES, 1000,
+                      PERF_SAMPLE_IP);
+    }
     /* cache-miss ring failure is non-fatal */
     return 0;
 }
@@ -757,23 +771,31 @@ static int sampling_drain(struct sample_ring *ring,
                 struct raw_sample *s = &(*out)[(*n_out)++];
                 memset(s, 0, sizeof(*s));
 
-                /* PERF_SAMPLE_IP is first */
-                if (payload >= sizeof(uint64_t))
-                    memcpy(&s->ip, record, sizeof(uint64_t));
-
-                /* PERF_SAMPLE_CALLCHAIN follows if present */
-                if (payload > sizeof(uint64_t)) {
+                /* Type-driven field parsing: fields appear in bit order */
+                size_t pos = 0;
+                if (ring->sample_type & PERF_SAMPLE_IP) {
+                    if (pos + 8 <= payload) {
+                        memcpy(&s->ip, record + pos, 8);
+                        pos += 8;
+                    }
+                }
+                if (ring->sample_type & PERF_SAMPLE_ADDR) {
+                    if (pos + 8 <= payload) {
+                        memcpy(&s->addr, record + pos, 8);
+                        pos += 8;
+                    }
+                }
+                if (ring->sample_type & PERF_SAMPLE_CALLCHAIN) {
                     uint64_t nr;
-                    size_t chain_off = sizeof(uint64_t);
-                    if (chain_off + sizeof(uint64_t) <= payload) {
-                        memcpy(&nr, record + chain_off, sizeof(uint64_t));
-                        chain_off += sizeof(uint64_t);
+                    if (pos + 8 <= payload) {
+                        memcpy(&nr, record + pos, 8);
+                        pos += 8;
                         if (nr > 0 && nr < 256 &&
-                            chain_off + nr * sizeof(uint64_t) <= payload) {
+                            pos + nr * 8 <= payload) {
                             s->n_ips = (int)nr;
-                            s->ips = malloc(nr * sizeof(uint64_t));
-                            memcpy(s->ips, record + chain_off,
-                                   nr * sizeof(uint64_t));
+                            s->ips = malloc(nr * 8);
+                            memcpy(s->ips, record + pos, nr * 8);
+                            pos += nr * 8;
                         }
                     }
                 }
@@ -1393,7 +1415,7 @@ static int process_samples(struct sym_resolver *sr,
 
                 /* Get source line */
                 uint32_t src_line = 0;
-                const char *src_file;
+                const char *src_file = NULL;
                 int sline;
                 if (symres_srcline(sr, ip, &src_file, &sline) == 0)
                     src_line = (uint32_t)sline;
@@ -1409,6 +1431,7 @@ static int process_samples(struct sym_resolver *sr,
                 hi->pct = pct;
                 hi->asm_text = strdup(asm_buf);
                 hi->source_line = src_line;
+                hi->source_file = src_file ? strdup(src_file) : NULL;
             }
 
             free(ip_buckets);
@@ -1433,8 +1456,8 @@ static int process_samples(struct sym_resolver *sr,
                                   &func_len) != 0)
                 continue;
 
-            /* Bucket cache-miss samples by IP */
-            struct { uint64_t ip; int count; } *ip_buckets = NULL;
+            /* Bucket cache-miss samples by IP, track most common data addr */
+            struct { uint64_t ip; uint64_t top_addr; int count; } *ip_buckets = NULL;
             int n_ip = 0, cap_ip = 64;
             ip_buckets = calloc((size_t)cap_ip, sizeof(*ip_buckets));
 
@@ -1450,6 +1473,9 @@ static int process_samples(struct sym_resolver *sr,
                     }
                     if (found >= 0) {
                         ip_buckets[found].count++;
+                        /* Keep first non-zero data addr as representative */
+                        if (!ip_buckets[found].top_addr && cm_samples[s].addr)
+                            ip_buckets[found].top_addr = cm_samples[s].addr;
                     } else {
                         if (n_ip >= cap_ip) {
                             cap_ip *= 2;
@@ -1457,6 +1483,7 @@ static int process_samples(struct sym_resolver *sr,
                                 (size_t)cap_ip * sizeof(*ip_buckets));
                         }
                         ip_buckets[n_ip].ip = ip;
+                        ip_buckets[n_ip].top_addr = cm_samples[s].addr;
                         ip_buckets[n_ip].count = 1;
                         n_ip++;
                     }
@@ -1468,10 +1495,13 @@ static int process_samples(struct sym_resolver *sr,
                 for (int j = i + 1; j < n_ip; j++)
                     if (ip_buckets[j].count > ip_buckets[i].count) {
                         uint64_t ti = ip_buckets[i].ip;
+                        uint64_t ta = ip_buckets[i].top_addr;
                         int tc = ip_buckets[i].count;
                         ip_buckets[i].ip = ip_buckets[j].ip;
+                        ip_buckets[i].top_addr = ip_buckets[j].top_addr;
                         ip_buckets[i].count = ip_buckets[j].count;
                         ip_buckets[j].ip = ti;
+                        ip_buckets[j].top_addr = ta;
                         ip_buckets[j].count = tc;
                     }
 
@@ -1497,7 +1527,7 @@ static int process_samples(struct sym_resolver *sr,
                 cs_free(insn, cnt);
 
                 uint32_t src_line = 0;
-                const char *src_file;
+                const char *src_file = NULL;
                 int sline;
                 if (symres_srcline(sr, ip, &src_file, &sline) == 0)
                     src_line = (uint32_t)sline;
@@ -1513,10 +1543,140 @@ static int process_samples(struct sym_resolver *sr,
                 cm->source_line = src_line;
                 cm->pct = pct;
                 cm->asm_text = strdup(asm_buf);
+                cm->source_file = src_file ? strdup(src_file) : NULL;
+                cm->data_addr = ip_buckets[k].top_addr;
             }
 
             free(ip_buckets);
             free(func_bytes);
+        }
+    }
+
+    /* ── Pass 5: Memory hotspot attribution (PERF_SAMPLE_ADDR) ──────── */
+
+    if (cm_samples && n_cm > 0 && sr->cs_ok) {
+        /* Check if any sample has addr != 0 */
+        int has_addr = 0;
+        for (int i = 0; i < n_cm && !has_addr; i++)
+            if (cm_samples[i].addr) has_addr = 1;
+
+        if (has_addr) {
+            /* Bucket by (func_name, cache_line = addr >> 6) */
+            struct mem_bucket {
+                char func[256];
+                uint64_t cache_line;
+                uint64_t ip;      /* representative IP for disassembly */
+                int count;
+            };
+            int n_mb = 0, cap_mb = 256;
+            struct mem_bucket *mbs = calloc((size_t)cap_mb, sizeof(*mbs));
+
+            for (int i = 0; i < n_cm; i++) {
+                if (!cm_samples[i].addr) continue;
+                const char *fname = symres_func_name(sr, cm_samples[i].ip);
+                if (!fname) continue;
+
+                char clean[256];
+                snprintf(clean, sizeof(clean), "%s", fname);
+                strip_compiler_suffix(clean);
+                uint64_t cl = cm_samples[i].addr >> 6;
+
+                int found = -1;
+                for (int j = 0; j < n_mb; j++) {
+                    if (mbs[j].cache_line == cl &&
+                        strcmp(mbs[j].func, clean) == 0) {
+                        found = j;
+                        break;
+                    }
+                }
+                if (found >= 0) {
+                    mbs[found].count++;
+                } else {
+                    if (n_mb >= cap_mb) {
+                        cap_mb *= 2;
+                        mbs = realloc(mbs, (size_t)cap_mb * sizeof(*mbs));
+                    }
+                    snprintf(mbs[n_mb].func, sizeof(mbs[n_mb].func),
+                             "%s", clean);
+                    mbs[n_mb].cache_line = cl;
+                    mbs[n_mb].ip = cm_samples[i].ip;
+                    mbs[n_mb].count = 1;
+                    n_mb++;
+                }
+            }
+
+            /* Count total samples with addr */
+            int total_addr = 0;
+            for (int i = 0; i < n_mb; i++) total_addr += mbs[i].count;
+
+            /* Sort by count descending */
+            for (int i = 0; i < n_mb - 1; i++)
+                for (int j = i + 1; j < n_mb; j++)
+                    if (mbs[j].count > mbs[i].count) {
+                        struct mem_bucket tmp = mbs[i];
+                        mbs[i] = mbs[j];
+                        mbs[j] = tmp;
+                    }
+
+            /* Take top entries */
+            int take = n_mb < opts->top_n * 2 ? n_mb : opts->top_n * 2;
+            int mh_cap = take > 0 ? take : 1;
+            prof->mem_hotspots = malloc((size_t)mh_cap *
+                                        sizeof(*prof->mem_hotspots));
+            prof->n_mem_hotspots = 0;
+
+            for (int k = 0; k < take; k++) {
+                double pct = total_addr > 0
+                    ? 100.0 * mbs[k].count / total_addr : 0;
+                if (pct < 0.1) break;
+
+                uint64_t ip = mbs[k].ip;
+
+                /* Disassemble */
+                char asm_buf[256];
+                asm_buf[0] = '\0';
+
+                /* Find func range to disassemble */
+                uint64_t func_start;
+                uint8_t *func_bytes;
+                size_t func_len;
+                if (symres_func_range(sr, mbs[k].func,
+                                      &func_start, &func_bytes,
+                                      &func_len) == 0) {
+                    uint64_t offset = ip - func_start;
+                    if (offset < func_len) {
+                        cs_insn *dinsn;
+                        size_t dcnt = cs_disasm(sr->cs_handle,
+                                                func_bytes + offset,
+                                                func_len - (size_t)offset,
+                                                ip, 1, &dinsn);
+                        if (dcnt > 0) {
+                            snprintf(asm_buf, sizeof(asm_buf), "%s %s",
+                                     dinsn[0].mnemonic, dinsn[0].op_str);
+                            cs_free(dinsn, dcnt);
+                        }
+                    }
+                    free(func_bytes);
+                }
+
+                uint32_t src_line = 0;
+                const char *src_file = NULL;
+                int sline;
+                if (symres_srcline(sr, ip, &src_file, &sline) == 0)
+                    src_line = (uint32_t)sline;
+
+                struct mem_hotspot *mh =
+                    &prof->mem_hotspots[prof->n_mem_hotspots++];
+                mh->func_name = strdup(mbs[k].func);
+                mh->source_line = src_line;
+                mh->source_file = src_file ? strdup(src_file) : NULL;
+                mh->asm_text = strdup(asm_buf);
+                mh->cache_line = mbs[k].cache_line;
+                mh->pct = pct;
+                mh->n_samples = mbs[k].count;
+            }
+
+            free(mbs);
         }
     }
 
@@ -2381,6 +2541,122 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     return 0;
 }
 
+/* ── Source interleaving helpers ──────────────────────────────────────── */
+
+/* Returns array where lines[i] points to start of line i (1-indexed).
+   lines[0] = NULL. Caller frees the array (not the strings — they point
+   into src). *n_lines is set to the highest valid line number. */
+static char **index_source_lines(const char *src, long len, int *n_lines) {
+    int cap = 256, n = 0;
+    char **lines = calloc((size_t)cap, sizeof(char *));
+    const char *p = src, *end = src + len;
+    while (p < end) {
+        n++;
+        if (n >= cap) { cap *= 2; lines = realloc(lines, (size_t)cap * sizeof(char *)); }
+        lines[n] = (char *)p;
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        p = nl ? nl + 1 : end;
+    }
+    *n_lines = n;
+    return lines;
+}
+
+/* Print source line with leading whitespace trimmed, no trailing newline */
+static void print_source_line(const char *line) {
+    /* skip leading whitespace */
+    while (*line == ' ' || *line == '\t') line++;
+    /* print until newline or NUL */
+    while (*line && *line != '\n' && *line != '\r') {
+        putchar(*line);
+        line++;
+    }
+}
+
+/* ── Statistics ───────────────────────────────────────────────────────── */
+
+static void compute_stats(struct run_stats *rs) {
+    if (rs->n <= 0) { rs->mean = rs->stddev = 0; return; }
+    double sum = 0;
+    for (int i = 0; i < rs->n; i++) sum += rs->values[i];
+    rs->mean = sum / rs->n;
+    if (rs->n < 2) { rs->stddev = 0; return; }
+    double ss = 0;
+    for (int i = 0; i < rs->n; i++) {
+        double d = rs->values[i] - rs->mean;
+        ss += d * d;
+    }
+    rs->stddev = sqrt(ss / (rs->n - 1));
+}
+
+/* Student's t CDF approximation (Abramowitz & Stegun 26.2.17 + beta) */
+static double t_cdf(double t_val, double df) {
+    /* Use the regularized incomplete beta function relationship:
+       I_x(a, b) where x = df/(df + t^2), a = df/2, b = 0.5 */
+    double x = df / (df + t_val * t_val);
+    double a = df / 2.0, b = 0.5;
+
+    /* Compute I_x(a, b) via continued fraction (Lentz's method) */
+    /* First compute Beta(a,b) via lgamma */
+    double lbeta = lgamma(a) + lgamma(b) - lgamma(a + b);
+
+    /* Compute I_x using the series expansion for small x*a/(a+b) */
+    double prefix = exp(a * log(x) + b * log(1.0 - x) - lbeta) / a;
+    double sum = 1.0, term = 1.0;
+    for (int n = 0; n < 200; n++) {
+        term *= x * (double)(n + 1 - b) / (double)(n + 1 + a);
+        sum += term;
+        if (fabs(term) < 1e-12 * fabs(sum)) break;
+    }
+    double ix = prefix * sum;
+
+    /* CDF = 1 - 0.5 * I_x(df/2, 0.5) for t > 0 */
+    if (t_val >= 0)
+        return 1.0 - 0.5 * ix;
+    else
+        return 0.5 * ix;
+}
+
+static double welch_t_test(struct run_stats *a, struct run_stats *b) {
+    if (a->n < 2 || b->n < 2) return 1.0;
+    double va = a->stddev * a->stddev, vb = b->stddev * b->stddev;
+    double se = sqrt(va / a->n + vb / b->n);
+    if (se < 1e-15) return (fabs(a->mean - b->mean) < 1e-15) ? 1.0 : 0.0;
+    double t_val = (a->mean - b->mean) / se;
+
+    /* Welch-Satterthwaite degrees of freedom */
+    double num = (va / a->n + vb / b->n);
+    num *= num;
+    double denom = (va * va) / ((double)a->n * a->n * (a->n - 1)) +
+                   (vb * vb) / ((double)b->n * b->n * (b->n - 1));
+    double df = denom > 0 ? num / denom : 2.0;
+
+    /* Two-sided p-value */
+    double p = 2.0 * (1.0 - t_cdf(fabs(t_val), df));
+    if (p < 0) p = 0;
+    if (p > 1) p = 1;
+    return p;
+}
+
+static const char *sig_marker(double p) {
+    if (p < 0.001) return "***";
+    if (p < 0.01)  return "**";
+    if (p < 0.05)  return "*";
+    return "ns";
+}
+
+static void fmt_stddev(char *buf, size_t sz, double stddev) {
+    if (stddev >= 1e9)
+        snprintf(buf, sz, "%.2fG", stddev / 1e9);
+    else if (stddev >= 1e6)
+        snprintf(buf, sz, "%.1fM", stddev / 1e6);
+    else if (stddev >= 1e3)
+        snprintf(buf, sz, "%.0fK", stddev / 1e3);
+    else if (stddev >= 1.0)
+        snprintf(buf, sz, "%.0f", stddev);
+    else
+        snprintf(buf, sz, "%.2f", stddev);
+}
+
 /* ── Output ──────────────────────────────────────────────────────────── */
 
 static const char *short_path(const char *path,
@@ -2410,8 +2686,21 @@ static void print_report(struct perf_opts *opts,
     fmt_count(c_bm,   sizeof(c_bm),   s->branch_misses);
 
     printf("=== perf: %s ===\n", opts->cmd_str);
-    printf("cycles: %s  insn: %s  IPC: %.2f  wall: %.2fs\n",
-           c_cyc, c_insn, s->ipc, s->wall_seconds);
+    if (prof->n_runs > 1) {
+        char sd_cyc[32], sd_insn[32], sd_ipc[32], sd_wall[32];
+        fmt_stddev(sd_cyc,  sizeof(sd_cyc),  prof->rs_cycles.stddev);
+        fmt_stddev(sd_insn, sizeof(sd_insn), prof->rs_insns.stddev);
+        fmt_stddev(sd_ipc,  sizeof(sd_ipc),  prof->rs_ipc.stddev);
+        snprintf(sd_wall, sizeof(sd_wall), "%.2f", prof->rs_wall.stddev);
+        printf("cycles: %s \302\261%s  insn: %s \302\261%s"
+               "  IPC: %.2f \302\261%s  wall: %.2fs \302\261%ss"
+               "  (%d runs)\n",
+               c_cyc, sd_cyc, c_insn, sd_insn,
+               s->ipc, sd_ipc, s->wall_seconds, sd_wall, prof->n_runs);
+    } else {
+        printf("cycles: %s  insn: %s  IPC: %.2f  wall: %.2fs\n",
+               c_cyc, c_insn, s->ipc, s->wall_seconds);
+    }
     printf("cache: %.1f%% miss (%s/%s)  branch: %.1f%% miss (%s/%s)\n",
            s->cache_miss_pct, c_cm, c_cr,
            s->branch_miss_pct, c_bm, c_br);
@@ -2460,34 +2749,64 @@ static void print_report(struct perf_opts *opts,
         printf("\n");
     }
 
-    /* Hot instructions */
+    /* Hot instructions (with source interleaving) */
     if (prof->n_insns > 0) {
         printf("--- hot instructions ---\n");
         const char *cur_func = NULL;
+        char *src_buf = NULL;
+        char **src_lines = NULL;
+        int n_src_lines = 0;
+        int last_printed_line = 0;
         for (int i = 0; i < prof->n_insns; i++) {
             struct hot_insn *hi = &prof->insns[i];
             if (!cur_func ||
                 strcmp(cur_func, hi->func_name) != 0) {
                 cur_func = hi->func_name;
-                const char *src = NULL;
-                for (int f = 0; f < prof->n_funcs; f++) {
-                    if (strcmp(prof->funcs[f].name,
-                              cur_func) == 0 &&
-                        prof->funcs[f].source_file) {
-                        src = short_path(
-                            prof->funcs[f].source_file,
-                            opts->source_dir);
-                        break;
+                free(src_buf); src_buf = NULL;
+                free(src_lines); src_lines = NULL;
+                n_src_lines = 0;
+                last_printed_line = 0;
+
+                /* Load source for this function */
+                const char *disp_src = NULL;
+                const char *load_path = hi->source_file;
+                if (!load_path) {
+                    for (int f = 0; f < prof->n_funcs; f++) {
+                        if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
+                            prof->funcs[f].source_file) {
+                            load_path = prof->funcs[f].source_file;
+                            break;
+                        }
                     }
                 }
-                if (src && hi->source_line)
+                if (load_path) {
+                    disp_src = short_path(load_path, opts->source_dir);
+                    long slen;
+                    src_buf = read_file_source(load_path, &slen);
+                    if (src_buf)
+                        src_lines = index_source_lines(src_buf, slen,
+                                                       &n_src_lines);
+                }
+
+                if (disp_src && hi->source_line)
                     printf("[%s]  //%s:%u\n",
-                           cur_func, src, hi->source_line);
+                           cur_func, disp_src, hi->source_line);
                 else
                     printf("[%s]\n", cur_func);
             }
+            /* Interleave source line if it changed */
+            if (hi->source_line != 0 &&
+                (int)hi->source_line != last_printed_line &&
+                src_lines && (int)hi->source_line <= n_src_lines) {
+                printf("       :%u  ", hi->source_line);
+                print_source_line(src_lines[hi->source_line]);
+                printf("\n");
+                last_printed_line = (int)hi->source_line;
+            }
             printf("  %5.1f%%  %s\n", hi->pct, hi->asm_text);
         }
+        free(src_buf);
+        free(src_lines);
         printf("\n");
     }
 
@@ -2504,34 +2823,106 @@ static void print_report(struct perf_opts *opts,
         printf("\n");
     }
 
-    /* Cache misses */
+    /* Cache misses (with source interleaving) */
     if (prof->n_cm_sites > 0) {
         printf("--- cache misses ---\n");
         const char *cur_func = NULL;
+        char *src_buf = NULL;
+        char **src_lines = NULL;
+        int n_src_lines = 0;
+        int last_printed_line = 0;
         for (int i = 0; i < prof->n_cm_sites; i++) {
             struct cache_miss_site *cm = &prof->cm_sites[i];
             if (!cur_func ||
                 strcmp(cur_func, cm->func_name) != 0) {
                 cur_func = cm->func_name;
-                const char *src = NULL;
-                for (int f = 0; f < prof->n_funcs; f++) {
-                    if (strcmp(prof->funcs[f].name,
-                              cur_func) == 0 &&
-                        prof->funcs[f].source_file) {
-                        src = short_path(
-                            prof->funcs[f].source_file,
-                            opts->source_dir);
-                        break;
+                free(src_buf); src_buf = NULL;
+                free(src_lines); src_lines = NULL;
+                n_src_lines = 0;
+                last_printed_line = 0;
+
+                const char *disp_src = NULL;
+                const char *load_path = cm->source_file;
+                if (!load_path) {
+                    for (int f = 0; f < prof->n_funcs; f++) {
+                        if (strcmp(prof->funcs[f].name, cur_func) == 0 &&
+                            prof->funcs[f].source_file) {
+                            load_path = prof->funcs[f].source_file;
+                            break;
+                        }
                     }
                 }
-                if (src && cm->source_line)
+                if (load_path) {
+                    disp_src = short_path(load_path, opts->source_dir);
+                    long slen;
+                    src_buf = read_file_source(load_path, &slen);
+                    if (src_buf)
+                        src_lines = index_source_lines(src_buf, slen,
+                                                       &n_src_lines);
+                }
+
+                if (disp_src && cm->source_line)
                     printf("[%s]  //%s:%u\n",
-                           cur_func, src, cm->source_line);
+                           cur_func, disp_src, cm->source_line);
                 else
                     printf("[%s]\n", cur_func);
             }
+            if (cm->source_line != 0 &&
+                (int)cm->source_line != last_printed_line &&
+                src_lines && (int)cm->source_line <= n_src_lines) {
+                printf("       :%u  ", cm->source_line);
+                print_source_line(src_lines[cm->source_line]);
+                printf("\n");
+                last_printed_line = (int)cm->source_line;
+            }
             printf("  %5.1f%%  %s\n", cm->pct, cm->asm_text);
         }
+        free(src_buf);
+        free(src_lines);
+        printf("\n");
+    }
+
+    /* Memory hotspots (cache-line level) */
+    if (prof->n_mem_hotspots > 0) {
+        printf("--- memory hotspots ---\n");
+        const char *cur_func = NULL;
+        char *src_buf = NULL;
+        char **src_lines = NULL;
+        int n_src_lines = 0;
+        int last_printed_line = 0;
+        for (int i = 0; i < prof->n_mem_hotspots; i++) {
+            struct mem_hotspot *mh = &prof->mem_hotspots[i];
+            if (!cur_func ||
+                strcmp(cur_func, mh->func_name) != 0) {
+                cur_func = mh->func_name;
+                free(src_buf); src_buf = NULL;
+                free(src_lines); src_lines = NULL;
+                n_src_lines = 0;
+                last_printed_line = 0;
+                if (mh->source_file) {
+                    long slen;
+                    src_buf = read_file_source(mh->source_file, &slen);
+                    if (src_buf)
+                        src_lines = index_source_lines(src_buf, slen,
+                                                       &n_src_lines);
+                }
+                printf("[%s]\n", cur_func);
+            }
+            if (mh->source_line != 0 &&
+                (int)mh->source_line != last_printed_line &&
+                src_lines && (int)mh->source_line <= n_src_lines) {
+                printf("       :%u  ", mh->source_line);
+                print_source_line(src_lines[mh->source_line]);
+                printf("\n");
+                last_printed_line = (int)mh->source_line;
+            }
+            printf("  %5.1f%%  %-40s cacheline 0x%" PRIx64
+                   " (%d samples)\n",
+                   mh->pct, mh->asm_text,
+                   mh->cache_line << 6, mh->n_samples);
+        }
+        free(src_buf);
+        free(src_lines);
         printf("\n");
     }
 
@@ -2593,51 +2984,98 @@ static void print_report(struct perf_opts *opts,
 /* ── Pipeline ────────────────────────────────────────────────────────── */
 
 static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
-    fprintf(stderr, "profiling: %s\n", opts->cmd_str);
+    int n_runs = opts->n_runs > 0 ? opts->n_runs : 1;
+    prof->n_runs = n_runs;
 
-    /* Phase 1: single-execution profiling */
-    struct raw_sample *cyc = NULL, *cm = NULL;
-    int n_cyc = 0, n_cm = 0;
-    uint64_t load_base = 0;
+    /* Allocate per-run stat arrays */
+    prof->rs_cycles.values         = malloc((size_t)n_runs * sizeof(double));
+    prof->rs_insns.values          = malloc((size_t)n_runs * sizeof(double));
+    prof->rs_ipc.values            = malloc((size_t)n_runs * sizeof(double));
+    prof->rs_wall.values           = malloc((size_t)n_runs * sizeof(double));
+    prof->rs_cache_miss_pct.values = malloc((size_t)n_runs * sizeof(double));
+    prof->rs_branch_miss_pct.values= malloc((size_t)n_runs * sizeof(double));
+
     int want_cm = (opts->cachemiss_mode >= 0);
 
-    if (profile_child(opts, &prof->stats,
-                      &prof->topdown, &prof->has_topdown,
-                      &cyc, &n_cyc,
-                      want_cm ? &cm : NULL,
-                      want_cm ? &n_cm : NULL,
-                      &load_base) != 0) {
-        fprintf(stderr, "error: profiling failed\n");
-        return -1;
+    for (int run = 0; run < n_runs; run++) {
+        fprintf(stderr, "profiling: %s (run %d/%d)\n",
+                opts->cmd_str, run + 1, n_runs);
+
+        struct raw_sample *cyc = NULL, *cm = NULL;
+        int n_cyc = 0, n_cm = 0;
+        uint64_t load_base = 0;
+
+        /* Collect samples only on run 0 (instruction-level % is stable) */
+        int want_samples = (run == 0);
+
+        if (profile_child(opts, &prof->stats,
+                          &prof->topdown, &prof->has_topdown,
+                          want_samples ? &cyc : NULL,
+                          want_samples ? &n_cyc : NULL,
+                          (want_cm && want_samples) ? &cm : NULL,
+                          (want_cm && want_samples) ? &n_cm : NULL,
+                          &load_base) != 0) {
+            fprintf(stderr, "error: profiling failed (run %d)\n", run + 1);
+            return -1;
+        }
+
+        /* Store per-run stats */
+        prof->rs_cycles.values[run]         = (double)prof->stats.cycles;
+        prof->rs_insns.values[run]          = (double)prof->stats.instructions;
+        prof->rs_ipc.values[run]            = prof->stats.ipc;
+        prof->rs_wall.values[run]           = prof->stats.wall_seconds;
+        prof->rs_cache_miss_pct.values[run] = prof->stats.cache_miss_pct;
+        prof->rs_branch_miss_pct.values[run]= prof->stats.branch_miss_pct;
+        prof->rs_cycles.n = prof->rs_insns.n = prof->rs_ipc.n =
+            prof->rs_wall.n = prof->rs_cache_miss_pct.n =
+            prof->rs_branch_miss_pct.n = run + 1;
+
+        /* Process samples and external tools only on run 0 */
+        if (run == 0) {
+            struct sym_resolver sr;
+            if (symres_init(&sr, opts->binary_path, load_base) != 0) {
+                fprintf(stderr,
+                    "warning: symbol resolution unavailable for %s\n",
+                    opts->binary_path);
+            }
+
+            int has_debug = symres_has_debug(&sr);
+            if (!has_debug)
+                fprintf(stderr,
+                    "warning: no debug symbols in %s "
+                    "(build with -g for source annotations)\n",
+                    opts->binary_path);
+
+            process_samples(&sr, cyc, n_cyc, cm, n_cm, opts, prof);
+
+            xref_skeleton(opts, prof);
+            run_mca(&sr, opts, prof);
+            run_uprof(opts, prof);
+            run_remarks(opts, prof);
+            run_pahole(opts, prof, has_debug);
+
+            symres_free(&sr);
+        }
+
+        free_raw_samples(cyc, n_cyc);
+        free_raw_samples(cm, n_cm);
     }
 
-    /* Phase 2: in-process analysis */
-    struct sym_resolver sr;
-    if (symres_init(&sr, opts->binary_path, load_base) != 0) {
-        fprintf(stderr, "warning: symbol resolution unavailable for %s\n",
-                opts->binary_path);
-        /* Continue with degraded output — counters still valid */
-    }
+    /* Compute mean/stddev for all metrics */
+    compute_stats(&prof->rs_cycles);
+    compute_stats(&prof->rs_insns);
+    compute_stats(&prof->rs_ipc);
+    compute_stats(&prof->rs_wall);
+    compute_stats(&prof->rs_cache_miss_pct);
+    compute_stats(&prof->rs_branch_miss_pct);
 
-    int has_debug = symres_has_debug(&sr);
-    if (!has_debug)
-        fprintf(stderr,
-            "warning: no debug symbols in %s "
-            "(build with -g for source annotations)\n",
-            opts->binary_path);
-
-    process_samples(&sr, cyc, n_cyc, cm, n_cm, opts, prof);
-
-    /* Phase 3: external tools (unchanged) */
-    xref_skeleton(opts, prof);
-    run_mca(&sr, opts, prof);
-    run_uprof(opts, prof);
-    run_remarks(opts, prof);
-    run_pahole(opts, prof, has_debug);
-
-    symres_free(&sr);
-    free_raw_samples(cyc, n_cyc);
-    free_raw_samples(cm, n_cm);
+    /* Update stats to use mean values */
+    prof->stats.cycles         = (uint64_t)prof->rs_cycles.mean;
+    prof->stats.instructions   = (uint64_t)prof->rs_insns.mean;
+    prof->stats.ipc            = prof->rs_ipc.mean;
+    prof->stats.wall_seconds   = prof->rs_wall.mean;
+    prof->stats.cache_miss_pct = prof->rs_cache_miss_pct.mean;
+    prof->stats.branch_miss_pct= prof->rs_branch_miss_pct.mean;
 
     return 0;
 }
@@ -2652,8 +3090,13 @@ static void print_comparison(struct perf_opts *opts,
 
     printf("=== perf A/B: %s vs %s ===\n", a_cmd, b_cmd);
 
-    /* Stats CSV with deltas */
-    printf("metric,A,B,delta,%%change\n");
+    int has_stats = (prof_a->n_runs > 1 && prof_b->n_runs > 1);
+
+    /* Stats CSV with deltas (and p-values if multi-run) */
+    if (has_stats)
+        printf("metric,A,B,delta,%%change,p-value,sig\n");
+    else
+        printf("metric,A,B,delta,%%change\n");
 
     {
         char ca[32], cb[32];
@@ -2664,8 +3107,19 @@ static void print_comparison(struct perf_opts *opts,
                                       sb->cycles - sa->cycles);
         double pct = sa->cycles ? 100.0 * ((double)sb->cycles - sa->cycles)
                                          / sa->cycles : 0;
-        printf("cycles,%s,%s,%s%s,%.1f%%\n", ca, cb,
-               sb->cycles < sa->cycles ? "-" : "+", cd, pct);
+        if (has_stats) {
+            char sda[32], sdb[32];
+            fmt_stddev(sda, sizeof(sda), prof_a->rs_cycles.stddev);
+            fmt_stddev(sdb, sizeof(sdb), prof_b->rs_cycles.stddev);
+            double p = welch_t_test(&prof_a->rs_cycles, &prof_b->rs_cycles);
+            printf("cycles,%s \302\261%s,%s \302\261%s,%s%s,%.1f%%,%.4f,%s\n",
+                   ca, sda, cb, sdb,
+                   sb->cycles < sa->cycles ? "-" : "+", cd, pct,
+                   p, sig_marker(p));
+        } else {
+            printf("cycles,%s,%s,%s%s,%.1f%%\n", ca, cb,
+                   sb->cycles < sa->cycles ? "-" : "+", cd, pct);
+        }
     }
     {
         char ia[32], ib[32];
@@ -2678,27 +3132,76 @@ static void print_comparison(struct perf_opts *opts,
         double pct = sa->instructions ?
             100.0 * ((double)sb->instructions - sa->instructions)
                    / sa->instructions : 0;
-        printf("insns,%s,%s,%s%s,%.1f%%\n", ia, ib,
-               sb->instructions < sa->instructions ? "-" : "+", id, pct);
+        if (has_stats) {
+            char sda[32], sdb[32];
+            fmt_stddev(sda, sizeof(sda), prof_a->rs_insns.stddev);
+            fmt_stddev(sdb, sizeof(sdb), prof_b->rs_insns.stddev);
+            double p = welch_t_test(&prof_a->rs_insns, &prof_b->rs_insns);
+            printf("insns,%s \302\261%s,%s \302\261%s,%s%s,%.1f%%,%.4f,%s\n",
+                   ia, sda, ib, sdb,
+                   sb->instructions < sa->instructions ? "-" : "+", id, pct,
+                   p, sig_marker(p));
+        } else {
+            printf("insns,%s,%s,%s%s,%.1f%%\n", ia, ib,
+                   sb->instructions < sa->instructions ? "-" : "+", id, pct);
+        }
     }
-    printf("IPC,%.2f,%.2f,%+.2f,%.1f%%\n",
-           sa->ipc, sb->ipc, sb->ipc - sa->ipc,
-           sa->ipc ? 100.0 * (sb->ipc - sa->ipc) / sa->ipc : 0);
-    printf("wall,%.2fs,%.2fs,%+.2fs,%.1f%%\n",
-           sa->wall_seconds, sb->wall_seconds,
-           sb->wall_seconds - sa->wall_seconds,
-           sa->wall_seconds ? 100.0 * (sb->wall_seconds - sa->wall_seconds)
-                              / sa->wall_seconds : 0);
-    printf("cache miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%\n",
-           sa->cache_miss_pct, sb->cache_miss_pct,
-           sb->cache_miss_pct - sa->cache_miss_pct,
-           sa->cache_miss_pct ? 100.0 * (sb->cache_miss_pct - sa->cache_miss_pct)
-                                / sa->cache_miss_pct : 0);
-    printf("branch miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%\n",
-           sa->branch_miss_pct, sb->branch_miss_pct,
-           sb->branch_miss_pct - sa->branch_miss_pct,
-           sa->branch_miss_pct ? 100.0 * (sb->branch_miss_pct - sa->branch_miss_pct)
-                                  / sa->branch_miss_pct : 0);
+    if (has_stats) {
+        char sda[32], sdb[32];
+        double p;
+        fmt_stddev(sda, sizeof(sda), prof_a->rs_ipc.stddev);
+        fmt_stddev(sdb, sizeof(sdb), prof_b->rs_ipc.stddev);
+        p = welch_t_test(&prof_a->rs_ipc, &prof_b->rs_ipc);
+        printf("IPC,%.2f \302\261%s,%.2f \302\261%s,%+.2f,%.1f%%,%.4f,%s\n",
+               sa->ipc, sda, sb->ipc, sdb, sb->ipc - sa->ipc,
+               sa->ipc ? 100.0 * (sb->ipc - sa->ipc) / sa->ipc : 0,
+               p, sig_marker(p));
+
+        snprintf(sda, sizeof(sda), "%.2f", prof_a->rs_wall.stddev);
+        snprintf(sdb, sizeof(sdb), "%.2f", prof_b->rs_wall.stddev);
+        p = welch_t_test(&prof_a->rs_wall, &prof_b->rs_wall);
+        printf("wall,%.2fs \302\261%ss,%.2fs \302\261%ss,%+.2fs,%.1f%%,%.4f,%s\n",
+               sa->wall_seconds, sda, sb->wall_seconds, sdb,
+               sb->wall_seconds - sa->wall_seconds,
+               sa->wall_seconds ? 100.0 * (sb->wall_seconds - sa->wall_seconds)
+                                  / sa->wall_seconds : 0,
+               p, sig_marker(p));
+
+        p = welch_t_test(&prof_a->rs_cache_miss_pct, &prof_b->rs_cache_miss_pct);
+        printf("cache miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%,%.4f,%s\n",
+               sa->cache_miss_pct, sb->cache_miss_pct,
+               sb->cache_miss_pct - sa->cache_miss_pct,
+               sa->cache_miss_pct ? 100.0 * (sb->cache_miss_pct - sa->cache_miss_pct)
+                                    / sa->cache_miss_pct : 0,
+               p, sig_marker(p));
+
+        p = welch_t_test(&prof_a->rs_branch_miss_pct, &prof_b->rs_branch_miss_pct);
+        printf("branch miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%,%.4f,%s\n",
+               sa->branch_miss_pct, sb->branch_miss_pct,
+               sb->branch_miss_pct - sa->branch_miss_pct,
+               sa->branch_miss_pct ? 100.0 * (sb->branch_miss_pct - sa->branch_miss_pct)
+                                      / sa->branch_miss_pct : 0,
+               p, sig_marker(p));
+    } else {
+        printf("IPC,%.2f,%.2f,%+.2f,%.1f%%\n",
+               sa->ipc, sb->ipc, sb->ipc - sa->ipc,
+               sa->ipc ? 100.0 * (sb->ipc - sa->ipc) / sa->ipc : 0);
+        printf("wall,%.2fs,%.2fs,%+.2fs,%.1f%%\n",
+               sa->wall_seconds, sb->wall_seconds,
+               sb->wall_seconds - sa->wall_seconds,
+               sa->wall_seconds ? 100.0 * (sb->wall_seconds - sa->wall_seconds)
+                                  / sa->wall_seconds : 0);
+        printf("cache miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%\n",
+               sa->cache_miss_pct, sb->cache_miss_pct,
+               sb->cache_miss_pct - sa->cache_miss_pct,
+               sa->cache_miss_pct ? 100.0 * (sb->cache_miss_pct - sa->cache_miss_pct)
+                                    / sa->cache_miss_pct : 0);
+        printf("branch miss%%,%.1f%%,%.1f%%,%+.1fpp,%.1f%%\n",
+               sa->branch_miss_pct, sb->branch_miss_pct,
+               sb->branch_miss_pct - sa->branch_miss_pct,
+               sa->branch_miss_pct ? 100.0 * (sb->branch_miss_pct - sa->branch_miss_pct)
+                                      / sa->branch_miss_pct : 0);
+    }
     printf("\n");
 
     /* Hot function delta */
@@ -2815,7 +3318,7 @@ static void print_comparison(struct perf_opts *opts,
     }
     printf("\n");
 
-    /* Per-function cache miss hotspots */
+    /* Per-function cache miss hotspots (with source interleaving) */
     if (prof_a->n_cm_sites > 0 && prof_b->n_cm_sites > 0) {
         printf("--- cache miss hotspots A -> B ---\n");
         for (int b = 0; b < prof_b->n_funcs; b++) {
@@ -2834,6 +3337,22 @@ static void print_comparison(struct perf_opts *opts,
             if (!found_a) continue;
 
             printf("[%s]\n", prof_b->funcs[b].name);
+
+            /* Load source for interleaving (use B's source file) */
+            char *sb2 = NULL; char **sl2 = NULL; int nsl2 = 0;
+            for (int i = 0; i < prof_b->n_cm_sites; i++) {
+                char cmn[256];
+                snprintf(cmn, sizeof(cmn), "%s", prof_b->cm_sites[i].func_name);
+                strip_compiler_suffix(cmn);
+                if (strcmp(cmn, bclean) == 0 && prof_b->cm_sites[i].source_file) {
+                    long slen;
+                    sb2 = read_file_source(prof_b->cm_sites[i].source_file, &slen);
+                    if (sb2) sl2 = index_source_lines(sb2, slen, &nsl2);
+                    break;
+                }
+            }
+
+            int last_line = 0;
             int count = 0;
             for (int i = 0; i < prof_a->n_cm_sites && count < 3; i++) {
                 char cmn[256];
@@ -2841,12 +3360,21 @@ static void print_comparison(struct perf_opts *opts,
                          prof_a->cm_sites[i].func_name);
                 strip_compiler_suffix(cmn);
                 if (strcmp(cmn, bclean) == 0) {
+                    if (prof_a->cm_sites[i].source_line != 0 &&
+                        (int)prof_a->cm_sites[i].source_line != last_line &&
+                        sl2 && (int)prof_a->cm_sites[i].source_line <= nsl2) {
+                        printf("       :%u  ", prof_a->cm_sites[i].source_line);
+                        print_source_line(sl2[prof_a->cm_sites[i].source_line]);
+                        printf("\n");
+                        last_line = (int)prof_a->cm_sites[i].source_line;
+                    }
                     printf("  A: %5.1f%%  %s\n",
                            prof_a->cm_sites[i].pct,
                            prof_a->cm_sites[i].asm_text);
                     count++;
                 }
             }
+            last_line = 0;
             count = 0;
             for (int i = 0; i < prof_b->n_cm_sites && count < 3; i++) {
                 char cmn[256];
@@ -2854,17 +3382,26 @@ static void print_comparison(struct perf_opts *opts,
                          prof_b->cm_sites[i].func_name);
                 strip_compiler_suffix(cmn);
                 if (strcmp(cmn, bclean) == 0) {
+                    if (prof_b->cm_sites[i].source_line != 0 &&
+                        (int)prof_b->cm_sites[i].source_line != last_line &&
+                        sl2 && (int)prof_b->cm_sites[i].source_line <= nsl2) {
+                        printf("       :%u  ", prof_b->cm_sites[i].source_line);
+                        print_source_line(sl2[prof_b->cm_sites[i].source_line]);
+                        printf("\n");
+                        last_line = (int)prof_b->cm_sites[i].source_line;
+                    }
                     printf("  B: %5.1f%%  %s\n",
                            prof_b->cm_sites[i].pct,
                            prof_b->cm_sites[i].asm_text);
                     count++;
                 }
             }
+            free(sb2); free(sl2);
         }
         printf("\n");
     }
 
-    /* Hot instruction summary */
+    /* Hot instruction summary (with source interleaving) */
     if (prof_a->n_insns > 0 && prof_b->n_insns > 0) {
         printf("--- hot instructions A -> B ---\n");
         for (int b = 0; b < prof_b->n_funcs; b++) {
@@ -2883,6 +3420,22 @@ static void print_comparison(struct perf_opts *opts,
             if (!found_a) continue;
 
             printf("[%s]\n", prof_b->funcs[b].name);
+
+            /* Load source for interleaving (use B's source file) */
+            char *sb2 = NULL; char **sl2 = NULL; int nsl2 = 0;
+            for (int i = 0; i < prof_b->n_insns; i++) {
+                char iclean[256];
+                snprintf(iclean, sizeof(iclean), "%s", prof_b->insns[i].func_name);
+                strip_compiler_suffix(iclean);
+                if (strcmp(iclean, bclean) == 0 && prof_b->insns[i].source_file) {
+                    long slen;
+                    sb2 = read_file_source(prof_b->insns[i].source_file, &slen);
+                    if (sb2) sl2 = index_source_lines(sb2, slen, &nsl2);
+                    break;
+                }
+            }
+
+            int last_line = 0;
             int count = 0;
             for (int i = 0; i < prof_a->n_insns && count < 3; i++) {
                 char iclean[256];
@@ -2890,12 +3443,21 @@ static void print_comparison(struct perf_opts *opts,
                          prof_a->insns[i].func_name);
                 strip_compiler_suffix(iclean);
                 if (strcmp(iclean, bclean) == 0) {
+                    if (prof_a->insns[i].source_line != 0 &&
+                        (int)prof_a->insns[i].source_line != last_line &&
+                        sl2 && (int)prof_a->insns[i].source_line <= nsl2) {
+                        printf("       :%u  ", prof_a->insns[i].source_line);
+                        print_source_line(sl2[prof_a->insns[i].source_line]);
+                        printf("\n");
+                        last_line = (int)prof_a->insns[i].source_line;
+                    }
                     printf("  A: %5.1f%%  %s\n",
                            prof_a->insns[i].pct,
                            prof_a->insns[i].asm_text);
                     count++;
                 }
             }
+            last_line = 0;
             count = 0;
             for (int i = 0; i < prof_b->n_insns && count < 3; i++) {
                 char iclean[256];
@@ -2903,9 +3465,61 @@ static void print_comparison(struct perf_opts *opts,
                          prof_b->insns[i].func_name);
                 strip_compiler_suffix(iclean);
                 if (strcmp(iclean, bclean) == 0) {
+                    if (prof_b->insns[i].source_line != 0 &&
+                        (int)prof_b->insns[i].source_line != last_line &&
+                        sl2 && (int)prof_b->insns[i].source_line <= nsl2) {
+                        printf("       :%u  ", prof_b->insns[i].source_line);
+                        print_source_line(sl2[prof_b->insns[i].source_line]);
+                        printf("\n");
+                        last_line = (int)prof_b->insns[i].source_line;
+                    }
                     printf("  B: %5.1f%%  %s\n",
                            prof_b->insns[i].pct,
                            prof_b->insns[i].asm_text);
+                    count++;
+                }
+            }
+            free(sb2); free(sl2);
+        }
+        printf("\n");
+    }
+
+    /* Memory hotspots A -> B */
+    if (prof_a->n_mem_hotspots > 0 || prof_b->n_mem_hotspots > 0) {
+        printf("--- memory hotspots A -> B ---\n");
+        for (int b = 0; b < prof_b->n_funcs; b++) {
+            char bclean[256];
+            snprintf(bclean, sizeof(bclean), "%s", prof_b->funcs[b].name);
+            strip_compiler_suffix(bclean);
+
+            /* Check if this function has memory hotspots in either profile */
+            int has_a = 0, has_b = 0;
+            for (int i = 0; i < prof_a->n_mem_hotspots && !has_a; i++)
+                if (strcmp(prof_a->mem_hotspots[i].func_name, bclean) == 0)
+                    has_a = 1;
+            for (int i = 0; i < prof_b->n_mem_hotspots && !has_b; i++)
+                if (strcmp(prof_b->mem_hotspots[i].func_name, bclean) == 0)
+                    has_b = 1;
+            if (!has_a && !has_b) continue;
+
+            printf("[%s]\n", prof_b->funcs[b].name);
+            int count = 0;
+            for (int i = 0; i < prof_a->n_mem_hotspots && count < 3; i++) {
+                if (strcmp(prof_a->mem_hotspots[i].func_name, bclean) == 0) {
+                    printf("  A: %5.1f%%  %-40s cacheline 0x%" PRIx64 "\n",
+                           prof_a->mem_hotspots[i].pct,
+                           prof_a->mem_hotspots[i].asm_text,
+                           prof_a->mem_hotspots[i].cache_line << 6);
+                    count++;
+                }
+            }
+            count = 0;
+            for (int i = 0; i < prof_b->n_mem_hotspots && count < 3; i++) {
+                if (strcmp(prof_b->mem_hotspots[i].func_name, bclean) == 0) {
+                    printf("  B: %5.1f%%  %-40s cacheline 0x%" PRIx64 "\n",
+                           prof_b->mem_hotspots[i].pct,
+                           prof_b->mem_hotspots[i].asm_text,
+                           prof_b->mem_hotspots[i].cache_line << 6);
                     count++;
                 }
             }
@@ -3030,6 +3644,7 @@ static void free_profile(struct perf_profile *prof) {
     for (int i = 0; i < prof->n_insns; i++) {
         free(prof->insns[i].func_name);
         free(prof->insns[i].asm_text);
+        free(prof->insns[i].source_file);
     }
     free(prof->insns);
 
@@ -3046,6 +3661,7 @@ static void free_profile(struct perf_profile *prof) {
     for (int i = 0; i < prof->n_cm_sites; i++) {
         free(prof->cm_sites[i].func_name);
         free(prof->cm_sites[i].asm_text);
+        free(prof->cm_sites[i].source_file);
     }
     free(prof->cm_sites);
 
@@ -3062,6 +3678,20 @@ static void free_profile(struct perf_profile *prof) {
         free(prof->remarks[i].message);
     }
     free(prof->remarks);
+
+    for (int i = 0; i < prof->n_mem_hotspots; i++) {
+        free(prof->mem_hotspots[i].func_name);
+        free(prof->mem_hotspots[i].source_file);
+        free(prof->mem_hotspots[i].asm_text);
+    }
+    free(prof->mem_hotspots);
+
+    free(prof->rs_cycles.values);
+    free(prof->rs_insns.values);
+    free(prof->rs_ipc.values);
+    free(prof->rs_wall.values);
+    free(prof->rs_cache_miss_pct.values);
+    free(prof->rs_branch_miss_pct.values);
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────── */
@@ -3099,6 +3729,7 @@ int perf_main(int argc, char *argv[]) {
         case PERF_OPT_VS:          opts.vs_binary     = optarg; break;
         case PERF_OPT_REMARKS:     opts.remarks_mode  =  1; break;
         case PERF_OPT_NO_REMARKS:  opts.remarks_mode  = -1; break;
+        case PERF_OPT_RUNS:        opts.n_runs        = atoi(optarg); break;
         case 's': opts.source_dir = optarg;     break;
         case 'v': opts.verbose    = 1;          break;
         case 'h': perf_usage(argv[0]); return 0;
@@ -3135,6 +3766,9 @@ int perf_main(int argc, char *argv[]) {
 
     if (opts.vs_binary) {
         /* ── A/B comparison mode ─────────────────────────────── */
+        /* Default to 5 runs for A/B if not explicitly set */
+        if (opts.n_runs == 0) opts.n_runs = 5;
+
         char top_tmpdir[PATH_MAX];
         strcpy(top_tmpdir, g_tmpdir);
 
