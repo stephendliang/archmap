@@ -128,6 +128,14 @@ static void *arena_realloc(struct arena *a, void *old_ptr,
     return p;
 }
 
+static size_t arena_save(struct arena *a) {
+    return a->head ? a->head->used : 0;
+}
+
+static void arena_reset(struct arena *a, size_t mark) {
+    if (a->head) a->head->used = mark;
+}
+
 static void arena_destroy(struct arena *a) {
     struct arena_block *b = a->head;
     while (b) {
@@ -1215,7 +1223,8 @@ static int symres_srcline(struct sym_resolver *sr, uint64_t addr,
 /* Returns runtime start address, raw bytes (caller must free), and length.
    Uses the raw symbol name (including .constprop.N etc). */
 static int symres_func_range(struct sym_resolver *sr, const char *name,
-                              uint64_t *start, uint8_t **bytes, size_t *len) {
+                              uint64_t *start, uint8_t **bytes, size_t *len,
+                              struct arena *a) {
     if (!sr->mod || !sr->elf) return -1;
 
     /* Find symbol via dwfl (for the runtime-adjusted address) */
@@ -1257,7 +1266,7 @@ static int symres_func_range(struct sym_resolver *sr, const char *name,
             if (!d) return -1;
             uint64_t offset = best_sym.st_value - shdr.sh_addr;
             if (offset + best_sym.st_size > d->d_size) return -1;
-            *bytes = xmalloc(best_sym.st_size);
+            *bytes = arena_alloc(a, best_sym.st_size);
             memcpy(*bytes, (uint8_t *)d->d_buf + offset, best_sym.st_size);
             return 0;
         }
@@ -1615,21 +1624,29 @@ static int process_samples(struct sym_resolver *sr,
     prof->insns = arena_alloc(&prof->arena, (size_t)insn_cap * sizeof(*prof->insns));
     prof->n_insns = 0;
 
+    struct arena iter_scratch;
+    arena_init(&iter_scratch, ARENA_DEFAULT_BLOCK);
+
     if (sr->cs_ok) {
         for (int f = 0; f < prof->n_funcs; f++) {
+            size_t mark = arena_save(&iter_scratch);
+
             uint64_t func_start;
             uint8_t *func_bytes;
             size_t func_len;
 
             if (symres_func_range(sr, prof->funcs[f].name,
                                   &func_start, &func_bytes,
-                                  &func_len) != 0)
+                                  &func_len, &iter_scratch) != 0) {
+                arena_reset(&iter_scratch, mark);
                 continue;
+            }
 
             /* Bucket cycle samples by IP within this function */
             struct { uint64_t ip; int count; } *ip_buckets = NULL;
             int n_ip = 0, cap_ip = 64;
-            ip_buckets = xcalloc((size_t)cap_ip, sizeof(*ip_buckets));
+            ip_buckets = arena_alloc(&iter_scratch, (size_t)cap_ip * sizeof(*ip_buckets));
+            memset(ip_buckets, 0, (size_t)cap_ip * sizeof(*ip_buckets));
             int func_total = 0;
 
             for (int s = 0; s < n_cycle; s++) {
@@ -1647,9 +1664,10 @@ static int process_samples(struct sym_resolver *sr,
                         ip_buckets[found].count++;
                     } else {
                         if (n_ip >= cap_ip) {
+                            size_t old_sz = (size_t)cap_ip * sizeof(*ip_buckets);
                             cap_ip *= 2;
-                            ip_buckets = xrealloc(ip_buckets,
-                                (size_t)cap_ip * sizeof(*ip_buckets));
+                            ip_buckets = arena_realloc(&iter_scratch, ip_buckets,
+                                old_sz, (size_t)cap_ip * sizeof(*ip_buckets));
                         }
                         ip_buckets[n_ip].ip = ip;
                         ip_buckets[n_ip].count = 1;
@@ -1717,8 +1735,7 @@ static int process_samples(struct sym_resolver *sr,
                     (char *)intern_str(&prof->strings, src_file) : NULL;
             }
 
-            free(ip_buckets);
-            free(func_bytes);
+            arena_reset(&iter_scratch, mark);
         }
     }
 
@@ -1730,19 +1747,24 @@ static int process_samples(struct sym_resolver *sr,
         prof->n_cm_sites = 0;
 
         for (int f = 0; f < prof->n_funcs; f++) {
+            size_t mark = arena_save(&iter_scratch);
+
             uint64_t func_start;
             uint8_t *func_bytes;
             size_t func_len;
 
             if (symres_func_range(sr, prof->funcs[f].name,
                                   &func_start, &func_bytes,
-                                  &func_len) != 0)
+                                  &func_len, &iter_scratch) != 0) {
+                arena_reset(&iter_scratch, mark);
                 continue;
+            }
 
             /* Bucket cache-miss samples by IP, track most common data addr */
             struct { uint64_t ip; uint64_t top_addr; int count; } *ip_buckets = NULL;
             int n_ip = 0, cap_ip = 64;
-            ip_buckets = xcalloc((size_t)cap_ip, sizeof(*ip_buckets));
+            ip_buckets = arena_alloc(&iter_scratch, (size_t)cap_ip * sizeof(*ip_buckets));
+            memset(ip_buckets, 0, (size_t)cap_ip * sizeof(*ip_buckets));
 
             for (int s = 0; s < n_cm; s++) {
                 uint64_t ip = cm_samples[s].ip;
@@ -1761,9 +1783,10 @@ static int process_samples(struct sym_resolver *sr,
                             ip_buckets[found].top_addr = cm_samples[s].addr;
                     } else {
                         if (n_ip >= cap_ip) {
+                            size_t old_sz = (size_t)cap_ip * sizeof(*ip_buckets);
                             cap_ip *= 2;
-                            ip_buckets = xrealloc(ip_buckets,
-                                (size_t)cap_ip * sizeof(*ip_buckets));
+                            ip_buckets = arena_realloc(&iter_scratch, ip_buckets,
+                                old_sz, (size_t)cap_ip * sizeof(*ip_buckets));
                         }
                         ip_buckets[n_ip].ip = ip;
                         ip_buckets[n_ip].top_addr = cm_samples[s].addr;
@@ -1833,8 +1856,7 @@ static int process_samples(struct sym_resolver *sr,
                 cm->data_addr = ip_buckets[k].top_addr;
             }
 
-            free(ip_buckets);
-            free(func_bytes);
+            arena_reset(&iter_scratch, mark);
         }
     }
 
@@ -1855,7 +1877,9 @@ static int process_samples(struct sym_resolver *sr,
                 int count;
             };
             int n_mb = 0, cap_mb = 256;
-            struct mem_bucket *mbs = xcalloc((size_t)cap_mb, sizeof(*mbs));
+            size_t mbs_mark = arena_save(&iter_scratch);
+            struct mem_bucket *mbs = arena_alloc(&iter_scratch, (size_t)cap_mb * sizeof(*mbs));
+            memset(mbs, 0, (size_t)cap_mb * sizeof(*mbs));
 
             for (int i = 0; i < n_cm; i++) {
                 if (!cm_samples[i].addr) continue;
@@ -1879,8 +1903,10 @@ static int process_samples(struct sym_resolver *sr,
                     mbs[found].count++;
                 } else {
                     if (n_mb >= cap_mb) {
+                        size_t old_sz = (size_t)cap_mb * sizeof(*mbs);
                         cap_mb *= 2;
-                        mbs = xrealloc(mbs, (size_t)cap_mb * sizeof(*mbs));
+                        mbs = arena_realloc(&iter_scratch, mbs,
+                            old_sz, (size_t)cap_mb * sizeof(*mbs));
                     }
                     snprintf(mbs[n_mb].func, sizeof(mbs[n_mb].func),
                              "%s", clean);
@@ -1926,9 +1952,10 @@ static int process_samples(struct sym_resolver *sr,
                 uint64_t func_start;
                 uint8_t *func_bytes;
                 size_t func_len;
+                size_t fb_mark = arena_save(&iter_scratch);
                 if (symres_func_range(sr, mbs[k].func,
                                       &func_start, &func_bytes,
-                                      &func_len) == 0) {
+                                      &func_len, &iter_scratch) == 0) {
                     uint64_t offset = ip - func_start;
                     if (offset < func_len) {
                         cs_insn *dinsn;
@@ -1942,8 +1969,8 @@ static int process_samples(struct sym_resolver *sr,
                             cs_free(dinsn, dcnt);
                         }
                     }
-                    free(func_bytes);
                 }
+                arena_reset(&iter_scratch, fb_mark);
 
                 uint32_t src_line = 0;
                 const char *src_file = NULL;
@@ -1964,10 +1991,11 @@ static int process_samples(struct sym_resolver *sr,
                 mh->n_samples = mbs[k].count;
             }
 
-            free(mbs);
+            arena_reset(&iter_scratch, mbs_mark);
         }
     }
 
+    arena_destroy(&iter_scratch);
     return 0;
 }
 
@@ -2125,22 +2153,29 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
     int mca_cap = limit > 0 ? limit : 1;
     prof->mca_blocks = arena_alloc(&prof->arena, (size_t)mca_cap * sizeof(*prof->mca_blocks));
 
+    struct arena mca_scratch;
+    arena_init(&mca_scratch, ARENA_DEFAULT_BLOCK);
+
     for (int f = 0; f < limit; f++) {
         const char *raw_name = prof->funcs[f].name;
 
         /* Get function bytes via sym_resolver */
+        size_t mark = arena_save(&mca_scratch);
         uint64_t func_start;
         uint8_t *func_bytes;
         size_t func_len;
         if (symres_func_range(sr, raw_name,
-                              &func_start, &func_bytes, &func_len) != 0)
+                              &func_start, &func_bytes, &func_len,
+                              &mca_scratch) != 0) {
+            arena_reset(&mca_scratch, mark);
             continue;
+        }
 
         /* Disassemble with capstone */
         cs_insn *insns;
         size_t count = cs_disasm(sr->cs_handle, func_bytes, func_len,
                                   func_start, 0, &insns);
-        free(func_bytes);
+        arena_reset(&mca_scratch, mark);
         if (count == 0) continue;
 
         /* Write cleaned instructions to temp file */
@@ -2267,6 +2302,7 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
         }
     }
 
+    arena_destroy(&mca_scratch);
     return 0;
 }
 
