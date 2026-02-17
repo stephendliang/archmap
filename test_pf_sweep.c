@@ -18,7 +18,7 @@
 #include <time.h>
 #include <math.h>
 
-#include "avx_map64.h"
+#include "simd_map64.h"
 
 /* ---- RNG (deterministic) ---- */
 static uint64_t rng_s[4];
@@ -81,13 +81,13 @@ static struct workload gen_workload(uint64_t pool_size, uint64_t n_ops,
     w.op_keys = (uint64_t *)malloc(n_ops * sizeof(uint64_t));
     w.op_type = (uint8_t *)malloc(n_ops);
 
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     uint64_t gen = 0;
     while (gen < pool_size) {
         uint64_t k = xoshiro256ss() | 1;
-        if (avx_map64_insert(&m, k)) w.pool[gen++] = k;
+        if (simd_map64_insert(&m, k)) w.pool[gen++] = k;
     }
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
 
     uint32_t live = (uint32_t)(pool_size / 2), total = (uint32_t)pool_size;
     w.init_live = live;
@@ -125,27 +125,27 @@ static void free_workload(struct workload *w) {
 
 /* ---- fixed PF baseline ---- */
 static double run_fixed(struct workload *w, int pf_dist) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint32_t i = 0; i < w->init_live; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     volatile uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < w->n_ops; i++) {
         if (i + pf_dist < w->n_ops) {
             if (w->op_type[i + pf_dist] == 0)
-                avx_map64_prefetch(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch(&m, w->op_keys[i + pf_dist]);
             else
-                avx_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
         }
         switch (w->op_type[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(&m, w->op_keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(&m, w->op_keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(&m, w->op_keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(&m, w->op_keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(&m, w->op_keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(&m, w->op_keys[i]); break;
         }
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->n_ops / elapsed / 1e6;
 }
 
@@ -156,9 +156,9 @@ static double run_adaptive(struct workload *w,
                             int shift,        /* 0=hard reset, 1..3 = >>shift */
                             uint32_t thresh)  /* raw counter threshold */
 {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint32_t i = 0; i < w->init_live; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     uint32_t win_mask = (1u << win_bits) - 1;
     uint32_t mut_count = 0;
@@ -177,18 +177,18 @@ static double run_adaptive(struct workload *w,
         }
         if (i + pf_dist < w->n_ops) {
             if (w->op_type[i + pf_dist] == 0)
-                avx_map64_prefetch(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch(&m, w->op_keys[i + pf_dist]);
             else
-                avx_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
         }
         switch (w->op_type[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(&m, w->op_keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(&m, w->op_keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(&m, w->op_keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(&m, w->op_keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(&m, w->op_keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(&m, w->op_keys[i]); break;
         }
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->n_ops / elapsed / 1e6;
 }
 
@@ -198,10 +198,10 @@ static double run_delete_adaptive(struct workload *w,
                                    int win_bits,
                                    int load_num, int load_den)  /* threshold: count*den > cap*num */
 {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     /* insert all pool keys */
     for (uint64_t i = 0; i < w->pool_size; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     uint32_t win_mask = (1u << win_bits) - 1;
     int pf_dist = pf_hi;
@@ -212,28 +212,28 @@ static double run_delete_adaptive(struct workload *w,
         if (__builtin_expect((i & win_mask) == 0 && i > 0, 0))
             pf_dist = ((uint64_t)m.count * load_den > (uint64_t)m.cap * load_num) ? pf_hi : pf_lo;
         if (i + pf_dist < w->pool_size)
-            avx_map64_prefetch2(&m, w->pool[i + pf_dist]);
-        tot += (uint64_t)avx_map64_delete(&m, w->pool[i]);
+            simd_map64_prefetch2(&m, w->pool[i + pf_dist]);
+        tot += (uint64_t)simd_map64_delete(&m, w->pool[i]);
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->pool_size / elapsed / 1e6;
 }
 
 static double run_delete_fixed(struct workload *w, int pf_dist) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint64_t i = 0; i < w->pool_size; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     volatile uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < w->pool_size; i++) {
         if (i + pf_dist < w->pool_size)
-            avx_map64_prefetch2(&m, w->pool[i + pf_dist]);
-        tot += (uint64_t)avx_map64_delete(&m, w->pool[i]);
+            simd_map64_prefetch2(&m, w->pool[i + pf_dist]);
+        tot += (uint64_t)simd_map64_delete(&m, w->pool[i]);
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->pool_size / elapsed / 1e6;
 }
 

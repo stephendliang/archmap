@@ -5,7 +5,7 @@
 #define PHF64_SLOTS 16
 #define AVX_PHF64_PREFETCH
 #include "avx_phf64.h"
-#include "avx_map64.h"
+#include "simd_map64.h"
 
 #define N        2000000
 #define PF_AHEAD 24
@@ -118,19 +118,19 @@ int main(void) {
     }
 
     /* Dynamic avx_map64 baseline */
-    struct avx_map64 dyn;
-    avx_map64_init(&dyn);
+    struct simd_map64 dyn;
+    simd_map64_init(&dyn);
     for (int i = 0; i < N; i++)
-        avx_map64_insert(&dyn, keys[i]);
+        simd_map64_insert(&dyn, keys[i]);
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     volatile int sink = 0;
     for (int i = 0; i < N; i++)
-        sink += avx_map64_contains(&dyn, keys[i]);
+        sink += simd_map64_contains(&dyn, keys[i]);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dyn_hit = elapsed_ns(t0, t1) / N;
-    avx_map64_destroy(&dyn);
+    simd_map64_destroy(&dyn);
 
     printf("avx_phf64 16-slot (2 CL) sweep (N=%d, PF=%d):\n", N, PF_AHEAD);
     printf("  %-12s %5s  %8s  %5s %7s  %5s  %5s  %5s  %5s  %s\n",
@@ -156,7 +156,7 @@ int main(void) {
 
     printf("  -----------------------------------------------------------"
            "-------------------------------\n");
-    printf("  avx_map64 (dynamic, 8-slot, 75%% load):   "
+    printf("  simd_map64 (dynamic, 8-slot, 75%% load):   "
            "                              hit=%5.1f\n", dyn_hit);
 
     free(keys);

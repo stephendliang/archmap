@@ -3,7 +3,7 @@
  * Compiled as C, linked from test_hashmap.cpp.
  */
 #include "avx_map64s.h"
-#include "avx_map64.h"
+#include "simd_map64.h"
 
 #include "testground/khashl/khashl.h"
 
@@ -160,19 +160,19 @@ struct bench_result {
 };
 
 /* ================================================================
- * avx_map64 benchmark
+ * simd_map64 benchmark
  * ================================================================ */
 
-struct bench_result bench_avx64(const uint64_t *k_ins, const uint64_t *k_pos,
+struct bench_result bench_sm64(const uint64_t *k_ins, const uint64_t *k_pos,
                                 const uint64_t *k_mix, uint64_t n_ops) {
     struct bench_result r;
-    struct avx_map64 m;
-    avx_map64_init(&m);
+    struct simd_map64 m;
+    simd_map64_init(&m);
 
     uint64_t dups = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < n_ops; i++) {
-        if (avx_map64_insert(&m, k_ins[i]) == 0)
+        if (simd_map64_insert(&m, k_ins[i]) == 0)
             dups++;
     }
     double elapsed = now_sec() - t0;
@@ -183,8 +183,8 @@ struct bench_result bench_avx64(const uint64_t *k_ins, const uint64_t *k_pos,
     t0 = now_sec();
     for (uint64_t i = 0; i < n_ops; i++) {
         if (i + PF_DIST < n_ops)
-            avx_map64_prefetch(&m, k_pos[i + PF_DIST]);
-        avx_map64_contains(&m, k_pos[i]);
+            simd_map64_prefetch(&m, k_pos[i + PF_DIST]);
+        simd_map64_contains(&m, k_pos[i]);
     }
     elapsed = now_sec() - t0;
     r.pos_mops = (double)n_ops / elapsed / 1e6;
@@ -193,15 +193,15 @@ struct bench_result bench_avx64(const uint64_t *k_ins, const uint64_t *k_pos,
     t0 = now_sec();
     for (uint64_t i = 0; i < n_ops; i++) {
         if (i + PF_DIST < n_ops)
-            avx_map64_prefetch(&m, k_mix[i + PF_DIST]);
-        if (avx_map64_contains(&m, k_mix[i]))
+            simd_map64_prefetch(&m, k_mix[i + PF_DIST]);
+        if (simd_map64_contains(&m, k_mix[i]))
             hits++;
     }
     elapsed = now_sec() - t0;
     r.mix_mops = (double)n_ops / elapsed / 1e6;
     r.hit_pct  = 100.0 * (double)hits / (double)n_ops;
 
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return r;
 }
 
@@ -331,7 +331,7 @@ struct bench_result bench_khashl(const uint64_t *k_ins, const uint64_t *k_pos,
 }
 
 /* ================================================================
- * avx_map64 deletion + mixed workload benchmark
+ * simd_map64 deletion + mixed workload benchmark
  * ================================================================ */
 
 struct bench_del_result {
@@ -345,7 +345,7 @@ struct bench_del_result {
     int verified;
 };
 
-struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops,
+struct bench_del_result bench_sm64_del(uint64_t pool_size, uint64_t n_mixed_ops,
                                         double zipf_s,
                                         int pct_lookup, int pct_insert,
                                         int pct_delete) {
@@ -359,13 +359,13 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
 
     /* --- generate pool of unique non-zero keys --- */
     uint64_t *pool = (uint64_t *)hp_alloc(pool_size * sizeof(uint64_t));
-    struct avx_map64 m;
-    avx_map64_init(&m);
+    struct simd_map64 m;
+    simd_map64_init(&m);
 
     uint64_t gen = 0;
     while (gen < pool_size) {
         uint64_t k = xoshiro256ss() | 1;
-        if (avx_map64_insert(&m, k))
+        if (simd_map64_insert(&m, k))
             pool[gen++] = k;
     }
 
@@ -380,8 +380,8 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     double t0 = now_sec();
     for (uint64_t i = 0; i < pool_size; i++) {
         if (i + PF_DIST < pool_size)
-            avx_map64_prefetch2(&m, pool[i + PF_DIST]);
-        tot += (uint64_t)avx_map64_delete(&m, pool[i]);
+            simd_map64_prefetch2(&m, pool[i + PF_DIST]);
+        tot += (uint64_t)simd_map64_delete(&m, pool[i]);
     }
     double elapsed = now_sec() - t0;
     r.del_mops = (double)pool_size / elapsed / 1e6;
@@ -391,7 +391,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
                 m.count, (unsigned long)tot);
         r.verified = 0;
     }
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
 
     /* --- mixed workload with parameterized ratios ---
      *
@@ -400,11 +400,11 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
      * Operations are pre-generated with accurate pool tracking so
      * the final map state can be verified against the pool.
      */
-    avx_map64_init(&m);
+    simd_map64_init(&m);
     uint32_t live  = (uint32_t)(pool_size / 2);
     uint32_t total = (uint32_t)pool_size;
     for (uint32_t i = 0; i < live; i++)
-        avx_map64_insert(&m, pool[i]);
+        simd_map64_insert(&m, pool[i]);
 
     zipf_setup(live, zipf_s);
 
@@ -449,7 +449,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     zipf_cdf = NULL;
 
     /* execute with unified dispatch:
-     * avx_map64_op eliminates the 3-way switch branch (11% misprediction).
+     * simd_map64_op eliminates the 3-way switch branch (11% misprediction).
      * Single probe loop, op-dependent logic at terminal points only.
      * Controlled A/B: +42-75% vs switch across all profiles.
      * Always pf2: eliminates prefetch branch too (harmless extra prefetch
@@ -458,8 +458,8 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     t0 = now_sec();
     for (uint64_t i = 0; i < n_mixed_ops; i++) {
         if (i + PF_DIST_MIX < n_mixed_ops)
-            avx_map64_prefetch2(&m, op_keys[i + PF_DIST_MIX]);
-        tot += (uint64_t)avx_map64_op(&m, op_keys[i], op_type[i]);
+            simd_map64_prefetch2(&m, op_keys[i + PF_DIST_MIX]);
+        tot += (uint64_t)simd_map64_op(&m, op_keys[i], op_type[i]);
     }
     elapsed = now_sec() - t0;
     r.mixed_mops = (double)n_mixed_ops / elapsed / 1e6;
@@ -472,7 +472,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     }
     if (r.verified) {
         for (uint32_t i = 0; i < live; i++) {
-            if (!avx_map64_contains(&m, pool[i])) {
+            if (!simd_map64_contains(&m, pool[i])) {
                 fprintf(stderr, "FAIL: live pool[%u] missing\n", i);
                 r.verified = 0;
                 break;
@@ -481,7 +481,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     }
     if (r.verified && total > live) {
         for (uint32_t i = live; i < total; i++) {
-            if (avx_map64_contains(&m, pool[i])) {
+            if (simd_map64_contains(&m, pool[i])) {
                 fprintf(stderr, "FAIL: dead pool[%u] found\n", i);
                 r.verified = 0;
                 break;
@@ -492,7 +492,7 @@ struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops
     (void)tot;
     hp_free(op_keys, n_mixed_ops * sizeof(uint64_t));
     hp_free(op_type, n_mixed_ops);
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     hp_free(pool, pool_size * sizeof(uint64_t));
     return r;
 }

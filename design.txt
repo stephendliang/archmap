@@ -144,12 +144,13 @@ SAHA (hmap_avx512.h/c — 92+579 lines)
     64-slot SIMD groups, wyhash, 7-bit h2 metadata (h2 | 0x80 sentinel),
     87.5% load factor. AVX-512 _mm512_cmpeq_epi8_mask for group probing.
 
-avx_map64.h (239 lines) — uint64_t hash set, test/bench only
+simd_map64.h (240 lines) — uint64_t hash set, test/bench only
     Zero-metadata direct-key design. 8-wide groups (one cache line).
-    vpcmpeqq compares all 8 keys at once — zero false positives, no
+    SIMD compares all 8 keys at once — zero false positives, no
     metadata bytes. Key=0 empty sentinel. CRC32 hash. Backshift deletion
     (no tombstones). Unified op function for mixed workloads (eliminates
-    3-way switch dispatch misprediction). Token-compacted (2636 tokens).
+    3-way switch dispatch misprediction). Dual backend: AVX-512 (1 instr
+    per group) or AVX2 (5 instr per group, same 8-bit mask interface).
 
 avx_map64s.h (206 lines) — uint64_t hash set with 16-bit h2 + sentinel
     31 data slots + 1 overflow sentinel per group. 15-bit h2 gives
@@ -189,7 +190,7 @@ Headers:
     hmap_avx512.h         92 lines  SAHA API, tier dispatch macros
 
 Hash table headers (standalone, test/bench use):
-    avx_map64.h          239 lines  uint64_t direct-key hash set
+    simd_map64.h         240 lines  uint64_t direct-key hash set (AVX-512/AVX2)
     avx_map64s.h         206 lines  uint64_t sentinel hash set
     avx_map128s.h        343 lines  128-bit sentinel hash set
     avx_phf64.h          179 lines  Perfect hash function

@@ -14,7 +14,7 @@
  * Run:   taskset -c 0 ./test_dispatch [pool_size] [n_ops] [zipf_s]
  */
 
-#include "avx_map64.h"
+#include "simd_map64.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,7 +100,7 @@ static inline double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* avx64_backshift_at and avx_map64_op are now in avx_map64.h */
+/* sm64_backshift_at and simd_map64_op are now in simd_map64.h */
 
 /* ================================================================
  * Dispatch variants (all noinline to prevent cross-contamination)
@@ -110,21 +110,21 @@ typedef struct { double mops; uint64_t tot; } mix_result_t;
 
 /* --- V0: switch3 (current baseline) --- */
 __attribute__((noinline))
-static mix_result_t run_switch3(struct avx_map64 *m, const uint64_t *keys,
+static mix_result_t run_switch3(struct simd_map64 *m, const uint64_t *keys,
                                  const uint8_t *ops, uint64_t n) {
     uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < n; i++) {
         if (i + PF_DIST_MIX < n) {
             if (ops[i + PF_DIST_MIX] == 0)
-                avx_map64_prefetch(m, keys[i + PF_DIST_MIX]);
+                simd_map64_prefetch(m, keys[i + PF_DIST_MIX]);
             else
-                avx_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
+                simd_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
         }
         switch (ops[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(m, keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(m, keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(m, keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(m, keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(m, keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(m, keys[i]); break;
         }
     }
     return (mix_result_t){ (double)n / (now_sec() - t0) / 1e6, tot };
@@ -132,23 +132,23 @@ static mix_result_t run_switch3(struct avx_map64 *m, const uint64_t *keys,
 
 /* --- V1: if_likely (bias first branch toward contains) --- */
 __attribute__((noinline))
-static mix_result_t run_if_likely(struct avx_map64 *m, const uint64_t *keys,
+static mix_result_t run_if_likely(struct simd_map64 *m, const uint64_t *keys,
                                    const uint8_t *ops, uint64_t n) {
     uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < n; i++) {
         if (i + PF_DIST_MIX < n) {
             if (ops[i + PF_DIST_MIX] == 0)
-                avx_map64_prefetch(m, keys[i + PF_DIST_MIX]);
+                simd_map64_prefetch(m, keys[i + PF_DIST_MIX]);
             else
-                avx_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
+                simd_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
         }
         if (__builtin_expect(ops[i] == 0, 1)) {
-            tot += (uint64_t)avx_map64_contains(m, keys[i]);
+            tot += (uint64_t)simd_map64_contains(m, keys[i]);
         } else if (ops[i] == 1) {
-            tot += (uint64_t)avx_map64_insert(m, keys[i]);
+            tot += (uint64_t)simd_map64_insert(m, keys[i]);
         } else {
-            tot += (uint64_t)avx_map64_delete(m, keys[i]);
+            tot += (uint64_t)simd_map64_delete(m, keys[i]);
         }
     }
     return (mix_result_t){ (double)n / (now_sec() - t0) / 1e6, tot };
@@ -156,22 +156,22 @@ static mix_result_t run_if_likely(struct avx_map64 *m, const uint64_t *keys,
 
 /* --- V2: computed goto (indirect jump, no call overhead) --- */
 __attribute__((noinline))
-static mix_result_t run_goto_lut(struct avx_map64 *m, const uint64_t *keys,
+static mix_result_t run_goto_lut(struct simd_map64 *m, const uint64_t *keys,
                                   const uint8_t *ops, uint64_t n) {
     uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < n; i++) {
         if (i + PF_DIST_MIX < n) {
             if (ops[i + PF_DIST_MIX] == 0)
-                avx_map64_prefetch(m, keys[i + PF_DIST_MIX]);
+                simd_map64_prefetch(m, keys[i + PF_DIST_MIX]);
             else
-                avx_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
+                simd_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
         }
         static void *dtable[] = { &&Lcontains, &&Linsert, &&Ldelete };
         goto *dtable[ops[i]];
-        Lcontains: tot += (uint64_t)avx_map64_contains(m, keys[i]); goto Ldone;
-        Linsert:   tot += (uint64_t)avx_map64_insert(m, keys[i]);   goto Ldone;
-        Ldelete:   tot += (uint64_t)avx_map64_delete(m, keys[i]);   goto Ldone;
+        Lcontains: tot += (uint64_t)simd_map64_contains(m, keys[i]); goto Ldone;
+        Linsert:   tot += (uint64_t)simd_map64_insert(m, keys[i]);   goto Ldone;
+        Ldelete:   tot += (uint64_t)simd_map64_delete(m, keys[i]);   goto Ldone;
         Ldone: ;
     }
     return (mix_result_t){ (double)n / (now_sec() - t0) / 1e6, tot };
@@ -179,14 +179,14 @@ static mix_result_t run_goto_lut(struct avx_map64 *m, const uint64_t *keys,
 
 /* --- V3: unified (single probe, late dispatch, always pf2) --- */
 __attribute__((noinline))
-static mix_result_t run_unified(struct avx_map64 *m, const uint64_t *keys,
+static mix_result_t run_unified(struct simd_map64 *m, const uint64_t *keys,
                                  const uint8_t *ops, uint64_t n) {
     uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < n; i++) {
         if (i + PF_DIST_MIX < n)
-            avx_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
-        tot += (uint64_t)avx_map64_op(m, keys[i], ops[i]);
+            simd_map64_prefetch2(m, keys[i + PF_DIST_MIX]);
+        tot += (uint64_t)simd_map64_op(m, keys[i], ops[i]);
     }
     return (mix_result_t){ (double)n / (now_sec() - t0) / 1e6, tot };
 }
@@ -195,7 +195,7 @@ static mix_result_t run_unified(struct avx_map64 *m, const uint64_t *keys,
  * Runner infrastructure
  * ================================================================ */
 
-typedef mix_result_t (*run_fn_t)(struct avx_map64 *, const uint64_t *,
+typedef mix_result_t (*run_fn_t)(struct simd_map64 *, const uint64_t *,
                                   const uint8_t *, uint64_t);
 
 static const char *vnames[N_VARIANTS] = {
@@ -215,15 +215,15 @@ int main(int argc, char **argv) {
     /* generate unique non-zero key pool */
     uint64_t *pool = (uint64_t *)malloc(pool_size * sizeof(uint64_t));
     {
-        struct avx_map64 tmp;
-        avx_map64_init(&tmp);
+        struct simd_map64 tmp;
+        simd_map64_init(&tmp);
         uint64_t gen = 0;
         while (gen < pool_size) {
             uint64_t k = xoshiro256ss() | 1;
-            if (avx_map64_insert(&tmp, k))
+            if (simd_map64_insert(&tmp, k))
                 pool[gen++] = k;
         }
-        avx_map64_destroy(&tmp);
+        simd_map64_destroy(&tmp);
     }
 
     /* Fisher-Yates shuffle */
@@ -304,10 +304,10 @@ int main(int argc, char **argv) {
                 int v = (vi + round) % N_VARIANTS;
 
                 /* fresh map with initial live pool */
-                struct avx_map64 m;
-                avx_map64_init(&m);
+                struct simd_map64 m;
+                simd_map64_init(&m);
                 for (uint32_t j = 0; j < init_live; j++)
-                    avx_map64_insert(&m, pool[j]);
+                    simd_map64_insert(&m, pool[j]);
 
                 mix_result_t r = runners[v](&m, op_keys, op_type, n_ops);
                 results[v] += r.mops;
@@ -331,7 +331,7 @@ int main(int argc, char **argv) {
                     }
                 }
 
-                avx_map64_destroy(&m);
+                simd_map64_destroy(&m);
             }
         }
 

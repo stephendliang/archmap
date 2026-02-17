@@ -93,7 +93,7 @@ static inline double now_sec(void) {
  * VARIANT A: Baseline (avx_map64 verbatim from header)
  * ================================================================ */
 
-#include "avx_map64.h"
+#include "simd_map64.h"
 
 /* prefetch wrappers already in header */
 
@@ -114,7 +114,7 @@ struct del_stats {
 
 static struct del_stats g_stats;
 
-static int instrumented_delete(struct avx_map64 *m, uint64_t key) {
+static int instrumented_delete(struct simd_map64 *m, uint64_t key) {
     if (__builtin_expect(m->cap == 0, 0)) return 0;
 
     uint32_t gi   = map_hash(key) & m->mask;
@@ -836,14 +836,14 @@ struct variant_ops {
 /* Wrapper functions to cast void* properly */
 
 /* --- baseline wrappers --- */
-static void w_base_init(void *m)     { avx_map64_init((struct avx_map64 *)m); }
-static void w_base_destroy(void *m)  { avx_map64_destroy((struct avx_map64 *)m); }
-static int  w_base_insert(void *m, uint64_t k) { return avx_map64_insert((struct avx_map64 *)m, k); }
-static int  w_base_contains(void *m, uint64_t k) { return avx_map64_contains((struct avx_map64 *)m, k); }
-static int  w_base_delete(void *m, uint64_t k) { return avx_map64_delete((struct avx_map64 *)m, k); }
-static void w_base_prefetch(void *m, uint64_t k) { avx_map64_prefetch((struct avx_map64 *)m, k); }
-static void w_base_prefetch2(void *m, uint64_t k) { avx_map64_prefetch2((struct avx_map64 *)m, k); }
-static uint32_t w_base_count(void *m) { return ((struct avx_map64 *)m)->count; }
+static void w_base_init(void *m)     { simd_map64_init((struct simd_map64 *)m); }
+static void w_base_destroy(void *m)  { simd_map64_destroy((struct simd_map64 *)m); }
+static int  w_base_insert(void *m, uint64_t k) { return simd_map64_insert((struct simd_map64 *)m, k); }
+static int  w_base_contains(void *m, uint64_t k) { return simd_map64_contains((struct simd_map64 *)m, k); }
+static int  w_base_delete(void *m, uint64_t k) { return simd_map64_delete((struct simd_map64 *)m, k); }
+static void w_base_prefetch(void *m, uint64_t k) { simd_map64_prefetch((struct simd_map64 *)m, k); }
+static void w_base_prefetch2(void *m, uint64_t k) { simd_map64_prefetch2((struct simd_map64 *)m, k); }
+static uint32_t w_base_count(void *m) { return ((struct simd_map64 *)m)->count; }
 
 /* --- tombstone wrappers --- */
 static void w_tomb_init(void *m)     { tomb_init((struct avx_tomb *)m); }
@@ -876,7 +876,7 @@ static void w_disp_prefetch2(void *m, uint64_t k) { disp_prefetch2((struct avx_d
 static uint32_t w_disp_count(void *m) { return ((struct avx_disp *)m)->count; }
 
 static struct variant_ops variants[] = {
-    { "baseline",   sizeof(struct avx_map64),  w_base_init, w_base_destroy, w_base_insert, w_base_contains, w_base_delete, w_base_prefetch, w_base_prefetch2, w_base_count },
+    { "baseline",   sizeof(struct simd_map64),  w_base_init, w_base_destroy, w_base_insert, w_base_contains, w_base_delete, w_base_prefetch, w_base_prefetch2, w_base_count },
     { "tombstone",  sizeof(struct avx_tomb),   w_tomb_init, w_tomb_destroy, w_tomb_insert, w_tomb_contains, w_tomb_delete, w_tomb_prefetch, w_tomb_prefetch2, w_tomb_count },
     { "hybrid",     sizeof(struct avx_hybrid), w_hyb_init,  w_hyb_destroy,  w_hyb_insert,  w_hyb_contains,  w_hyb_delete,  w_hyb_prefetch,  w_hyb_prefetch2,  w_hyb_count },
     { "disp-bmap",  sizeof(struct avx_disp),   w_disp_init, w_disp_destroy, w_disp_insert, w_disp_contains, w_disp_delete, w_disp_prefetch, w_disp_prefetch2, w_disp_count },
@@ -1040,14 +1040,14 @@ static struct bench_del_result run_bench(struct variant_ops *v,
 static void run_instrumented(uint64_t pool_size) {
     memset(&g_stats, 0, sizeof(g_stats));
 
-    struct avx_map64 m;
-    avx_map64_init(&m);
+    struct simd_map64 m;
+    simd_map64_init(&m);
 
     uint64_t *pool = (uint64_t *)malloc(pool_size * sizeof(uint64_t));
     uint64_t gen = 0;
     while (gen < pool_size) {
         uint64_t k = xoshiro256ss() | 2;
-        if (avx_map64_insert(&m, k))
+        if (simd_map64_insert(&m, k))
             pool[gen++] = k;
     }
 
@@ -1089,7 +1089,7 @@ static void run_instrumented(uint64_t pool_size) {
     }
     printf("\n");
 
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     free(pool);
 }
 

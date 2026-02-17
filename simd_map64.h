@@ -1,8 +1,10 @@
-/* avx_map64: Zero-metadata direct-key AVX-512 hash set for uint64_t
+/* simd_map64: Zero-metadata direct-key SIMD hash set for uint64_t
 
 Header-only. Keys stored directly in 8-wide groups (one cache line).
-vpcmpeqq compares all 8 keys at once — zero false positives, no metadata,
-no scalar verification. Key=0 reserved as empty sentinel. */
+SIMD compares all 8 keys at once — zero false positives, no metadata,
+no scalar verification. Key=0 reserved as empty sentinel.
+
+Backends: AVX-512 (1 instruction per group) or AVX2 (5 instructions). */
 #pragma once
 
 #include <immintrin.h>
@@ -11,11 +13,11 @@ no scalar verification. Key=0 reserved as empty sentinel. */
 #include <string.h>
 #include <sys/mman.h>
 
-#define AVX64_INIT_CAP  64  // 8 groups
-#define AVX64_LOAD_NUM  3
-#define AVX64_LOAD_DEN  4   // 75% load factor
+#define SM64_INIT_CAP  64  // 8 groups
+#define SM64_LOAD_NUM  3
+#define SM64_LOAD_DEN  4   // 75% load factor
 
-struct avx_map64 {
+struct simd_map64 {
     uint64_t *keys;     // aligned, zero = empty
     uint32_t count;
     uint32_t cap;       // ng * 8
@@ -23,42 +25,75 @@ struct avx_map64 {
 };
 
 // hash: CRC32 integer mixer
-#define avx64_hash(key) ((uint32_t)_mm_crc32_u64(0, (key)))
+#define sm64_hash(key) ((uint32_t)_mm_crc32_u64(0, (key)))
 
-// SIMD match/empty masks
-#define avx64_match(grp, key) \
+/* ================================================================
+ * Backend selection — only #ifdef in the file
+ * ================================================================ */
+
+#if defined(__AVX512F__)
+
+#define sm64_match(grp, key) \
     _mm512_cmpeq_epi64_mask(_mm512_load_si512((const __m512i *)(grp)), \
                             _mm512_set1_epi64((long long)(key)))
 
-#define avx64_empty(grp) \
+#define sm64_empty(grp) \
     _mm512_cmpeq_epi64_mask(_mm512_load_si512((const __m512i *)(grp)), \
                             _mm512_setzero_si512())
 
+#elif defined(__AVX2__)
+
+static inline uint8_t sm64_match(const uint64_t *grp, uint64_t key) {
+    __m256i k  = _mm256_set1_epi64x((long long)key);
+    __m256i lo = _mm256_load_si256((const __m256i *)grp);
+    __m256i hi = _mm256_load_si256((const __m256i *)(grp + 4));
+    int mlo = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(lo, k)));
+    int mhi = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(hi, k)));
+    return (uint8_t)(mlo | (mhi << 4));
+}
+
+static inline uint8_t sm64_empty(const uint64_t *grp) {
+    __m256i z  = _mm256_setzero_si256();
+    __m256i lo = _mm256_load_si256((const __m256i *)grp);
+    __m256i hi = _mm256_load_si256((const __m256i *)(grp + 4));
+    int mlo = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(lo, z)));
+    int mhi = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(hi, z)));
+    return (uint8_t)(mlo | (mhi << 4));
+}
+
+#else
+#error "simd_map64 requires AVX2 or AVX-512"
+#endif
+
+/* ================================================================
+ * Shared code — no raw SIMD below this line
+ * ================================================================ */
+
 // prefetch home group
-#define avx_map64_prefetch(m, key) do { \
-    uint32_t gi_ = avx64_hash(key) & (m)->mask; \
+#define simd_map64_prefetch(m, key) do { \
+    uint32_t gi_ = sm64_hash(key) & (m)->mask; \
     _mm_prefetch((const char *)((m)->keys + (gi_ << 3)), _MM_HINT_T0); \
 } while (0)
 
 // prefetch home + overflow group
-static inline void avx_map64_prefetch2(struct avx_map64 *m, uint64_t key) {
-    uint32_t gi = avx64_hash(key) & m->mask;
+static inline void simd_map64_prefetch2(struct simd_map64 *m, uint64_t key) {
+    uint32_t gi = sm64_hash(key) & m->mask;
     _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
     gi = (gi + 1) & m->mask;
     _mm_prefetch((const char *)(m->keys + (gi << 3)), _MM_HINT_T0);
 }
 
 // round byte size up to 2MB
-#define avx64_mapsize(cap) \
+#define sm64_mapsize(cap) \
     (((size_t)(cap) * sizeof(uint64_t) + (2u << 20) - 1) & ~((size_t)(2u << 20) - 1))
 
-#define avx_map64_init(m)    memset((m), 0, sizeof(*(m)))
-#define avx_map64_destroy(m) do { \
-    if ((m)->keys) munmap((m)->keys, avx64_mapsize((m)->cap)); \
+#define simd_map64_init(m)    memset((m), 0, sizeof(*(m)))
+#define simd_map64_destroy(m) do { \
+    if ((m)->keys) munmap((m)->keys, sm64_mapsize((m)->cap)); \
 } while (0)
 
-static void avx64_alloc(struct avx_map64 *m, uint32_t cap) {
-    size_t total = avx64_mapsize(cap);
+static void sm64_alloc(struct simd_map64 *m, uint32_t cap) {
+    size_t total = sm64_mapsize(cap);
     // try explicit 2MB hugepages with MAP_POPULATE (pre-fault)
     m->keys = (uint64_t *)mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, -1, 0);
     if (m->keys == MAP_FAILED) {
@@ -72,18 +107,18 @@ static void avx64_alloc(struct avx_map64 *m, uint32_t cap) {
     m->count = 0;
 }
 
-static void avx64_grow(struct avx_map64 *m) {
+static void sm64_grow(struct simd_map64 *m) {
     uint32_t old_cap = m->cap;
     uint64_t *old_keys = m->keys;
-    avx64_alloc(m, old_cap * 2);
+    sm64_alloc(m, old_cap * 2);
     uint32_t mask = m->mask;
     for (uint32_t i = 0; i < old_cap; i++) {
         uint64_t key = old_keys[i];
         if (!key) continue;
-        uint32_t gi = avx64_hash(key) & mask;
+        uint32_t gi = sm64_hash(key) & mask;
         for (;;) {
             uint64_t *grp = m->keys + (gi << 3);
-            __mmask8 em = avx64_empty(grp);
+            uint8_t em = sm64_empty(grp);
             if (em) {
                 grp[__builtin_ctz(em)] = key;
                 m->count++;
@@ -92,19 +127,19 @@ static void avx64_grow(struct avx_map64 *m) {
             gi = (gi + 1) & mask;
         }
     }
-    munmap(old_keys, avx64_mapsize(old_cap));
+    munmap(old_keys, sm64_mapsize(old_cap));
 }
 
 // public API
 
-static inline int avx_map64_insert(struct avx_map64 *m, uint64_t key) {
-    if (m->cap == 0) avx64_alloc(m, AVX64_INIT_CAP);
-    if (m->count * AVX64_LOAD_DEN >= m->cap * AVX64_LOAD_NUM) avx64_grow(m);
-    uint32_t gi = avx64_hash(key) & m->mask;
+static inline int simd_map64_insert(struct simd_map64 *m, uint64_t key) {
+    if (m->cap == 0) sm64_alloc(m, SM64_INIT_CAP);
+    if (m->count * SM64_LOAD_DEN >= m->cap * SM64_LOAD_NUM) sm64_grow(m);
+    uint32_t gi = sm64_hash(key) & m->mask;
     for (;;) {
         uint64_t *grp = m->keys + (gi << 3);
-        if (avx64_match(grp, key)) return 0;
-        __mmask8 em = avx64_empty(grp);
+        if (sm64_match(grp, key)) return 0;
+        uint8_t em = sm64_empty(grp);
         if (em) {
             grp[__builtin_ctz(em)] = key;
             m->count++;
@@ -114,15 +149,13 @@ static inline int avx_map64_insert(struct avx_map64 *m, uint64_t key) {
     }
 }
 
-static inline int avx_map64_contains(struct avx_map64 *m, uint64_t key) {
+static inline int simd_map64_contains(struct simd_map64 *m, uint64_t key) {
     if (__builtin_expect(m->cap == 0, 0)) return 0;
-    uint32_t gi = avx64_hash(key) & m->mask;
-    __m512i needle = _mm512_set1_epi64((long long)key);
+    uint32_t gi = sm64_hash(key) & m->mask;
     for (;;) {
         uint64_t *grp = m->keys + (gi << 3);
-        __m512i group = _mm512_load_si512((const __m512i *)grp);
-        if (_mm512_cmpeq_epi64_mask(group, needle)) return 1;
-        if (_mm512_testn_epi64_mask(group, group))  return 0;
+        if (sm64_match(grp, key)) return 1;
+        if (sm64_empty(grp))      return 0;
         gi = (gi + 1) & m->mask;
     }
 }
@@ -130,7 +163,7 @@ static inline int avx_map64_contains(struct avx_map64 *m, uint64_t key) {
 /* backshift: repair probe chain after deletion.
 pulls displaced keys toward their home group so contains()
 (which stops at the first empty slot) remains correct. */
-static inline void avx64_backshift_at(struct avx_map64 *m, uint32_t gi, int slot) {
+static inline void sm64_backshift_at(struct simd_map64 *m, uint32_t gi, int slot) {
     uint32_t mask = m->mask;
     uint32_t hole_gi = gi;
     int hole_slot = slot;
@@ -141,8 +174,7 @@ static inline void avx64_backshift_at(struct avx_map64 *m, uint32_t gi, int slot
         _mm_prefetch((const char *)(m->keys + (pf_gi << 3)), _MM_HINT_T0);
 
         uint64_t *scan_grp = m->keys + (scan_gi << 3);
-        __m512i scan_group = _mm512_load_si512((__m512i *)scan_grp);
-        __mmask8 scan_empty = _mm512_testn_epi64_mask(scan_group, scan_group);
+        uint8_t scan_empty = sm64_empty(scan_grp);
 
         if (scan_empty == 0xFF) return; // fully empty — chain over
 
@@ -152,7 +184,7 @@ static inline void avx64_backshift_at(struct avx_map64 *m, uint32_t gi, int slot
         int cand_slots[8];
         int n_cand = 0;
 
-        for (__mmask8 todo = (~scan_empty) & 0xFF; todo; todo &= todo - 1) {
+        for (uint8_t todo = (~scan_empty) & 0xFF; todo; todo &= todo - 1) {
             int s = __builtin_ctz(todo);
             cand_keys[n_cand] = scan_grp[s];
             cand_slots[n_cand] = s;
@@ -160,7 +192,7 @@ static inline void avx64_backshift_at(struct avx_map64 *m, uint32_t gi, int slot
         }
 
         for (int j = 0; j < n_cand; j++)
-            cand_homes[j] = avx64_hash(cand_keys[j]) & mask;
+            cand_homes[j] = sm64_hash(cand_keys[j]) & mask;
 
         int moved = 0;
         for (int j = 0; j < n_cand; j++) {
@@ -181,20 +213,18 @@ static inline void avx64_backshift_at(struct avx_map64 *m, uint32_t gi, int slot
     }
 }
 
-static inline int avx_map64_delete(struct avx_map64 *m, uint64_t key) {
+static inline int simd_map64_delete(struct simd_map64 *m, uint64_t key) {
     if (__builtin_expect(m->cap == 0, 0)) return 0;
-    uint32_t gi = avx64_hash(key) & m->mask, mask = m->mask;
-    __m512i needle = _mm512_set1_epi64((long long)key);
+    uint32_t gi = sm64_hash(key) & m->mask, mask = m->mask;
     for (;;) {
         uint64_t *grp = m->keys + (gi << 3);
-        __m512i group = _mm512_load_si512((__m512i *)grp);
-        __mmask8 mm = _mm512_cmpeq_epi64_mask(group, needle);
-        __mmask8 empty = _mm512_testn_epi64_mask(group, group);
+        uint8_t mm = sm64_match(grp, key);
+        uint8_t empty = sm64_empty(grp);
         if (mm) {
             int slot = __builtin_ctz(mm);
             grp[slot] = 0;
             m->count--;
-            if (!empty) avx64_backshift_at(m, gi, slot);
+            if (!empty) sm64_backshift_at(m, gi, slot);
             return 1;
         }
         if (empty) return 0;
@@ -203,25 +233,23 @@ static inline int avx_map64_delete(struct avx_map64 *m, uint64_t key) {
 }
 
 // unified op: single probe loop. op: 0=contains, 1=insert, 2=delete
-static inline int avx_map64_op(struct avx_map64 *m, uint64_t key, int op) {
+static inline int simd_map64_op(struct simd_map64 *m, uint64_t key, int op) {
     if (__builtin_expect(m->cap == 0, 0)) {
-        if (op == 1) avx64_alloc(m, AVX64_INIT_CAP);
+        if (op == 1) sm64_alloc(m, SM64_INIT_CAP);
         else return 0;
     }
-    if (__builtin_expect(op == 1 && m->count * AVX64_LOAD_DEN >= m->cap * AVX64_LOAD_NUM, 0)) avx64_grow(m);
-    uint32_t gi = avx64_hash(key) & m->mask, mask = m->mask;
-    __m512i needle = _mm512_set1_epi64((long long)key);
+    if (__builtin_expect(op == 1 && m->count * SM64_LOAD_DEN >= m->cap * SM64_LOAD_NUM, 0)) sm64_grow(m);
+    uint32_t gi = sm64_hash(key) & m->mask, mask = m->mask;
     for (;;) {
         uint64_t *grp = m->keys + (gi << 3);
-        __m512i group = _mm512_load_si512((const __m512i *)grp);
-        __mmask8 mm = _mm512_cmpeq_epi64_mask(group, needle);
-        __mmask8 empty = _mm512_testn_epi64_mask(group, group);
+        uint8_t mm = sm64_match(grp, key);
+        uint8_t empty = sm64_empty(grp);
         if (mm) {
             if (__builtin_expect(op == 2, 0)) {
                 int slot = __builtin_ctz(mm);
                 grp[slot] = 0;
                 m->count--;
-                if (!empty) avx64_backshift_at(m, gi, slot);
+                if (!empty) sm64_backshift_at(m, gi, slot);
                 return 1;
             }
             return op == 0; // 1 for contains, 0 for insert-dup

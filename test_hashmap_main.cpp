@@ -28,7 +28,7 @@ void     bench_free_keys(uint64_t *keys, uint64_t n_ops);
 
 struct bench_result bench_vt(const uint64_t *k_ins, const uint64_t *k_pos,
                              const uint64_t *k_mix, uint64_t n_ops);
-struct bench_result bench_avx64(const uint64_t *k_ins, const uint64_t *k_pos,
+struct bench_result bench_sm64(const uint64_t *k_ins, const uint64_t *k_pos,
                                 const uint64_t *k_mix, uint64_t n_ops);
 struct bench_result bench_avx64s(const uint64_t *k_ins, const uint64_t *k_pos,
                                  const uint64_t *k_mix, uint64_t n_ops);
@@ -46,7 +46,7 @@ struct bench_del_result {
     int verified;
 };
 
-struct bench_del_result bench_avx64_del(uint64_t pool_size, uint64_t n_mixed_ops,
+struct bench_del_result bench_sm64_del(uint64_t pool_size, uint64_t n_mixed_ops,
                                         double zipf_s,
                                         int pct_lookup, int pct_insert,
                                         int pct_delete);
@@ -125,22 +125,22 @@ int main(int argc, char **argv) {
     uint64_t *k_pos = bench_gen_zipf_keys(N, zipf_s, n_ops);
     uint64_t *k_mix = bench_gen_zipf_keys(2 * N, zipf_s, n_ops);
 
-    bench_result r_avx64s = bench_avx64s(k_ins, k_pos, k_mix, n_ops);
-    bench_result r_avx64  = bench_avx64(k_ins, k_pos, k_mix, n_ops);
+    bench_result r_sm64s = bench_avx64s(k_ins, k_pos, k_mix, n_ops);
+    bench_result r_sm64 = bench_sm64(k_ins, k_pos, k_mix, n_ops);
     bench_result r_boost  = bench_boost(k_ins, k_pos, k_mix, n_ops);
     bench_result r_vt     = bench_vt(k_ins, k_pos, k_mix, n_ops);
     bench_result r_khashl = bench_khashl(k_ins, k_pos, k_mix, n_ops);
 
     printf("                insert          lookup+         lookup±\n");
-    print_row("avx_map64s",  &r_avx64s);
-    print_row("avx_map64",   &r_avx64);
+    print_row("simd_map64s", &r_sm64s);
+    print_row("simd_map64",  &r_sm64);
     print_row("verstable",   &r_vt);
     print_row("boost",       &r_boost);
     print_row("khashl",      &r_khashl);
     printf("\n");
     printf("  insert:  %lu unique of %lu (%.1f%% dup)\n",
-           (unsigned long)r_avx64.unique, (unsigned long)n_ops, r_avx64.dup_pct);
-    printf("  lookup±: %.1f%% hit\n", r_avx64.hit_pct);
+           (unsigned long)r_sm64.unique, (unsigned long)n_ops, r_sm64.dup_pct);
+    printf("  lookup±: %.1f%% hit\n", r_sm64.hit_pct);
 
     /* --- deletion + mixed workload profiles --- */
     struct { const char *name; int lkp, ins, del; } profiles[] = {
@@ -153,10 +153,10 @@ int main(int argc, char **argv) {
     int n_profiles = (int)(sizeof(profiles) / sizeof(profiles[0]));
 
     /* first run to get pure-delete number (same for all profiles) */
-    bench_del_result r_del = bench_avx64_del(N, n_ops, zipf_s,
+    bench_del_result r_del = bench_sm64_del(N, n_ops, zipf_s,
                                               profiles[0].lkp, profiles[0].ins,
                                               profiles[0].del);
-    printf("\n  avx_map64 delete:  %6.1f Mops/s  (pool=%lu)\n",
+    printf("\n  simd_map64 delete:  %6.1f Mops/s  (pool=%lu)\n",
            r_del.del_mops, (unsigned long)r_del.pool_size);
     printf("  mixed workloads (z=%.1f):\n", zipf_s);
     printf("    %-12s %d/%d/%d:  %6.1f Mops/s   verify: %s\n",
@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
            r_del.mixed_mops, r_del.verified ? "OK" : "FAIL");
 
     for (int p = 1; p < n_profiles; p++) {
-        bench_del_result rp = bench_avx64_del(N, n_ops, zipf_s,
+        bench_del_result rp = bench_sm64_del(N, n_ops, zipf_s,
                                                profiles[p].lkp, profiles[p].ins,
                                                profiles[p].del);
         printf("    %-12s %d/%d/%d:  %6.1f Mops/s   verify: %s\n",

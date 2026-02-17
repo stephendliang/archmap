@@ -14,7 +14,7 @@
 #include <time.h>
 #include <math.h>
 
-#include "avx_map64.h"
+#include "simd_map64.h"
 
 /* ---- RNG ---- */
 static uint64_t rng_s[4];
@@ -73,13 +73,13 @@ static struct workload gen_workload(uint64_t pool_size, uint64_t n_ops,
     w.op_keys = malloc(n_ops * sizeof(uint64_t));
     w.op_type = malloc(n_ops);
 
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     uint64_t gen = 0;
     while (gen < pool_size) {
         uint64_t k = xoshiro256ss() | 1;
-        if (avx_map64_insert(&m, k)) w.pool[gen++] = k;
+        if (simd_map64_insert(&m, k)) w.pool[gen++] = k;
     }
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
 
     uint32_t live = pool_size / 2, total = pool_size;
     w.init_live = live;
@@ -121,9 +121,9 @@ static void free_workload(struct workload *w) {
 /* Variant A: Current — hard reset, win=1024, thresh=512, LF>50% for delete */
 __attribute__((noinline))
 static double run_mixed_A(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint32_t i = 0; i < w->init_live; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     uint32_t mut_count = 0;
     int pf_dist = 12;
@@ -137,27 +137,27 @@ static double run_mixed_A(struct workload *w) {
         }
         if (i + pf_dist < w->n_ops) {
             if (w->op_type[i + pf_dist] == 0)
-                avx_map64_prefetch(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch(&m, w->op_keys[i + pf_dist]);
             else
-                avx_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
         }
         switch (w->op_type[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(&m, w->op_keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(&m, w->op_keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(&m, w->op_keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(&m, w->op_keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(&m, w->op_keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(&m, w->op_keys[i]); break;
         }
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->n_ops / elapsed / 1e6;
 }
 
 /* Variant B: >>1 decay, win=1024, thresh=1024 (steady-state equiv of 50%) */
 __attribute__((noinline))
 static double run_mixed_B(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint32_t i = 0; i < w->init_live; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     uint32_t mut_count = 0;
     int pf_dist = 12;
@@ -171,27 +171,27 @@ static double run_mixed_B(struct workload *w) {
         }
         if (i + pf_dist < w->n_ops) {
             if (w->op_type[i + pf_dist] == 0)
-                avx_map64_prefetch(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch(&m, w->op_keys[i + pf_dist]);
             else
-                avx_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
         }
         switch (w->op_type[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(&m, w->op_keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(&m, w->op_keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(&m, w->op_keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(&m, w->op_keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(&m, w->op_keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(&m, w->op_keys[i]); break;
         }
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->n_ops / elapsed / 1e6;
 }
 
 /* Variant C: >>1 decay, win=512, thresh=512 */
 __attribute__((noinline))
 static double run_mixed_C(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint32_t i = 0; i < w->init_live; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     uint32_t mut_count = 0;
     int pf_dist = 12;
@@ -205,81 +205,81 @@ static double run_mixed_C(struct workload *w) {
         }
         if (i + pf_dist < w->n_ops) {
             if (w->op_type[i + pf_dist] == 0)
-                avx_map64_prefetch(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch(&m, w->op_keys[i + pf_dist]);
             else
-                avx_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
+                simd_map64_prefetch2(&m, w->op_keys[i + pf_dist]);
         }
         switch (w->op_type[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(&m, w->op_keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(&m, w->op_keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(&m, w->op_keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(&m, w->op_keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(&m, w->op_keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(&m, w->op_keys[i]); break;
         }
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->n_ops / elapsed / 1e6;
 }
 
 /* Variant D: Fixed PF=12 baseline (no adaptation overhead) */
 __attribute__((noinline))
 static double run_mixed_fixed12(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint32_t i = 0; i < w->init_live; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     volatile uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < w->n_ops; i++) {
         if (i + 12 < w->n_ops) {
             if (w->op_type[i + 12] == 0)
-                avx_map64_prefetch(&m, w->op_keys[i + 12]);
+                simd_map64_prefetch(&m, w->op_keys[i + 12]);
             else
-                avx_map64_prefetch2(&m, w->op_keys[i + 12]);
+                simd_map64_prefetch2(&m, w->op_keys[i + 12]);
         }
         switch (w->op_type[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(&m, w->op_keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(&m, w->op_keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(&m, w->op_keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(&m, w->op_keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(&m, w->op_keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(&m, w->op_keys[i]); break;
         }
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->n_ops / elapsed / 1e6;
 }
 
 /* Variant E: Fixed PF=4 baseline */
 __attribute__((noinline))
 static double run_mixed_fixed4(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint32_t i = 0; i < w->init_live; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
 
     volatile uint64_t tot = 0;
     double t0 = now_sec();
     for (uint64_t i = 0; i < w->n_ops; i++) {
         if (i + 4 < w->n_ops) {
             if (w->op_type[i + 4] == 0)
-                avx_map64_prefetch(&m, w->op_keys[i + 4]);
+                simd_map64_prefetch(&m, w->op_keys[i + 4]);
             else
-                avx_map64_prefetch2(&m, w->op_keys[i + 4]);
+                simd_map64_prefetch2(&m, w->op_keys[i + 4]);
         }
         switch (w->op_type[i]) {
-            case 0: tot += (uint64_t)avx_map64_contains(&m, w->op_keys[i]); break;
-            case 1: tot += (uint64_t)avx_map64_insert(&m, w->op_keys[i]); break;
-            case 2: tot += (uint64_t)avx_map64_delete(&m, w->op_keys[i]); break;
+            case 0: tot += (uint64_t)simd_map64_contains(&m, w->op_keys[i]); break;
+            case 1: tot += (uint64_t)simd_map64_insert(&m, w->op_keys[i]); break;
+            case 2: tot += (uint64_t)simd_map64_delete(&m, w->op_keys[i]); break;
         }
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->n_ops / elapsed / 1e6;
 }
 
 /* ---- Pure delete variants ---- */
 __attribute__((noinline))
 static double run_del_lf50(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint64_t i = 0; i < w->pool_size; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
     /* shuffle */
     for (uint64_t i = w->pool_size - 1; i > 0; i--) {
         uint64_t j = xoshiro256ss() % (i + 1);
@@ -292,19 +292,19 @@ static double run_del_lf50(struct workload *w) {
         if (__builtin_expect((i & 1023) == 0 && i > 0, 0))
             pf_dist = (m.count * 2 > m.cap) ? 12 : 4;
         if (i + pf_dist < w->pool_size)
-            avx_map64_prefetch2(&m, w->pool[i + pf_dist]);
-        tot += (uint64_t)avx_map64_delete(&m, w->pool[i]);
+            simd_map64_prefetch2(&m, w->pool[i + pf_dist]);
+        tot += (uint64_t)simd_map64_delete(&m, w->pool[i]);
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->pool_size / elapsed / 1e6;
 }
 
 __attribute__((noinline))
 static double run_del_lf25(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint64_t i = 0; i < w->pool_size; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
     for (uint64_t i = w->pool_size - 1; i > 0; i--) {
         uint64_t j = xoshiro256ss() % (i + 1);
         uint64_t tmp = w->pool[i]; w->pool[i] = w->pool[j]; w->pool[j] = tmp;
@@ -316,19 +316,19 @@ static double run_del_lf25(struct workload *w) {
         if (__builtin_expect((i & 1023) == 0 && i > 0, 0))
             pf_dist = (m.count * 4 > m.cap) ? 12 : 4;
         if (i + pf_dist < w->pool_size)
-            avx_map64_prefetch2(&m, w->pool[i + pf_dist]);
-        tot += (uint64_t)avx_map64_delete(&m, w->pool[i]);
+            simd_map64_prefetch2(&m, w->pool[i + pf_dist]);
+        tot += (uint64_t)simd_map64_delete(&m, w->pool[i]);
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->pool_size / elapsed / 1e6;
 }
 
 __attribute__((noinline))
 static double run_del_fixed12(struct workload *w) {
-    struct avx_map64 m; avx_map64_init(&m);
+    struct simd_map64 m; simd_map64_init(&m);
     for (uint64_t i = 0; i < w->pool_size; i++)
-        avx_map64_insert(&m, w->pool[i]);
+        simd_map64_insert(&m, w->pool[i]);
     for (uint64_t i = w->pool_size - 1; i > 0; i--) {
         uint64_t j = xoshiro256ss() % (i + 1);
         uint64_t tmp = w->pool[i]; w->pool[i] = w->pool[j]; w->pool[j] = tmp;
@@ -337,11 +337,11 @@ static double run_del_fixed12(struct workload *w) {
     double t0 = now_sec();
     for (uint64_t i = 0; i < w->pool_size; i++) {
         if (i + 12 < w->pool_size)
-            avx_map64_prefetch2(&m, w->pool[i + 12]);
-        tot += (uint64_t)avx_map64_delete(&m, w->pool[i]);
+            simd_map64_prefetch2(&m, w->pool[i + 12]);
+        tot += (uint64_t)simd_map64_delete(&m, w->pool[i]);
     }
     double elapsed = now_sec() - t0;
-    avx_map64_destroy(&m);
+    simd_map64_destroy(&m);
     return (double)w->pool_size / elapsed / 1e6;
 }
 

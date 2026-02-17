@@ -46,13 +46,18 @@ $(TSC_DIR):
 $(TARGET): main.c perf_analysis.c perf_analysis.h git_cache.c git_cache.h hmap_avx512.c hmap_avx512.h | $(TS_DIR) $(TSC_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(INCLUDES) -o $@ $(SRCS)
 
-BENCH_CFLAGS  = -O3 -march=native -mavx512f -mavx512bw -std=gnu11
-BENCH_CXXFLAGS = -O3 -march=native -mavx512f -mavx512bw -std=gnu++17
+BENCH_CFLAGS  = -O3 -march=native -std=gnu11
+BENCH_CXXFLAGS = -O3 -march=native -std=gnu++17
 
-test_hashmap: test_hashmap_main.cpp test_hashmap.c avx_map64s.h avx_map64.h verstable.h
+test_hashmap: test_hashmap_main.cpp test_hashmap.c avx_map64s.h simd_map64.h verstable.h
 	$(CC) $(BENCH_CFLAGS) -c -o test_hashmap_bench.o test_hashmap.c
 	g++ $(BENCH_CXXFLAGS) -c -o test_hashmap_main.o test_hashmap_main.cpp
 	g++ $(BENCH_CXXFLAGS) -o $@ test_hashmap_main.o test_hashmap_bench.o -lm
+
+test_hashmap_512: test_hashmap_main.cpp test_hashmap.c avx_map64s.h simd_map64.h verstable.h
+	$(CC) $(BENCH_CFLAGS) -mavx512f -mavx512bw -c -o test_hashmap_bench.o test_hashmap.c
+	g++ $(BENCH_CXXFLAGS) -mavx512f -mavx512bw -c -o test_hashmap_main.o test_hashmap_main.cpp
+	g++ $(BENCH_CXXFLAGS) -mavx512f -mavx512bw -o $@ test_hashmap_main.o test_hashmap_bench.o -lm
 
 clean:
 	rm -f $(TARGET) test_hashmap test_hashmap_c.o test_hashmap_cpp.o
