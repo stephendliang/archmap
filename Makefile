@@ -59,8 +59,17 @@ test_hashmap_512: test_hashmap_main.cpp test_hashmap.c avx_map64s.h simd_map64.h
 	g++ $(BENCH_CXXFLAGS) -mavx512f -mavx512bw -c -o test_hashmap_main.o test_hashmap_main.cpp
 	g++ $(BENCH_CXXFLAGS) -mavx512f -mavx512bw -o $@ test_hashmap_main.o test_hashmap_bench.o -lm
 
+bench_512: bench_backend.c simd_map64.h
+	$(CC) $(BENCH_CFLAGS) -mavx512f -mavx512bw -o $@ bench_backend.c -lm
+
+bench_avx2: bench_backend.c simd_map64.h
+	$(CC) $(BENCH_CFLAGS) -mno-avx512f -mno-avx512bw -o $@ bench_backend.c -lm
+
+bench_compare: bench_512 bench_avx2
+	@echo "=== AVX-512 ===" && ./bench_512 && echo && echo "=== AVX2 ===" && ./bench_avx2
+
 clean:
-	rm -f $(TARGET) test_hashmap test_hashmap_c.o test_hashmap_cpp.o
+	rm -f $(TARGET) test_hashmap test_hashmap_c.o test_hashmap_cpp.o bench_512 bench_avx2
 
 vendor-clean:
 	rm -rf vendor
