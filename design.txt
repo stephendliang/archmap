@@ -1,230 +1,218 @@
-archmap — extracts a structural skeleton from C/C++ source trees using tree-sitter.
+archmap internals
+=================
 
-Usage
-    archmap [options] <path> [path ...]
+See functionality.txt for user-facing usage, CLI options, and output format.
 
-    -d, --deps           Follow #include dependencies (BFS) beyond the given paths
-    -D, --define MACRO   Define macro for preprocessor branch selection
-    -I, --include-dir DIR  Add dir to the include search path
-    -c, --calls          Show call graph edges under functions
-    -S, --strip MACRO    Strip project-specific qualifier macro from output
-    -h, --help           Print usage and exit
+================================================================================
+Skeleton parsing (main.c — 1584 lines)
+================================================================================
 
-Output format
-    Flat sections per file, one declaration per line:
-
-        --- event.c
-        [struct]
-        conn_state { u8 closing : 1; u8 recv_active : 1; u8 reserved : 6; };  //:135-139
-        server_ctx { buf_ring br; sig_atomic_t running; int listen_fd; ... };  //:251-265
-        [type]
-        enum op_type { OP_ACCEPT = 0, OP_RECV = 1, OP_SEND = 2, ... };  //:56-63
-        [def]
-        CACHE_ALIGN __attribute__((aligned(64)))  //:74-75
-        decode_fd(ud)  //:152-153
-        [data]
-        io_uring_sqe SQE_TEMPLATE_ACCEPT = { ... };  //:77-83
-        conn_state g_conns[MAX_CONNECTIONS];  //:141
-        [functions]
-        void event_loop(server_ctx *ctx);  //:496-600
-        int server_run(u16 port, int cpu);  //:602-718
-
-    Sections (in order, omitted if empty):
-      [struct]     struct and union definitions (struct/union keyword stripped)
-      [type]       typedefs, named enums (enum foo { ... })
-      [def]        anonymous enums, #define (value macros keep value,
-                   function-like macros show name+params only, body dropped)
-      [data]       global/static variables
-      [functions]  function definitions (signature only) and function prototypes
-
-    Rules:
-      - File delimiter: --- path/file.c
-      - Line numbers: //:N or //:N-M appended to every line
-      - Every declaration is collapsed to exactly one line
-      - Paths are relative to the common prefix of all processed files
-      - Files are topologically sorted by include dependencies
-      - System #include <...> lines are omitted
-      - struct/union keywords stripped from all non-def sections
-      - Storage-class specifiers (static, extern, inline), const, volatile,
-        _Noreturn, and __attribute__((...)) stripped from declarations
-      - Bare forward declarations (struct X;) suppressed when a full
-        definition exists anywhere in the processed files
-      - Incomplete declarations (no trailing semicolon in source) are
-        skipped — handles macro-split fragments like CACHE_ALIGN on its
-        own line before a declaration
-      - Function prototypes (declarations with function_declarator) are
-        routed to [functions], not [data]
-      - Call edges (opt-in with -c) shown as -> callee1, callee2, ...
-        under each function
-      - Large initializers truncated to { ... }
-      - String literal initializers truncated to "..."
-
-How it works
-    A single tree-sitter query matches eight top-level node types:
+Tree-sitter query
+    A single query matches eight top-level node types:
         function_definition  struct_specifier  enum_specifier  type_definition
         declaration          preproc_def       preproc_function_def  preproc_include
 
     Each file is parsed exactly once (collect_file). The match loop applies
-    three filters, and also caches resolved #include paths on file_entry:
+    three filters and caches resolved #include paths on file_entry:
       1. Dedup: skip struct_specifier/enum_specifier whose parent is
          type_definition or declaration (already captured by that parent).
       2. Scope: keep only file-scope nodes (ancestor walk hits
          translation_unit before any function_definition/compound_statement).
-      3. Preproc: if -D is set, skip nodes inside dead #ifdef/#if branches.
+      3. Preproc: skip nodes inside dead #ifdef/#if branches.
 
-    After filtering, each captured node is classified into a section:
-      - section_for_capture() routes by capture index and node structure
-      - has_function_declarator() recursively checks through pointer_declarator
-        and parenthesized_declarator wrappers to detect function prototypes
-      - CAP_GLOBAL_VAR nodes with function_declarator go to SEC_FUNCTIONS
-      - Anonymous enums go to SEC_DEF; named enums go to SEC_TYPE
-
-    Skeleton text generation (skeleton_text):
-      - Function definitions: body (compound_statement) replaced with semicolon
-      - Global variables: large initializer_list replaced with { ... },
-        string_literal/concatenated_string replaced with "..."
-      - Struct/union/enum: bodies preserved but collapsed to single line
-      - Sequential enums (no explicit values, or only first has value):
-        compact comma-separated format
-      - Preproc function macros: name and parameters only, body dropped
+Skeleton text generation
+    skeleton_text() replaces function bodies with semicolons, truncates
+    large initializers to { ... }, collapses struct/union/enum to single
+    lines. Sequential enums (no explicit values, or only first has value)
+    get compact comma-separated format.
 
     Postprocessing pipeline (postprocess_skeleton):
       strip_qualifiers -> strip_trailing_attribute -> strip_comments ->
       normalize_whitespace -> join_continuation_lines ->
       collapse_blank_lines -> collapse_to_single_line
 
-    Printing (print_tree):
-      - strip_struct_refs removes struct/union keywords from all non-def sections
-      - [def] section: leading #define stripped from preproc captures
-      - Forward declarations suppressed via tag_set lookup
+Preprocessor branch selection
+    should_skip_preproc walks ancestors upward:
+    - preproc_ifdef: eval_ifdef checks "name" field against -D defines
+    - preproc_if: eval_preproc_if handles defined/!defined/0/1
+    - preproc_elif/preproc_elifdef: same logic for elif chains
+    - Unknown macros treated as undefined: #ifdef X skips primary, emits
+      #else (correct for include guards without -D flags)
 
 Forward declaration deduplication
-    A verstable hash set (tag_set) tracks struct/enum/union tag names that
-    have full definitions (i.e., a body/field_declaration_list). When printing,
-    any bare forward declaration (struct X; with no body and no declarator)
-    whose tag is in the set is suppressed.
-
-    Detection: register_full_tags recursively walks each captured node for
-    struct_specifier/union_specifier/enum_specifier with a body field, and
-    inserts the tag name. is_bare_forward_decl checks if a node is a bare
-    forward declaration by looking for the absence of a body and declarator.
+    SAHA hash set (g_tags) tracks struct/enum/union tag names with full
+    definitions (body/field_declaration_list). register_full_tags recursively
+    walks each captured node. is_bare_forward_decl checks for absence of
+    body and declarator. Bare forward declarations whose tag is in the set
+    are suppressed at print time.
 
 Call graph extraction
-    When -c is active, each function_definition's compound_statement is
-    walked recursively to find call_expression nodes. The function child's
-    identifier text is extracted and deduplicated into a callees array on
-    the symbol. Macro invocations that tree-sitter parses as call_expression
-    (function-like macros) are also captured.
+    When -c is active, collect_callees recursively walks each
+    function_definition's compound_statement for call_expression nodes.
+    Callees deduplicated per function via add_callee.
 
-Functions (source order)
-    read_file_source          Read file into malloc'd buffer
-    should_skip_fts_entry     Check fts entry against skip rules (dotfiles, build dirs)
-    is_source_file            Check extension (.c .h .cpp .hpp .cc)
-    has_function_declarator   Recursively check if a declarator node contains a
-                              function_declarator (through pointer/parenthesized wrappers)
-    section_for_capture       Map capture index + node structure to output section
-    strip_qualifiers          Remove leading storage-class/inline/const/volatile/
-                              attribute/custom macros
-    strip_struct_refs         Remove struct/union keywords from type references
-    strip_trailing_attribute  Remove trailing __attribute__((...)) after } or )
-    strip_comments            In-place removal of // and /* */ comments, preserving
-                              string literals
-    normalize_whitespace      Trim trailing whitespace per line; collapse interior
-                              space runs
-    join_continuation_lines   Join incomplete declaration lines split by qualifier
-                              stripping
-    collapse_blank_lines      Collapse runs of 2+ consecutive newlines to single newline
-    collapse_to_single_line   Flatten multi-line text to single line, collapsing
-                              whitespace around newlines
-    postprocess_skeleton      Chain all text transforms on skeleton text
-    fprint_node_text          Write source range to FILE*, optionally append semicolon
-    is_simple_sequential_enum Return true if enum members are sequential (at most
-                              first has explicit = value)
-    fprint_compact_enum       Print enum as one-line comma-separated list; works for
-                              both standalone and typedef-wrapped enums
-    skeleton_text             Generate skeleton text into malloc'd string via open_memstream
-    is_macro_defined          Linear search of -D defines list
-    eval_ifdef                Evaluate preproc_ifdef node (#ifdef/#ifndef) -> 1/0/-1
-    eval_preproc_if           Evaluate preproc_if node (#if defined/!defined/0/1) -> 1/0/-1
-    should_skip_preproc       Ancestor walk to detect dead preprocessor branches
-    is_file_scope             Ancestor walk; true when translation_unit reached first
-    resolve_include           Try file_dir then -I paths; return realpath or NULL
-    extract_tag_name_src      Extract struct/enum/union tag name from node with source text
-    has_body                  Check if a node has a body field
-    register_full_tags        Recursively find and register full struct/enum/union definitions
-    is_bare_forward_decl      Detect bare forward declarations (struct X;)
-    collect_callees           Recursively walk function body for call_expression nodes
-    collect_file              Parse, query, filter, buffer symbols + cache includes
-    add_file                  Append a new file_entry to the global array
-    add_symbol                Append a new symbol to a file_entry
-    add_callee                Append a callee to a symbol (with dedup)
-    visited_add               Deduplicated insert into visited path set
-    compute_common_prefix     Compute longest common directory prefix of all file paths
-    topo_sort_files           Topological sort by cached include dependencies
-    is_suppressed_fwd         Check if a forward decl should be suppressed (tag has full def)
-    print_tree                Sort files, suppress forward decls, emit sectioned format
-    cleanup                   Free all allocated memory
-    main                      Argument parsing, parser/query setup, walk or BFS, print
-
-Preprocessor branch selection
-    Always active. should_skip_preproc walks from the matched node upward
-    through its ancestors:
-      - preproc_else: marks the node as being in an alternative branch.
-      - preproc_elif: evaluates the condition via eval_preproc_if (both
-        preproc_if and preproc_elif have a "condition" field). If the node
-        is below this elif (in a later elif or #else) and the condition is
-        true, an earlier branch wins so the node is skipped. If the node
-        is in this elif's own body and the condition is false/unknown, the
-        branch is dead and the node is skipped.
-      - preproc_elifdef: same logic as preproc_elif but uses eval_ifdef
-        (both preproc_ifdef and preproc_elifdef have a "name" field, and
-        the "ifndef" substring check works for "#elifndef" too).
-      - preproc_ifdef: eval_ifdef checks the "name" field against the
-        defines list, distinguishing #ifdef from #ifndef by scanning the
-        source text for "ifndef".
-      - preproc_if: eval_preproc_if inspects the "condition" child.
-        Handles preproc_defined, unary_expression (! operator), and
-        number_literal (0/1). Returns -1 (unknown) for anything else.
-      - A node is skipped when: condition is true but node is in the
-        alternative branch, or condition is not provably true (false or
-        unknown) and node is in the primary branch. This "unknown = false"
-        rule ensures exactly one branch is emitted per conditional.
-    Without -D flags, all macros are treated as undefined: #ifdef X skips
-    the primary block and emits the #else; #ifndef X emits the primary
-    (correct for include guards).
+Sidecar discovery
+    Searches for .archmap starting from the common prefix directory of all
+    processed files, then walks upward to /. Glob matching uses relative
+    paths (after common prefix stripping).
 
 Directory walking
-    Uses fts(3) with FTS_PHYSICAL | FTS_NOCHDIR.
-    Skip rules: dotfiles/dotdirs, and below root level: build, vendor,
-    node_modules, third_party.
+    fts(3) with FTS_PHYSICAL | FTS_NOCHDIR. Skip rules: dotfiles/dotdirs,
+    and below root: build, vendor, node_modules, third_party.
 
-    Default mode: walk all given paths, collect each source file once,
-    then print the tree.
+    BFS mode (-d): seed visited set from fts walk, then iterate: collect_file
+    caches resolved includes on file_entry. BFS loop reads cached includes,
+    appends newly-seen realpath entries. Each file parsed exactly once.
 
-    BFS dependency mode (-d): seed a visited set from the fts walk, then
-    iterate: collect_file buffers the skeleton and caches resolved include
-    paths on file_entry. The BFS loop reads cached includes and appends
-    newly-seen realpath entries to the queue. Each file is parsed exactly
-    once. Tree is printed after all files are collected.
+================================================================================
+Git caching (git_cache.c — 510 lines)
+================================================================================
 
-Macro stripping (-S)
-    strip_qualifiers removes leading storage-class specifiers (static, inline,
-    extern, const, volatile, _Noreturn), __attribute__((...)) blocks, and any
-    macros specified via -S from the start of declarations and function
-    signatures. strip_trailing_attribute removes __attribute__((...)) blocks
-    that appear after a closing } or ), e.g. } __attribute__((aligned(64)));
+Parse results keyed by git blob OID (SHA-1 of file contents). Identical
+files have identical OIDs — unchanged files skip re-parsing across runs.
 
-Dependencies
-    libtree-sitter, libtree-sitter-c — tree-sitter runtime and C grammar
-      Vendored in vendor/ as whole-program compilation (see build_scheme.txt)
-    verstable.h — single-header hash table library (header-only, in-tree)
-      Source: https://github.com/JacksonAllan/Verstable
+Binary format: magic "AMAP", version 1, 32-byte header. FNV-1a hash of
+options string invalidates cache when CLI flags change.
 
-Build
-    make            # fetches vendor sources on first run, whole-program build
-    make clean      # remove binary
-    make vendor-clean  # remove vendor/ (re-fetched on next build)
+Deep-copy serialization: all strings and nested structures (symbols,
+includes, callees) are strdup'd into cache_entry to avoid dangling
+pointers from temporary parse state.
 
-    Single-invocation build: main.c + tree-sitter lib.c + tree-sitter-c
-    parser.c compiled together with -fwhole-program for cross-module
-    inlining. See build_scheme.txt for full flag rationale.
+================================================================================
+Perf pipeline (perf_analysis.c — 4287 lines)
+================================================================================
+
+Pipeline: build -> profile (direct perf_event_open + libdwfl + capstone) ->
+skeleton cross-reference -> compact report
+
+Single execution per profile: counters, sampling, and topdown all run
+simultaneously on the same fork+exec child via perf_event_open(). No
+external perf binary needed.
+
+Symbol resolution: libdwfl resolves sample IPs to function names and
+source locations. Capstone disassembles hot instruction addresses.
+
+Skeleton cross-reference: hot function names matched against tree-sitter
+skeleton (parsed via collect_file) to show signatures, call edges, callers.
+
+A/B comparison: profiles both binaries with --runs N (default 5), computes
+per-metric mean/stddev, Welch's t-test for statistical significance, then
+diffs every output section.
+
+Memory architecture
+    Arena bump allocator:
+        2 MiB hugepage-backed blocks (mmap MAP_HUGETLB with THP fallback).
+        All persistent profile data (function names, instruction text, source
+        paths, growing arrays) allocated from prof->arena. Single
+        arena_destroy() frees everything at cleanup.
+
+        arena_realloc: extends in-place when ptr is the most-recent bump
+        allocation (fast path for doubling arrays). Falls back to
+        alloc+memcpy; old block wasted but bounded by doubling strategy.
+
+        arena_save/arena_reset: watermark pattern for loop-scoped
+        temporaries (symres scratch, mca scratch). Avoids malloc/free
+        churn in hot loops.
+
+    String interning:
+        Wyhash-based intern table (prof->strings). All repeated strings
+        (function names, source paths) interned once. Linear probing,
+        80% load factor, arena-backed string storage. Separate calloc'd
+        slot array (needs zeroing for rehash).
+
+    Remaining malloc sites (~13): run_cmd() buffers with independent
+    lifetimes, join_argv() (called before arena exists), large temporaries
+    freed within function scope (buckets, ip_buckets, func_bytes),
+    intern table slots. All xmalloc/xcalloc/xrealloc abort on OOM.
+
+Struct packing:
+    symbol: is_fwd_decl/section/cap_idx as bitfields (56 -> 48 bytes)
+    perf_opts: mode/flag fields as bitfields (96 -> 72 bytes)
+    Struct field reordering to eliminate padding holes.
+
+================================================================================
+Hash table implementations
+================================================================================
+
+SAHA (hmap_avx512.h/c — 92+579 lines)
+    Used in main.c for g_tags (forward decl dedup).
+    SIMD-Accelerated Hash Array. 4-tier design by key length:
+      Tier 1: <=8B (inline u64)
+      Tier 2: <=16B (inline key16: u64 lo, hi)
+      Tier 3: <=24B (inline key24: u64 a, b, c)
+      Tier 4: >24B (arena-backed: hash+offset+length triplet)
+    64-slot SIMD groups, wyhash, 7-bit h2 metadata (h2 | 0x80 sentinel),
+    87.5% load factor. AVX-512 _mm512_cmpeq_epi8_mask for group probing.
+
+avx_map64.h (239 lines) — uint64_t hash set, test/bench only
+    Zero-metadata direct-key design. 8-wide groups (one cache line).
+    vpcmpeqq compares all 8 keys at once — zero false positives, no
+    metadata bytes. Key=0 empty sentinel. CRC32 hash. Backshift deletion
+    (no tombstones). Unified op function for mixed workloads (eliminates
+    3-way switch dispatch misprediction). Token-compacted (2636 tokens).
+
+avx_map64s.h (206 lines) — uint64_t hash set with 16-bit h2 + sentinel
+    31 data slots + 1 overflow sentinel per group. 15-bit h2 gives
+    1/32768 false positive rate (256x better than 7-bit). Sentinel
+    eliminates SIMD empty check on contains hot path. Interleaved layout:
+    64B metadata + 256B keys per group.
+
+avx_map128s.h (343 lines) — 128-bit key hash set with sentinel
+    Same sentinel architecture as avx_map64s but for 128-bit keys.
+    320B interleaved groups. Chained CRC32 hash (two 32-bit halves).
+    Prefetch pipelining: 1.9-5.4x speedup, 112M ops/sec.
+
+avx_phf64.h (179 lines) — perfect hash function for uint64_t
+    Fixed-size, no insertion/deletion after construction.
+
+verstable.h (2069 lines) — vendored generic hash table
+    Template-based C hash table. Tombstone-free deletions via cyclic
+    shift. Used as comparison baseline in benchmarks.
+
+Intern table (perf_analysis.c lines 149-278) — string dedup
+    Wyhash with linear probing. Separate calloc'd slot array,
+    arena-backed string storage. 80% load factor.
+
+================================================================================
+Source file map
+================================================================================
+
+Core:
+    main.c              1584 lines  Skeleton CLI, tree-sitter parsing, caching
+    perf_analysis.c     4287 lines  Perf pipeline, arena, interning, reporting
+    git_cache.c          510 lines  Incremental git blob OID cache
+    hmap_avx512.c        579 lines  SAHA implementation
+
+Headers:
+    perf_analysis.h      161 lines  Shared structs (symbol, file_entry, perf types)
+    git_cache.h           34 lines  Cache API (open/lookup/store/close)
+    hmap_avx512.h         92 lines  SAHA API, tier dispatch macros
+
+Hash table headers (standalone, test/bench use):
+    avx_map64.h          239 lines  uint64_t direct-key hash set
+    avx_map64s.h         206 lines  uint64_t sentinel hash set
+    avx_map128s.h        343 lines  128-bit sentinel hash set
+    avx_phf64.h          179 lines  Perfect hash function
+    verstable.h         2069 lines  Generic hash table (vendored)
+
+Total: ~10,283 lines (excluding vendor/, tests, benches)
+
+================================================================================
+Build system
+================================================================================
+
+Single-invocation whole-program compilation: main.c + perf_analysis.c +
+git_cache.c + hmap_avx512.c + tree-sitter lib.c + tree-sitter-c parser.c
+compiled together. -fwhole-program makes every symbol except main()
+internal, enabling cross-module inlining and dead code elimination across
+tree-sitter internals.
+
+Compiler flags: -O3 -march=native -flto -fomit-frame-pointer
+    -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector
+    -fipa-pta -fmerge-all-constants -DNDEBUG -mavx512f -mavx512bw
+    -Wall -Wextra -std=gnu11
+
+Vendored sources: tree-sitter v0.26.5 (runtime), tree-sitter-c v0.24.1
+(grammar). Fetched on first build via curl from GitHub release tarballs.
+
+System libraries: libgit2, libdw, libelf, capstone, libpfm4, libm

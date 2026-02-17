@@ -1,0 +1,173 @@
+archmap — semantic C/C++ skeleton extractor + performance profiler
+
+Two modes: (1) structural skeleton generation via tree-sitter parsing,
+(2) hardware performance analysis via perf_event_open + symbol cross-reference.
+
+================================================================================
+Skeleton mode (default)
+================================================================================
+
+Usage
+    archmap [options] <path> [path ...]
+
+    -d, --deps           Follow #include dependencies (BFS) beyond the given paths
+    -D, --define MACRO   Define macro for preprocessor branch selection
+    -I, --include-dir DIR  Add dir to the include search path
+    -c, --calls          Show call graph edges under functions
+    -S, --strip MACRO    Strip project-specific qualifier macro from output
+    --expand GLOB        Force-expand collapsed files
+    --collapse GLOB      Collapse files (hide skeleton, show summary only)
+    -h, --help           Print usage and exit
+
+Output format
+    Flat sections per file, one declaration per line:
+
+        --- event.c
+        [struct]
+        conn_state { u8 closing : 1; u8 recv_active : 1; u8 reserved : 6; };  //:135-139
+        server_ctx { buf_ring br; sig_atomic_t running; int listen_fd; ... };  //:251-265
+        [type]
+        enum op_type { OP_ACCEPT = 0, OP_RECV = 1, OP_SEND = 2, ... };  //:56-63
+        [def]
+        CACHE_ALIGN __attribute__((aligned(64)))  //:74-75
+        decode_fd(ud)  //:152-153
+        [data]
+        io_uring_sqe SQE_TEMPLATE_ACCEPT = { ... };  //:77-83
+        conn_state g_conns[MAX_CONNECTIONS];  //:141
+        [functions]
+        void event_loop(server_ctx *ctx);  //:496-600
+        int server_run(u16 port, int cpu);  //:602-718
+
+    Sections (in order, omitted if empty):
+      [struct]     struct and union definitions (struct/union keyword stripped)
+      [type]       typedefs, named enums (enum foo { ... })
+      [def]        anonymous enums, #define (value macros keep value,
+                   function-like macros show name+params only, body dropped)
+      [data]       global/static variables
+      [functions]  function definitions (signature only) and function prototypes
+
+    Rules:
+      - File delimiter: --- path/file.c
+      - Line numbers: //:N or //:N-M appended to every line
+      - Every declaration is collapsed to exactly one line
+      - Paths are relative to the common prefix of all processed files
+      - Files are topologically sorted by include dependencies
+      - System #include <...> lines are omitted
+      - struct/union keywords stripped from all non-def sections
+      - Storage-class specifiers (static, extern, inline), const, volatile,
+        _Noreturn, and __attribute__((...)) stripped from declarations
+      - Bare forward declarations (struct X;) suppressed when a full
+        definition exists anywhere in the processed files
+      - Incomplete declarations (no trailing semicolon in source) are
+        skipped — handles macro-split fragments
+      - Function prototypes routed to [functions], not [data]
+      - Call edges (opt-in with -c) shown as -> callee1, callee2, ...
+      - Large initializers truncated to { ... }
+      - String literal initializers truncated to "..."
+
+Sidecar (.archmap) files
+    Per-file summaries and collapse hints. Placed in the project root.
+    Format: "summary <glob> <text>" and "collapse <glob>".
+
+    When a file is collapsed, only the summary line is emitted — no sections.
+    CLI flags (--expand, --collapse) override sidecar directives.
+
+    Sidecar discovery walks upward from the common prefix directory to /.
+
+    See sidecar.txt for full specification.
+
+Directory walking
+    Uses fts(3). Skip rules: dotfiles/dotdirs, and below root: build,
+    vendor, node_modules, third_party.
+
+    BFS mode (-d): seed visited set from fts walk, then BFS through
+    #include dependencies. Each file parsed exactly once.
+
+Git-based incremental caching
+    Parse results keyed by git blob OID. Unchanged files skip re-parsing
+    across runs. Cache invalidated when CLI options change.
+
+================================================================================
+Perf mode (archmap perf)
+================================================================================
+
+Usage
+    archmap perf [options] -- <command> [args...]
+
+    -n, --top N          Top N hot functions (default 10)
+    -i, --insns N        Hot instructions per function (default 10)
+    -b, --build-cmd CMD  Build command (default "make")
+    --no-build           Skip build
+    --uprof / --no-uprof           Force/skip AMDuProf per-function IPC
+    --topdown / --no-topdown       Force/skip TMA top-down analysis
+    --mca / --no-mca               Force/skip llvm-mca throughput analysis
+    --cache-misses / --no-cache-misses  Force/skip cache miss attribution
+    --pahole / --no-pahole         Force/skip struct layout analysis
+    --remarks / --no-remarks       Force/skip compiler optimization remarks
+    --vs BINARY                    A/B comparison: baseline binary (A)
+    --runs N                       Number of profiling runs (default: 1, A/B: 5)
+    -s, --source DIR     Source dir for skeleton xref (default ".")
+    -v, --verbose        Print tool commands
+
+Pipeline: build -> profile -> skeleton cross-reference -> compact report
+
+All counters, sampling, and topdown run simultaneously on a single fork+exec
+child via perf_event_open(). No external perf binary needed.
+
+Data collected:
+    - Hardware counters: cycles, instructions, cache refs/misses,
+      branches/branch-misses, wall time
+    - Derived metrics: IPC, cache miss %, branch miss %
+    - Topdown L1/L2: retiring, bad-spec, frontend-bound, backend-bound
+    - Per-function hot list with overhead %, call graph, caller chain
+    - Hot instructions with source interleaving (dwarf line info)
+    - AMDuProf per-function IPC, L1 DC miss %, branch mispredict rate
+    - Cache miss sites with data virtual address attribution
+    - Memory hotspots (cache-line granularity aggregation)
+    - llvm-mca throughput analysis per basic block
+    - Compiler optimization remarks (clang -fsave-optimization-record)
+    - Struct layout via pahole (size, holes, padding, cachelines)
+    - Multi-run statistics with Welch's t-test for A/B comparison
+
+Output sections:
+    --- hot functions ---
+    --- hot instructions ---
+    --- uprof (per-function) ---
+    --- cache misses ---
+    --- memory hotspots ---
+    --- throughput (llvm-mca) ---
+    --- compiler remarks ---
+    --- data layout ---
+
+A/B comparison mode (--vs):
+    Profiles both binaries, then diffs every section:
+    --- hot functions (A -> B) ---
+    --- cache miss hotspots A -> B ---
+    --- hot instructions A -> B ---
+    --- memory hotspots A -> B ---
+    --- throughput A -> B (llvm-mca) ---
+    --- topdown A -> B ---
+    --- remarks diff (A -> B) ---
+
+Skeleton cross-reference: hot function names are matched against the
+tree-sitter skeleton to show function signatures, call edges, callers.
+Source files resolved via the -s source directory.
+
+================================================================================
+Build
+================================================================================
+
+    make              Fetches vendor sources on first run, whole-program build
+    make clean        Remove binary
+    make vendor-clean Remove vendor/ (re-fetched on next build)
+
+Dependencies (system libraries):
+    libgit2        git blob OID lookup, cache keying
+    libdw + libelf dwarf line info, ELF symbol resolution
+    capstone       instruction disassembly
+    libpfm4        perf_event_open encoding for hardware events
+
+Dependencies (vendored):
+    tree-sitter    C parsing (v0.26.5 runtime + v0.24.1 grammar)
+
+Requires: AVX-512F + AVX-512BW (Skylake-X or newer, Zen 4+)
