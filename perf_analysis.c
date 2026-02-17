@@ -1024,8 +1024,7 @@ static int profile_child(struct perf_opts *opts,
                           struct raw_sample **cm_samples, int *n_cm,
                           uint64_t *out_load_base) {
     *has_topdown = 0;
-    *cycle_samples = NULL;
-    *n_cycle = 0;
+    if (cycle_samples) { *cycle_samples = NULL; *n_cycle = 0; }
     if (cm_samples) { *cm_samples = NULL; *n_cm = 0; }
     *out_load_base = 0;
 
@@ -1085,7 +1084,18 @@ static int profile_child(struct perf_opts *opts,
     int td_ok = topdown_open(child, &tg, opts->topdown_mode);
 
     struct sampling_ctx sctx;
-    int samp_ok = sampling_open(child, &sctx, cm_samples != NULL);
+    int samp_ok = -1;
+    if (cycle_samples) {
+        samp_ok = sampling_open(child, &sctx,
+                                cm_samples != NULL);
+    } else {
+        /* No sampling requested — init with safe sentinel values */
+        memset(&sctx, 0, sizeof(sctx));
+        sctx.cycles.fd = -1;
+        sctx.cycles.mmap_base = MAP_FAILED;
+        sctx.cache_misses.fd = -1;
+        sctx.cache_misses.mmap_base = MAP_FAILED;
+    }
 
     /* Unblock child → exec triggers enable_on_exec atomically */
     if (write(go_pipe[1], "x", 1) < 0) { /* ignore */ }
@@ -1124,9 +1134,9 @@ static int profile_child(struct perf_opts *opts,
     }
 
     /* Drain sampling ring buffers */
-    if (samp_ok == 0)
+    if (samp_ok == 0 && cycle_samples)
         sampling_drain(&sctx.cycles, cycle_samples, n_cycle);
-    if (cm_samples && sctx.cache_misses.fd >= 0)
+    if (cm_samples && samp_ok == 0 && sctx.cache_misses.fd >= 0)
         sampling_drain(&sctx.cache_misses, cm_samples, n_cm);
 
     /* Read topdown */
