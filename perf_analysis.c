@@ -377,17 +377,35 @@ static void cleanup_tmpdir(void) {
     g_tmpdir[0] = '\0';
 }
 
+/* ── OOM-aborting allocator wrappers ──────────────────────────────────── */
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p && n) { fprintf(stderr, "out of memory (malloc %zu)\n", n); abort(); }
+    return p;
+}
+static void *xcalloc(size_t count, size_t size) {
+    void *p = calloc(count, size);
+    if (!p && count && size) { fprintf(stderr, "out of memory (calloc %zu)\n", count * size); abort(); }
+    return p;
+}
+static void *xrealloc(void *ptr, size_t n) {
+    void *p = realloc(ptr, n);
+    if (!p && n) { fprintf(stderr, "out of memory (realloc %zu)\n", n); abort(); }
+    return p;
+}
+
 static char *run_cmd(const char *cmd, int *out_status, int verbose) {
     if (verbose) fprintf(stderr, "+ %s\n", cmd);
     FILE *fp = popen(cmd, "r");
     if (!fp) { if (out_status) *out_status = -1; return NULL; }
 
     size_t cap = 8192, len = 0;
-    char *buf = malloc(cap);
+    char *buf = xmalloc(cap);
     size_t n;
     while ((n = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
         len += n;
-        if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+        if (len + 1 >= cap) { cap *= 2; buf = xrealloc(buf, cap); }
     }
     buf[len] = '\0';
 
@@ -413,7 +431,7 @@ static char *join_argv(char **argv, int argc) {
     size_t total = 0;
     for (int i = 0; i < argc; i++)
         total += strlen(argv[i]) * 4 + 4;
-    char *cmd = malloc(total + 1);
+    char *cmd = xmalloc(total + 1);
     char *p = cmd;
     for (int i = 0; i < argc; i++) {
         if (i > 0) *p++ = ' ';
@@ -1223,7 +1241,7 @@ static int symres_func_range(struct sym_resolver *sr, const char *name,
             if (!d) return -1;
             uint64_t offset = best_sym.st_value - shdr.sh_addr;
             if (offset + best_sym.st_size > d->d_size) return -1;
-            *bytes = malloc(best_sym.st_size);
+            *bytes = xmalloc(best_sym.st_size);
             memcpy(*bytes, (uint8_t *)d->d_buf + offset, best_sym.st_size);
             return 0;
         }
@@ -1405,7 +1423,7 @@ static int process_samples(struct sym_resolver *sr,
     };
 
     int n_buckets = 0, cap_buckets = 256;
-    struct func_bucket *buckets = calloc((size_t)cap_buckets,
+    struct func_bucket *buckets = xcalloc((size_t)cap_buckets,
                                           sizeof(*buckets));
 
     for (int i = 0; i < n_cycle; i++) {
@@ -1428,7 +1446,7 @@ static int process_samples(struct sym_resolver *sr,
         } else {
             if (n_buckets >= cap_buckets) {
                 cap_buckets *= 2;
-                buckets = realloc(buckets,
+                buckets = xrealloc(buckets,
                     (size_t)cap_buckets * sizeof(*buckets));
             }
             struct func_bucket *b = &buckets[n_buckets++];
@@ -1451,7 +1469,7 @@ static int process_samples(struct sym_resolver *sr,
     /* Take top N functions (skip those below 0.5%) */
     int limit = n_buckets < opts->top_n ? n_buckets : opts->top_n;
     int n_total = n_cycle;
-    prof->funcs = malloc((size_t)limit * sizeof(*prof->funcs));
+    prof->funcs = xmalloc((size_t)limit * sizeof(*prof->funcs));
     prof->n_funcs = 0;
 
     for (int i = 0; i < limit; i++) {
@@ -1578,7 +1596,7 @@ static int process_samples(struct sym_resolver *sr,
     /* ── Pass 3: Hot instruction attribution (replaces run_perf_annotate) */
 
     int insn_cap = 64;
-    prof->insns = malloc((size_t)insn_cap * sizeof(*prof->insns));
+    prof->insns = xmalloc((size_t)insn_cap * sizeof(*prof->insns));
     prof->n_insns = 0;
 
     if (sr->cs_ok) {
@@ -1595,7 +1613,7 @@ static int process_samples(struct sym_resolver *sr,
             /* Bucket cycle samples by IP within this function */
             struct { uint64_t ip; int count; } *ip_buckets = NULL;
             int n_ip = 0, cap_ip = 64;
-            ip_buckets = calloc((size_t)cap_ip, sizeof(*ip_buckets));
+            ip_buckets = xcalloc((size_t)cap_ip, sizeof(*ip_buckets));
             int func_total = 0;
 
             for (int s = 0; s < n_cycle; s++) {
@@ -1614,7 +1632,7 @@ static int process_samples(struct sym_resolver *sr,
                     } else {
                         if (n_ip >= cap_ip) {
                             cap_ip *= 2;
-                            ip_buckets = realloc(ip_buckets,
+                            ip_buckets = xrealloc(ip_buckets,
                                 (size_t)cap_ip * sizeof(*ip_buckets));
                         }
                         ip_buckets[n_ip].ip = ip;
@@ -1668,7 +1686,7 @@ static int process_samples(struct sym_resolver *sr,
 
                 if (prof->n_insns >= insn_cap) {
                     insn_cap *= 2;
-                    prof->insns = realloc(prof->insns,
+                    prof->insns = xrealloc(prof->insns,
                         (size_t)insn_cap * sizeof(*prof->insns));
                 }
                 struct hot_insn *hi = &prof->insns[prof->n_insns++];
@@ -1691,7 +1709,7 @@ static int process_samples(struct sym_resolver *sr,
 
     if (cm_samples && n_cm > 0 && sr->cs_ok) {
         int cm_cap = 64;
-        prof->cm_sites = malloc((size_t)cm_cap * sizeof(*prof->cm_sites));
+        prof->cm_sites = xmalloc((size_t)cm_cap * sizeof(*prof->cm_sites));
         prof->n_cm_sites = 0;
 
         for (int f = 0; f < prof->n_funcs; f++) {
@@ -1707,7 +1725,7 @@ static int process_samples(struct sym_resolver *sr,
             /* Bucket cache-miss samples by IP, track most common data addr */
             struct { uint64_t ip; uint64_t top_addr; int count; } *ip_buckets = NULL;
             int n_ip = 0, cap_ip = 64;
-            ip_buckets = calloc((size_t)cap_ip, sizeof(*ip_buckets));
+            ip_buckets = xcalloc((size_t)cap_ip, sizeof(*ip_buckets));
 
             for (int s = 0; s < n_cm; s++) {
                 uint64_t ip = cm_samples[s].ip;
@@ -1727,7 +1745,7 @@ static int process_samples(struct sym_resolver *sr,
                     } else {
                         if (n_ip >= cap_ip) {
                             cap_ip *= 2;
-                            ip_buckets = realloc(ip_buckets,
+                            ip_buckets = xrealloc(ip_buckets,
                                 (size_t)cap_ip * sizeof(*ip_buckets));
                         }
                         ip_buckets[n_ip].ip = ip;
@@ -1782,7 +1800,7 @@ static int process_samples(struct sym_resolver *sr,
 
                 if (prof->n_cm_sites >= cm_cap) {
                     cm_cap *= 2;
-                    prof->cm_sites = realloc(prof->cm_sites,
+                    prof->cm_sites = xrealloc(prof->cm_sites,
                         (size_t)cm_cap * sizeof(*prof->cm_sites));
                 }
                 struct cache_miss_site *cm =
@@ -1819,7 +1837,7 @@ static int process_samples(struct sym_resolver *sr,
                 int count;
             };
             int n_mb = 0, cap_mb = 256;
-            struct mem_bucket *mbs = calloc((size_t)cap_mb, sizeof(*mbs));
+            struct mem_bucket *mbs = xcalloc((size_t)cap_mb, sizeof(*mbs));
 
             for (int i = 0; i < n_cm; i++) {
                 if (!cm_samples[i].addr) continue;
@@ -1844,7 +1862,7 @@ static int process_samples(struct sym_resolver *sr,
                 } else {
                     if (n_mb >= cap_mb) {
                         cap_mb *= 2;
-                        mbs = realloc(mbs, (size_t)cap_mb * sizeof(*mbs));
+                        mbs = xrealloc(mbs, (size_t)cap_mb * sizeof(*mbs));
                     }
                     snprintf(mbs[n_mb].func, sizeof(mbs[n_mb].func),
                              "%s", clean);
@@ -1871,7 +1889,7 @@ static int process_samples(struct sym_resolver *sr,
             /* Take top entries */
             int take = n_mb < opts->top_n * 2 ? n_mb : opts->top_n * 2;
             int mh_cap = take > 0 ? take : 1;
-            prof->mem_hotspots = malloc((size_t)mh_cap *
+            prof->mem_hotspots = xmalloc((size_t)mh_cap *
                                         sizeof(*prof->mem_hotspots));
             prof->n_mem_hotspots = 0;
 
@@ -2000,14 +2018,14 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
     if (!fp) return 0;
 
     int cap = 16;
-    prof->uprof_funcs = malloc((size_t)cap * sizeof(*prof->uprof_funcs));
+    prof->uprof_funcs = xmalloc((size_t)cap * sizeof(*prof->uprof_funcs));
     prof->n_uprof_funcs = 0;
 
     char line[4096];
     int in_funcs = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, "HOTTEST FUNCTIONS")) {
-            fgets(line, sizeof(line), fp);
+            if (!fgets(line, sizeof(line), fp)) break;
             in_funcs = 1;
             continue;
         }
@@ -2049,7 +2067,7 @@ static int run_uprof(struct perf_opts *opts, struct perf_profile *prof) {
 
         if (prof->n_uprof_funcs >= cap) {
             cap *= 2;
-            prof->uprof_funcs = realloc(prof->uprof_funcs,
+            prof->uprof_funcs = xrealloc(prof->uprof_funcs,
                 (size_t)cap * sizeof(*prof->uprof_funcs));
         }
         struct uprof_func *uf =
@@ -2080,7 +2098,7 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
     if (!sr->cs_ok) return 0;
 
     int cap = 16;
-    prof->mca_blocks = malloc((size_t)cap * sizeof(*prof->mca_blocks));
+    prof->mca_blocks = xmalloc((size_t)cap * sizeof(*prof->mca_blocks));
     prof->n_mca_blocks = 0;
 
     /* Check if -mcpu=native works */
@@ -2195,14 +2213,18 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
             char *nl = strchr(line, '\n');
             if (nl) *nl = '\0';
 
-            if (strstr(line, "Block RThroughput"))
-                sscanf(strstr(line, ":") + 1, " %lf", &rthroughput);
-            else if (strstr(line, "Total uOps"))
-                sscanf(strstr(line, ":") + 1, " %d", &uops);
-            else if (strstr(line, "IPC") && !strstr(line, "Block"))
-                sscanf(strstr(line, ":") + 1, " %lf", &ipc);
+            char *colon;
+            if (strstr(line, "Block RThroughput") &&
+                    (colon = strchr(line, ':')))
+                sscanf(colon + 1, " %lf", &rthroughput);
+            else if (strstr(line, "Total uOps") &&
+                    (colon = strchr(line, ':')))
+                sscanf(colon + 1, " %d", &uops);
+            else if (strstr(line, "IPC") && !strstr(line, "Block") &&
+                    (colon = strchr(line, ':')))
+                sscanf(colon + 1, " %lf", &ipc);
             else if (strstr(line, "Bottleneck")) {
-                char *p = strstr(line, ":");
+                char *p = strchr(line, ':');
                 if (p) {
                     p++;
                     while (*p == ' ') p++;
@@ -2222,7 +2244,7 @@ static int run_mca(struct sym_resolver *sr, struct perf_opts *opts,
         if (rthroughput > 0 || uops > 0) {
             if (prof->n_mca_blocks >= cap) {
                 cap *= 2;
-                prof->mca_blocks = realloc(prof->mca_blocks,
+                prof->mca_blocks = xrealloc(prof->mca_blocks,
                     (size_t)cap * sizeof(*prof->mca_blocks));
             }
             struct mca_block *mb =
@@ -2261,7 +2283,7 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
     }
 
     int cap = 16;
-    prof->layouts = malloc((size_t)cap * sizeof(*prof->layouts));
+    prof->layouts = xmalloc((size_t)cap * sizeof(*prof->layouts));
     prof->n_layouts = 0;
 
     /* Skip known primitive types when probing pahole */
@@ -2376,7 +2398,7 @@ static int run_pahole(struct perf_opts *opts, struct perf_profile *prof,
 
             if (prof->n_layouts >= cap) {
                 cap *= 2;
-                prof->layouts = realloc(prof->layouts,
+                prof->layouts = xrealloc(prof->layouts,
                     (size_t)cap * sizeof(*prof->layouts));
             }
             struct struct_layout *sl =
@@ -2587,7 +2609,7 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
     if (n_src == 0) return 0;
 
     int cap = 64;
-    prof->remarks = malloc((size_t)cap * sizeof(*prof->remarks));
+    prof->remarks = xmalloc((size_t)cap * sizeof(*prof->remarks));
     prof->n_remarks = 0;
 
     /* Try to read compile_commands.json */
@@ -2602,9 +2624,9 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
             long flen = ftell(fp);
             fseek(fp, 0, SEEK_SET);
             if (flen > 0 && flen < 10*1024*1024) {
-                ccjson = malloc((size_t)flen + 1);
-                fread(ccjson, 1, (size_t)flen, fp);
-                ccjson[flen] = '\0';
+                ccjson = xmalloc((size_t)flen + 1);
+                size_t nread = fread(ccjson, 1, (size_t)flen, fp);
+                ccjson[nread] = '\0';
             }
             fclose(fp);
         }
@@ -2760,7 +2782,7 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
 
                     if (prof->n_remarks >= cap) {
                         cap *= 2;
-                        prof->remarks = realloc(prof->remarks,
+                        prof->remarks = xrealloc(prof->remarks,
                             (size_t)cap * sizeof(*prof->remarks));
                     }
                     struct remark_entry *re =
@@ -2807,11 +2829,11 @@ static int run_remarks(struct perf_opts *opts, struct perf_profile *prof) {
    into src). *n_lines is set to the highest valid line number. */
 static char **index_source_lines(const char *src, long len, int *n_lines) {
     int cap = 256, n = 0;
-    char **lines = calloc((size_t)cap, sizeof(char *));
+    char **lines = xcalloc((size_t)cap, sizeof(char *));
     const char *p = src, *end = src + len;
     while (p < end) {
         n++;
-        if (n >= cap) { cap *= 2; lines = realloc(lines, (size_t)cap * sizeof(char *)); }
+        if (n >= cap) { cap *= 2; lines = xrealloc(lines, (size_t)cap * sizeof(char *)); }
         lines[n] = (char *)p;
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         p = nl ? nl + 1 : end;
@@ -3364,12 +3386,12 @@ static int run_pipeline(struct perf_opts *opts, struct perf_profile *prof) {
     prof->n_runs = n_runs;
 
     /* Allocate per-run stat arrays */
-    prof->rs_cycles.values         = malloc((size_t)n_runs * sizeof(double));
-    prof->rs_insns.values          = malloc((size_t)n_runs * sizeof(double));
-    prof->rs_ipc.values            = malloc((size_t)n_runs * sizeof(double));
-    prof->rs_wall.values           = malloc((size_t)n_runs * sizeof(double));
-    prof->rs_cache_miss_pct.values = malloc((size_t)n_runs * sizeof(double));
-    prof->rs_branch_miss_pct.values= malloc((size_t)n_runs * sizeof(double));
+    prof->rs_cycles.values         = xmalloc((size_t)n_runs * sizeof(double));
+    prof->rs_insns.values          = xmalloc((size_t)n_runs * sizeof(double));
+    prof->rs_ipc.values            = xmalloc((size_t)n_runs * sizeof(double));
+    prof->rs_wall.values           = xmalloc((size_t)n_runs * sizeof(double));
+    prof->rs_cache_miss_pct.values = xmalloc((size_t)n_runs * sizeof(double));
+    prof->rs_branch_miss_pct.values= xmalloc((size_t)n_runs * sizeof(double));
 
     int want_cm = (opts->cachemiss_mode >= 0);
 
@@ -3997,7 +4019,7 @@ static void print_comparison(struct perf_opts *opts,
     /* Remarks diff */
     if (prof_a->n_remarks > 0 || prof_b->n_remarks > 0) {
         printf("--- remarks diff (A -> B) ---\n");
-        int *b_matched = calloc((size_t)prof_b->n_remarks, sizeof(int));
+        int *b_matched = xcalloc((size_t)prof_b->n_remarks, sizeof(int));
         int any_diff = 0;
         const char *cur_func = NULL;
 
@@ -4154,7 +4176,7 @@ int perf_main(int argc, char *argv[]) {
             goto fail;
         }
 
-        char **a_argv = malloc((size_t)opts.cmd_argc * sizeof(char *));
+        char **a_argv = xmalloc((size_t)opts.cmd_argc * sizeof(char *));
         a_argv[0] = a_binary;
         for (int i = 1; i < opts.cmd_argc; i++)
             a_argv[i] = opts.cmd_argv[i];

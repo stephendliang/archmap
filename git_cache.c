@@ -216,40 +216,41 @@ static int deserialize_entry(FILE *f, struct cache_entry *ce) {
     uint16_t path_len;
     if (!read_u16(f, &path_len)) return -1;
     ce->abs_path = malloc(path_len + 1);
-    if (fread(ce->abs_path, 1, path_len, f) != path_len) {
-        free(ce->abs_path);
-        return -1;
-    }
+    if (!ce->abs_path ||
+        fread(ce->abs_path, 1, path_len, f) != path_len)
+        goto fail;
     ce->abs_path[path_len] = '\0';
 
     uint16_t n_syms, n_includes, n_tags;
     if (!read_u16(f, &n_syms) || !read_u16(f, &n_includes) ||
         !read_u16(f, &n_tags))
-        return -1;
+        goto fail;
 
     ce->fe.n_syms = n_syms;
     ce->fe.cap_syms = n_syms;
     ce->fe.abs_path = strdup(ce->abs_path);
     if (n_syms > 0) {
         ce->fe.syms = malloc((size_t)n_syms * sizeof(struct symbol));
+        if (!ce->fe.syms) goto fail;
         for (int i = 0; i < n_syms; i++) {
             struct symbol *s = &ce->fe.syms[i];
             memset(s, 0, sizeof(*s));
             s->text = read_str32(f);
             uint16_t nc, ci;
-            if (!read_u16(f, &nc) || !read_u16(f, &ci)) return -1;
+            if (!read_u16(f, &nc) || !read_u16(f, &ci)) goto fail;
             s->n_callees = nc;
             s->cap_callees = nc;
             s->cap_idx = ci;
             if (!read_u32(f, &s->start_line) || !read_u32(f, &s->end_line))
-                return -1;
+                goto fail;
             uint8_t sec, fwd;
-            if (!read_u8(f, &sec) || !read_u8(f, &fwd)) return -1;
+            if (!read_u8(f, &sec) || !read_u8(f, &fwd)) goto fail;
             s->section = (int)(int8_t)sec;
             s->is_fwd_decl = fwd;
             s->tag_name = read_str(f);
             if (nc > 0) {
                 s->callees = malloc((size_t)nc * sizeof(char *));
+                if (!s->callees) goto fail;
                 for (int k = 0; k < nc; k++)
                     s->callees[k] = read_str(f);
             }
@@ -259,6 +260,7 @@ static int deserialize_entry(FILE *f, struct cache_entry *ce) {
     ce->fe.n_includes = n_includes;
     if (n_includes > 0) {
         ce->fe.includes = malloc((size_t)n_includes * sizeof(char *));
+        if (!ce->fe.includes) goto fail;
         for (int i = 0; i < n_includes; i++)
             ce->fe.includes[i] = read_str(f);
     }
@@ -266,11 +268,17 @@ static int deserialize_entry(FILE *f, struct cache_entry *ce) {
     ce->n_tags = n_tags;
     if (n_tags > 0) {
         ce->tag_names = malloc((size_t)n_tags * sizeof(char *));
+        if (!ce->tag_names) goto fail;
         for (int i = 0; i < n_tags; i++)
             ce->tag_names[i] = read_str(f);
     }
 
     return 0;
+
+fail:
+    free_cache_entry_contents(ce);
+    memset(ce, 0, sizeof(*ce));
+    return -1;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────── */
