@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Walk up from cwd to find .archmap.files (written by archmap)
+find_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/.archmap.files" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+root="$(find_root)" || {
+    echo "error: no .archmap.files found (run archmap first)" >&2
+    exit 1
+}
+
+command -v claude >/dev/null 2>&1 || {
+    echo "error: claude not found in PATH" >&2
+    exit 1
+}
+
+files_list="$root/.archmap.files"
+sidecar="$root/.archmap"
+
+# Read all files from the latest archmap run
+mapfile -t all_files < "$files_list"
+
+# Collect files already covered by a summary glob in .archmap
+declare -A seen
+if [[ -f "$sidecar" ]]; then
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" == summary\ * ]]; then
+            rest="${line#summary }"
+            rest="${rest#"${rest%%[![:space:]]*}"}"
+            glob="${rest%%[[:space:]]*}"
+            for f in "${all_files[@]}"; do
+                # shellcheck disable=SC2053
+                if [[ "$f" == $glob ]]; then
+                    seen["$f"]=1
+                fi
+            done
+        fi
+    done < "$sidecar"
+fi
+
+# Diff: files without summaries
+unseen=()
+for f in "${all_files[@]}"; do
+    if [[ -z "${seen[$f]:-}" ]]; then
+        unseen+=("$f")
+    fi
+done
+
+if [[ ${#unseen[@]} -eq 0 ]]; then
+    echo "All files have summaries."
+    exit 0
+fi
+
+echo "Unseen files (${#unseen[@]}):"
+printf '  %s\n' "${unseen[@]}"
+echo ""
+
+# Build absolute paths and run archmap on just the unseen files
+abs_unseen=()
+for f in "${unseen[@]}"; do
+    abs_unseen+=("$root/$f")
+done
+
+skeleton="$(archmap "${abs_unseen[@]}")"
+
+# Ask claude to generate summary directives
+prompt="Below is the archmap skeleton output for source files that lack summaries.
+
+For each file (each --- header), write a single summary directive.
+Format: summary <filename>  <short description of the file's role, under 80 chars>
+
+If a file is boilerplate, vendored, or platform-specific scaffolding that an LLM
+already knows well, also add:
+collapse <filename>
+
+Output ONLY the raw directives, one per line. No markdown fences, no commentary.
+
+Skeleton output:
+$skeleton"
+
+echo "Asking claude to summarize..."
+raw="$(echo "$prompt" | env -u CLAUDECODE claude -p)"
+
+# Strip markdown fences if claude wrapped the output
+result="$(echo "$raw" | grep -v '^```')"
+
+# Append to .archmap
+{
+    echo ""
+    echo "# Auto-generated $(date +%Y-%m-%d)"
+    echo "$result"
+} >> "$sidecar"
+
+echo "Appended to $sidecar:"
+echo "$result"

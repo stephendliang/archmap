@@ -1,0 +1,5 @@
+
+# Auto-generated 2026-02-16
+summary hmap_avx512.h  AVX-512 SIMD hashmap: tiered key storage with metadata-based probing
+summary main.c  CLI driver: tree-sitter C parser producing skeleton/dependency output
+summary hmap_avx512.c  AVX-512 SIMD hashmap implementation: hashing, probing, tier ops
