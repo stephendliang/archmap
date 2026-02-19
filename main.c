@@ -15,7 +15,7 @@
 
 extern const TSLanguage *tree_sitter_c(void);
 
-#include "hmap/hmap_avx512.h"
+#include "hmap/hmap_shim.h"
 #include "perf_analysis.h"
 #include "git_cache.h"
 #include "skeleton.h"

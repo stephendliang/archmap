@@ -9,7 +9,7 @@
 #include "output.h"
 #include "skeleton.h"
 #include "perf_analysis.h"
-#include "hmap/hmap_avx512.h"
+#include "hmap/hmap_shim.h"
 
 /* Globals from main.c */
 extern struct file_entry *g_files;

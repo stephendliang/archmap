@@ -6,8 +6,7 @@ BIN = bin
 OPTFLAGS = -O3 -march=native -flto \
            -fomit-frame-pointer -fno-asynchronous-unwind-tables \
            -fno-unwind-tables -fno-stack-protector \
-           -fmerge-all-constants -DNDEBUG \
-           -mavx512f -mavx512bw
+           -fmerge-all-constants -DNDEBUG
 
 CFLAGS  ?= $(OPTFLAGS) -Wall -Wextra -std=gnu11
 LDFLAGS ?= -lgit2 -ldw -lelf -lcapstone -lpfm -lm
@@ -23,7 +22,7 @@ INCLUDES = -I $(TS_DIR)/lib/include -I $(TS_DIR)/lib/src -I $(TSC_DIR)/src -I hm
 # across tree-sitter internals, the grammar, and archmap for maximum inlining.
 SRCS = main.c skeleton.c output.c \
        perf_analysis.c arena.c symres.c perf_tools.c perf_report.c \
-       git_cache.c hmap/hmap_avx512.c \
+       git_cache.c \
        $(TS_DIR)/lib/src/lib.c $(TSC_DIR)/src/parser.c
 
 TARGET = $(BIN)/archmap
@@ -54,7 +53,7 @@ $(TSC_DIR):
 $(TARGET): main.c skeleton.c skeleton.h output.c output.h \
            perf_analysis.c perf_analysis.h arena.c arena.h symres.c symres.h \
            perf_tools.c perf_tools.h perf_report.c perf_report.h \
-           git_cache.c git_cache.h hmap/hmap_avx512.c hmap/hmap_avx512.h | $(BIN) $(TS_DIR) $(TSC_DIR)
+           git_cache.c git_cache.h hmap/hmap_shim.h | $(BIN) $(TS_DIR) $(TSC_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(INCLUDES) -o $@ $(SRCS)
 
 BENCH_CFLAGS  = -O3 -march=native -std=gnu11
