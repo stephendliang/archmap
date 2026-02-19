@@ -5,7 +5,7 @@
 #include "avx_map64s.h"
 #include "simd_map64.h"
 
-#include "testground/khashl/khashl.h"
+#include "../testground/khashl/khashl.h"
 
 KHASHL_SET_INIT(static, kh_u64_t, kh_u64, uint64_t, kh_hash_uint64, kh_eq_generic)
 

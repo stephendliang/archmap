@@ -2,8 +2,12 @@
 #define PERF_ANALYSIS_H
 
 #include <stdint.h>
+#include <stddef.h>
+#include <limits.h>
 #include <fts.h>
 #include <tree_sitter/api.h>
+
+#include "arena.h"
 
 extern const TSLanguage *tree_sitter_c(void);
 
@@ -48,7 +52,6 @@ int should_skip_fts_entry(FTSENT *ent);
 int is_source_file(const char *filename);
 struct file_entry *add_file(const char *abs_path);
 struct symbol *add_symbol(struct file_entry *fe);
-char *skeleton_text(const char *source, TSNode node, uint32_t cap_idx);
 void collect_callees(TSNode node, const char *source, struct symbol *sym);
 void collect_file(const char *path, TSParser *parser, TSQuery *query,
                   char **defines, int n_defines,
@@ -153,6 +156,66 @@ struct run_stats {
     double *values;         /* raw values from each run */
     int n;
 };
+
+/* ── Profile data (moved from perf_analysis.c) ─────────────────────── */
+
+struct perf_profile {
+    struct perf_stats stats;
+    struct hot_func *funcs;
+    struct hot_insn *insns;
+    struct uprof_func *uprof_funcs;
+    struct mca_block *mca_blocks;
+    struct cache_miss_site *cm_sites;
+    struct mem_hotspot *mem_hotspots;
+    struct struct_layout *layouts;
+    struct remark_entry *remarks;
+    int n_funcs, n_insns;
+    int n_uprof_funcs, n_mca_blocks;
+    int n_cm_sites, n_mem_hotspots;
+    int n_layouts, n_remarks;
+    int has_topdown, n_runs;
+    struct topdown_metrics topdown;
+    struct run_stats rs_cycles, rs_insns, rs_ipc, rs_wall;
+    struct run_stats rs_cache_miss_pct, rs_branch_miss_pct;
+    struct arena arena;
+    struct intern_table strings;
+};
+
+/* ── Options (moved from perf_analysis.c) ──────────────────────────── */
+
+struct perf_opts {
+    int top_n;
+    int insns_n;
+    int n_runs;           /* 0=auto (1 for single, 5 for A/B), >0=explicit */
+    int cmd_argc;
+    unsigned no_build : 1;
+    unsigned verbose  : 1;
+    int uprof_mode  : 2;  /* 1=force, -1=skip, 0=auto */
+    int topdown_mode: 2;
+    int mca_mode    : 2;
+    int cachemiss_mode: 2;
+    int pahole_mode : 2;
+    int remarks_mode: 2;  /* 0=auto, 1=force, -1=skip */
+    const char *build_cmd;
+    const char *source_dir;
+    char **cmd_argv;
+    char *binary_path;
+    char *cmd_str;
+    const char *vs_binary;
+};
+
+/* ── Utility functions from perf_analysis.c ────────────────────────── */
+
+extern char g_tmpdir[PATH_MAX];
+
+char *run_cmd(const char *cmd, int *out_status, int verbose);
+int has_tool(const char *name);
+const char *find_tool(const char *name);
+void fmt_count(char *buf, size_t sz, uint64_t val);
+void strip_compiler_suffix(char *name);
+int is_boring_caller(const char *name);
+void add_caller_entry(struct perf_profile *prof, struct hot_func *hf,
+                      const char *name, double pct);
 
 /* ── Entry point ───────────────────────────────────────────────────── */
 
